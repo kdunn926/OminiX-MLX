@@ -17,6 +17,16 @@ pub trait KeyValueCache {
     /// Reset the cache offset to 0 without deallocating buffers.
     /// Default implementation does nothing (for caches that don't support reset).
     fn reset(&mut self) {}
+
+    /// Returns sliced key/value tensors up to the current offset, if available.
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        None
+    }
+
+    /// Materialize lazy computation graphs for cached arrays.
+    fn eval(&self) -> Result<(), Exception> {
+        Ok(())
+    }
 }
 
 impl<T> KeyValueCache for &'_ mut T
@@ -37,6 +47,14 @@ where
 
     fn reset(&mut self) {
         T::reset(self)
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        T::current_kv(self)
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        T::eval(self)
     }
 }
 
@@ -116,6 +134,33 @@ impl KVCache {
         }
     }
 
+    /// Returns sliced key/value tensors up to the current offset, if any.
+    pub fn current_kv(&self) -> Option<(Array, Array)> {
+        match (&self.keys, &self.values) {
+            (Some(k), Some(v)) if self.offset > 0 => {
+                Some((
+                    k.index((Ellipsis, ..self.offset, ..)),
+                    v.index((Ellipsis, ..self.offset, ..)),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Materialize lazy computation graphs for cached arrays.
+    pub fn eval(&self) -> Result<(), Exception> {
+        let mut arrays: Vec<&Array> = Vec::new();
+        if let Some(k) = &self.keys {
+            arrays.push(k);
+        }
+        if let Some(v) = &self.values {
+            arrays.push(v);
+        }
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
+        Ok(())
+    }
 }
 
 impl KeyValueCache for KVCache {
@@ -191,5 +236,13 @@ impl KeyValueCache for KVCache {
             k.index((Ellipsis, ..self.offset, ..)),
             v.index((Ellipsis, ..self.offset, ..)),
         ))
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        KVCache::current_kv(self)
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        KVCache::eval(self)
     }
 }
