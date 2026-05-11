@@ -33,3 +33,7 @@ path = "examples/chat_qwen3.rs"
 [[example]]
 name = "a2ui_bridge"
 path = "examples/a2ui_bridge.rs"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
