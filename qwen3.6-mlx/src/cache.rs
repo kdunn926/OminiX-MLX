@@ -34,6 +34,7 @@ impl Default for RecurrentState {
 /// Unified cache for hybrid model layers.
 ///
 /// Full attention layers use KV cache; DeltaNet layers use recurrent state.
+#[derive(Debug, Clone)]
 pub enum HybridCache {
     KV(KVCache),
     Recurrent(RecurrentState),
