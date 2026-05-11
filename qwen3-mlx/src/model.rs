@@ -561,6 +561,10 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
         model.load_safetensors(&weights_filename)?;
     }
 
+    // Materialize parameters before first generation so the initial request
+    // doesn't pay the lazy-graph cost (the quantized path already does this).
+    model.eval()?;
+
     Ok(model)
 }
 

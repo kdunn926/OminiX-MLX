@@ -563,6 +563,9 @@ pub fn load_qwen2_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
         model.load_safetensors(&weights_filename)?;
     }
 
+    // Materialize parameters so the first request doesn't pay lazy-load cost.
+    model.eval()?;
+
     Ok(model)
 }
 

@@ -569,6 +569,8 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
         model.load_safetensors(&model_dir.join(weight_file))?;
     }
 
+    model.eval()?;
+
     Ok(model)
 }
 

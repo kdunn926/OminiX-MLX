@@ -10,7 +10,7 @@ use mlx_rs::{
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, Param},
+    module::{Module, ModuleParametersExt, Param},
     nn,
     ops::{
         self,
@@ -1553,11 +1553,13 @@ fn load_model_inner(model_dir: &Path, config: Gemma4Config, args: Gemma4TextConf
         ));
     }
 
-    Ok(Model {
+    let model = Model {
         args,
         model: language_model,
         lm_head,
-    })
+    };
+    model.eval()?;
+    Ok(model)
 }
 
 // ============================================================================
