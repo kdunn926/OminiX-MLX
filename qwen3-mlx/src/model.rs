@@ -23,6 +23,7 @@ use tokenizers::Tokenizer;
 use mlx_rs_core::{
     cache::KeyValueCache,
     error::Error,
+    fused_swiglu,
     utils::{
         create_attention_mask, initialize_rope, scaled_dot_product_attention,
         AttentionMask, FloatOrString, SdpaMask,
@@ -262,8 +263,9 @@ impl Module<&Array> for Mlp {
     type Error = Exception;
 
     fn forward(&mut self, input: &Array) -> std::result::Result<Self::Output, Self::Error> {
-        let activated = nn::silu(self.gate_proj.forward(input)?)?
-            .multiply(self.up_proj.forward(input)?)?;
+        let gate = self.gate_proj.forward(input)?;
+        let up = self.up_proj.forward(input)?;
+        let activated = fused_swiglu(&up, &gate)?;
         self.down_proj.forward(&activated)
     }
 

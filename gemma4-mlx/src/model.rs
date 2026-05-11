@@ -523,7 +523,12 @@ impl Module<&Array> for DenseMlp {
     fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let activated = self.activation.apply(&gate)?.multiply(&up)?;
+        // Use the fused Metal kernel for SwiGLU (the common case); fall back to
+        // generic activate-then-multiply for other activations like GeluPytorchTanh.
+        let activated = match self.activation {
+            GemmaActivation::Silu => mlx_rs_core::fused_swiglu(&up, &gate)?,
+            _ => self.activation.apply(&gate)?.multiply(&up)?,
+        };
         self.down_proj.forward(&activated)
     }
 

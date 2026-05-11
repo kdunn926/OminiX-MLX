@@ -288,7 +288,7 @@ impl Module<&Array> for Mlp {
     fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let activated = nn::silu(&gate)?.multiply(&up)?;
+        let activated = fused_swiglu(&up, &gate)?;
         self.down_proj.forward(&activated)
     }
 

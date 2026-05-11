@@ -166,9 +166,10 @@ impl Module<&Array> for SharedExpert {
     type Error = Exception;
 
     fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
-        let gate = nn::silu(self.gate_proj.forward(x)?)?;
+        let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&gate.multiply(up)?)
+        let activated = fused_swiglu(&up, &gate)?;
+        self.down_proj.forward(&activated)
     }
 
     fn training_mode(&mut self, _mode: bool) {}
