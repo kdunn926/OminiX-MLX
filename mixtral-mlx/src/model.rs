@@ -115,7 +115,7 @@ pub struct Attention {
 
 pub struct AttentionInput<'a, C> {
     pub x: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: Option<&'a mut C>,
 }
 
@@ -150,7 +150,8 @@ impl<C: KeyValueCache> Module<AttentionInput<'_, C>> for Attention {
         }
 
         let sdpa_mask = match mask {
-            Some(m) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Array(m)) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Causal) => Some(SdpaMask::Causal),
             None if L > 1 => Some(SdpaMask::Causal),
             None => None,
         };
@@ -371,7 +372,7 @@ pub struct MixtralModel {
 
 pub struct ModelInput<'a, C> {
     pub inputs: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: &'a mut Vec<Option<C>>,
 }
 
@@ -383,21 +384,19 @@ impl<C: KeyValueCache + Default> Module<ModelInput<'_, C>> for MixtralModel {
         let ModelInput { inputs, mask, cache } = input;
         let mut h = self.embed_tokens.forward(inputs)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => return Err(Exception::custom("Only `Array` mask is supported")),
-                None => None,
-            },
+        let computed_mask = if mask.is_none() {
+            create_attention_mask(&h, cache, Some(false))?
+        } else {
+            None
         };
+        let layer_mask = mask.or(computed_mask.as_ref());
 
         if cache.is_empty() {
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
 
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(AttentionInput { x: &h, mask: mask.as_ref(), cache: c.as_mut() })?;
+            h = layer.forward(AttentionInput { x: &h, mask: layer_mask, cache: c.as_mut() })?;
         }
 
         self.norm.forward(&h)

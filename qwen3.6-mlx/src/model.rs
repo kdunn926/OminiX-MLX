@@ -10,7 +10,7 @@ use mlx_rs::{
 };
 
 use mlx_rs_core::{
-    cache::{KVCache, KeyValueCache},
+    cache::KVCache,
     error::Error,
     utils::initialize_rope,
 };
@@ -44,7 +44,7 @@ impl TransformerBlock {
     pub fn forward(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
+        mask: Option<&mlx_rs_core::utils::AttentionMask>,
         cache: &mut HybridCache,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
@@ -101,16 +101,11 @@ impl Model {
         let mut h = self.text_model.embed_tokens.forward(inputs)?;
 
         let T = h.shape()[1];
+        // Causal-only prefill: pass the SDPA causal-mode marker through to attention
+        // instead of materializing an O(T^2) explicit mask array. The KV-offset is
+        // handled inside MLX's fused SDPA when paired with the cache offset.
         let mask = if T > 1 {
-            let offset = cache
-                .iter()
-                .find_map(|c| match c {
-                    HybridCache::KV(kv) => Some(kv.offset()),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            let mask = mlx_rs_core::utils::create_causal_mask(T, Some(offset), None, None)?;
-            Some(mask)
+            Some(mlx_rs_core::utils::AttentionMask::Causal)
         } else {
             None
         };

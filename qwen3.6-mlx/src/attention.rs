@@ -10,7 +10,7 @@ use mlx_rs::{
 };
 use mlx_rs_core::{
     cache::{KVCache, KeyValueCache},
-    utils::{initialize_rope, scaled_dot_product_attention, SdpaMask},
+    utils::{initialize_rope, scaled_dot_product_attention, AttentionMask, SdpaMask},
 };
 
 use crate::config::TextConfig;
@@ -45,7 +45,7 @@ pub struct GatedAttention {
 
 pub struct GatedAttentionInput<'a> {
     pub x: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: Option<&'a mut KVCache>,
 }
 
@@ -107,7 +107,8 @@ impl Module<GatedAttentionInput<'_>> for GatedAttention {
 
         // Scaled dot-product attention
         let sdpa_mask = match mask {
-            Some(m) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Array(m)) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Causal) => Some(SdpaMask::Causal),
             None if L > 1 => Some(SdpaMask::Causal),
             None => None,
         };

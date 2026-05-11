@@ -29,8 +29,8 @@ use mlx_rs::{
 use serde::Deserialize;
 
 use mlx_rs_core::{
-    AttentionMask, KVCache, KeyValueCache,
-    create_attention_mask, initialize_rope,
+    KVCache, KeyValueCache,
+    initialize_rope,
 };
 
 use crate::config::LLMConfig;
@@ -327,11 +327,9 @@ impl StepAudio2LLM {
         h: &Array,
         cache: &mut Vec<Option<KVCache>>,
     ) -> std::result::Result<Array, Exception> {
-        // Create attention mask if needed
-        let mask = match create_attention_mask(h, cache, Some(true))? {
-            Some(AttentionMask::Array(a)) => Some(a),
-            _ => None,
-        };
+        // No explicit mask: each layer's attention falls through to the fused
+        // SDPA causal mode when L > 1 (see attention forward), so the O(T^2)
+        // mask array is never materialized.
 
         // Initialize cache if empty
         if cache.is_empty() {
@@ -343,7 +341,7 @@ impl StepAudio2LLM {
         // Run through transformer layers
         let mut h = h.clone();
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(&h, mask.as_ref(), c.as_mut())?;
+            h = layer.forward(&h, None, c.as_mut())?;
         }
 
         // Final norm and LM head
