@@ -28,7 +28,7 @@ pub mod utils;
 
 pub use cache::{ConcatKeyValueCache, KVCache, KeyValueCache};
 pub use error::{Error, Result};
-pub use metal_kernels::{fused_swiglu, fused_modulate};
+pub use metal_kernels::{deltanet_recurrence, fused_modulate, fused_swiglu};
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{
     create_attention_mask, initialize_rope, scaled_dot_product_attention,

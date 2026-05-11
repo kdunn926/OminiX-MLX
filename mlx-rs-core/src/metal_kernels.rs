@@ -3,6 +3,7 @@
 //! Provides:
 //! - fused_swiglu: 10-12x faster than separate silu + multiply (for MoE models)
 //! - fused_modulate: Fused LayerNorm + modulation for DiT transformers
+//! - deltanet_recurrence: GPU-side delta-rule scan for Qwen3.5/Qwen3.6 prefill
 
 use mlx_rs::{Array, error::Exception};
 use std::ffi::CString;
@@ -93,8 +94,119 @@ const MODULATE_KERNEL_SOURCE: &str = r#"
     }
 "#;
 
+// =============================================================================
+// DeltaNet recurrence kernel
+// =============================================================================
+//
+// Runs the per-timestep delta-rule scan for Gated DeltaNet entirely on the GPU
+// in one dispatch, replacing ~13 MLX ops per timestep with a single Metal
+// kernel launch per (B, H, V_pos) work item.
+//
+// Threadgroup layout
+// ------------------
+//   grid = (V, H, B)         one threadgroup per (batch, head, v-position)
+//   group = (32, 1, 1)       exactly one SIMD-group per threadgroup
+//
+// Each thread inside a group owns K/32 consecutive K-indices (e.g. K=128 →
+// 4 K-entries per thread). The full per-(b,h,v) state column lives in thread
+// registers across the 32 threads; the only cross-thread communication is a
+// `simd_sum` per timestep to fold the K-dimension dot products. State never
+// touches global memory between timesteps.
+//
+// Algorithm (per threadgroup, per timestep t)
+//   1. Load q_t[k_range], k_t[k_range] for this thread's K-stride.
+//      Load v_t[v_pos], decay_t, beta_t (broadcast — every thread reads same).
+//   2. local_kv  = sum_{k in stride} state[k] * k_t[k]      // per-thread
+//   3. kv_mem    = simd_sum(local_kv)                       // reduces across 32 threads
+//   4. delta     = (v_t[v_pos] - kv_mem) * beta_t           // identical in every thread
+//   5. state[k]  = state[k] * decay_t + k_t[k] * delta      // per-thread update
+//   6. local_out = sum_{k in stride} state[k] * q_t[k]      // per-thread
+//   7. output_t  = simd_sum(local_out)                      // identical in every thread
+//   8. thread 0 of the simdgroup writes output[b, h, t, v_pos] to global mem
+//
+// After the t-loop, every thread writes its K-stride of `state` back to
+// `state_out[b, h, *, v_pos]`.
+//
+// All arrays are row-contiguous Float32. Shape contract:
+//   q, k     : [B, H, L, K]
+//   v        : [B, H, L, V]
+//   decay,
+//   beta     : [B, H, L]
+//   state_in : [B, H, K, V]
+//   output   : [B, H, L, V]   (kernel output 0)
+//   state_out: [B, H, K, V]   (kernel output 1)
+//
+// Template arguments: T (dtype), K (key head_dim), V (value head_dim), L (seq len).
+const DELTANET_RECURRENCE_KERNEL_SOURCE: &str = r#"
+    constexpr uint THREADS = 32;
+    constexpr uint K_PER_THREAD = K / THREADS;
+
+    uint v_pos = threadgroup_position_in_grid.x;
+    uint h     = threadgroup_position_in_grid.y;
+    uint b     = threadgroup_position_in_grid.z;
+    uint tid   = thread_position_in_threadgroup.x;
+    uint k_base = tid * K_PER_THREAD;
+
+    uint bh_seq_base = (b * H + h) * L;
+    uint state_bh_base = ((b * H) + h) * K * V;
+    uint v_base_bh_l = bh_seq_base * V;
+
+    // Load this thread's stripe of state[b, h, k_base..k_base+K_PER_THREAD, v_pos]
+    T state_local[K_PER_THREAD];
+    for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+        uint k_idx = k_base + kk;
+        state_local[kk] = state_in[state_bh_base + k_idx * V + v_pos];
+    }
+
+    for (uint t = 0; t < L; ++t) {
+        // Per-timestep scalars (broadcast across simdgroup — every thread reads same)
+        T decay_t = decay[bh_seq_base + t];
+        T beta_t  = beta[bh_seq_base + t];
+        T v_t     = v_in[v_base_bh_l + t * V + v_pos];
+
+        // Per-thread stripe of q_t[k], k_t[k]
+        T q_local[K_PER_THREAD];
+        T k_local[K_PER_THREAD];
+        uint qk_base = bh_seq_base * K + t * K + k_base;
+        for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            q_local[kk] = q_in[qk_base + kk];
+            k_local[kk] = k_in[qk_base + kk];
+        }
+
+        // 1) kv_mem = sum_k state[k] * k_t[k]
+        T local_kv = T(0);
+        for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            local_kv += state_local[kk] * k_local[kk];
+        }
+        T kv_mem = simd_sum(local_kv);
+
+        T delta = (v_t - kv_mem) * beta_t;
+
+        // 2) state[k] = state[k] * decay + k_t[k] * delta
+        // 3) output local accumulator: sum_k state[k] * q_t[k] (post-update)
+        T local_out = T(0);
+        for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            state_local[kk] = state_local[kk] * decay_t + k_local[kk] * delta;
+            local_out += state_local[kk] * q_local[kk];
+        }
+        T out_val = simd_sum(local_out);
+
+        // Single lane writes the output to avoid 32 redundant stores.
+        if (tid == 0) {
+            output[v_base_bh_l + t * V + v_pos] = out_val;
+        }
+    }
+
+    // Write back this thread's stripe of the post-scan state.
+    for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+        uint k_idx = k_base + kk;
+        state_out[state_bh_base + k_idx * V + v_pos] = state_local[kk];
+    }
+"#;
+
 static SWIGLU_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 static MODULATE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+static DELTANET_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 
 struct MetalKernel {
     kernel: mlx_sys::mlx_fast_metal_kernel,
@@ -143,6 +255,52 @@ fn create_swiglu_kernel() -> MetalKernel {
         );
 
         MetalKernel { kernel, input_names, output_names }
+    }
+}
+
+fn create_deltanet_kernel() -> MetalKernel {
+    unsafe {
+        let q_name = CString::new("q_in").unwrap();
+        let k_name = CString::new("k_in").unwrap();
+        let v_name = CString::new("v_in").unwrap();
+        let decay_name = CString::new("decay").unwrap();
+        let beta_name = CString::new("beta").unwrap();
+        let state_in_name = CString::new("state_in").unwrap();
+
+        let output_name = CString::new("output").unwrap();
+        let state_out_name = CString::new("state_out").unwrap();
+
+        let input_names = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(input_names, q_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, k_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, v_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, decay_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, beta_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, state_in_name.as_ptr());
+
+        let output_names = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(output_names, output_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(output_names, state_out_name.as_ptr());
+
+        let source = CString::new(DELTANET_RECURRENCE_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("deltanet_recurrence").unwrap();
+
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            input_names,
+            output_names,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,  // ensure_row_contiguous
+            false, // atomic_outputs
+        );
+
+        MetalKernel {
+            kernel,
+            input_names,
+            output_names,
+        }
     }
 }
 
@@ -335,5 +493,116 @@ pub fn fused_modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array, 
         mlx_sys::mlx_stream_free(stream);
 
         Ok(Array::from_ptr(result))
+    }
+}
+
+/// Gated-DeltaNet recurrence (delta-rule) executed entirely on the GPU.
+///
+/// Replaces a per-timestep Rust loop of ~13 MLX ops with a single Metal
+/// kernel launch. Each (batch, head, v_position) is mapped to one
+/// threadgroup (32-thread SIMD-group). The KV-state column for that
+/// triple is held in thread registers across the t=0..L scan; only the
+/// K-dimension dot products cross threads (via `simd_sum`).
+///
+/// Shape contract (all row-contiguous Float32):
+///   q, k     : [B, H, L, K]
+///   v        : [B, H, L, V]
+///   decay,
+///   beta     : [B, H, L]
+///   state_in : [B, H, K, V]
+///
+/// Returns (output [B, H, L, V], state_out [B, H, K, V]).
+/// Requires K % 32 == 0.
+pub fn deltanet_recurrence(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    decay: &Array,
+    beta: &Array,
+    state_in: &Array,
+) -> Result<(Array, Array), Exception> {
+    let kernel = DELTANET_KERNEL.get_or_init(create_deltanet_kernel);
+
+    let q_shape = q.shape();
+    let v_shape = v.shape();
+    if q_shape.len() != 4 || v_shape.len() != 4 {
+        return Err(Exception::custom(format!(
+            "deltanet_recurrence: expected 4D q and v, got q={:?} v={:?}",
+            q_shape, v_shape
+        )));
+    }
+    let b = q_shape[0] as i32;
+    let h = q_shape[1] as i32;
+    let l = q_shape[2] as i32;
+    let kdim = q_shape[3] as i32;
+    let vdim = v_shape[3] as i32;
+    if kdim % 32 != 0 || vdim == 0 {
+        return Err(Exception::custom(format!(
+            "deltanet_recurrence: K must be a multiple of 32 (got K={kdim}, V={vdim})"
+        )));
+    }
+
+    let dtype: u32 = q.dtype().into();
+
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let t_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, t_name.as_ptr(), dtype);
+        let k_name = CString::new("K").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, k_name.as_ptr(), kdim);
+        let v_name = CString::new("V").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, v_name.as_ptr(), vdim);
+        let l_name = CString::new("L").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, l_name.as_ptr(), l);
+        let h_name = CString::new("H").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, h_name.as_ptr(), h);
+
+        // grid = (V*32, H, B); one simdgroup of 32 threads per (b, h, v_pos).
+        let total_x = vdim * 32;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, total_x, h, b);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
+
+        let out_shape: Vec<i32> = vec![b, h, l, vdim];
+        let state_shape: Vec<i32> = vec![b, h, kdim, vdim];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, out_shape.as_ptr(), out_shape.len(), dtype);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, state_shape.as_ptr(), state_shape.len(), dtype);
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, q.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, k.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, v.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, decay.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, beta.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, state_in.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream);
+
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom(
+                "deltanet_recurrence Metal kernel execution failed"));
+        }
+
+        let mut out_result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut out_result, outputs, 0);
+        let mut state_result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut state_result, outputs, 1);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok((Array::from_ptr(out_result), Array::from_ptr(state_result)))
     }
 }

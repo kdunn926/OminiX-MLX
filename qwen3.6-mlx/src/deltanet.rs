@@ -184,9 +184,7 @@ impl GatedDeltaNet {
         let beta = nn::sigmoid(b)?; // [B, L, num_v_heads]
         let g = self.compute_decay_batched(&a)?; // [B, L, num_v_heads]
 
-        // ===== OPTIMIZED SEQUENTIAL RECURRENCE =====
-        // Pre-cast to float32 and pre-transpose to [B, H, L, dim] ONCE
-        // (eliminates 5 dtype casts + multiple reshapes per step)
+        // Pre-cast to float32 and pre-transpose to [B, H, L, dim].
         let H = self.num_v_heads;
         let K_dim = self.key_head_dim;
         let V_dim = self.value_head_dim;
@@ -198,64 +196,54 @@ impl GatedDeltaNet {
         let beta = beta.as_dtype(mlx_rs::Dtype::Float32)?.transpose_axes(&[0, 2, 1])?;
         // q, k: [B, H, L, K], v: [B, H, L, V], g, beta: [B, H, L]
 
-        // 8. Initialize state
-        let state = match cache.state.take() {
+        let state_in = match cache.state.take() {
             Some(s) => s,
             None => zeros_dtype(&[B, H, K_dim, V_dim], mlx_rs::Dtype::Float32)?,
         };
+        let decay = g.exp()?; // [B, H, L]
 
-        // 9. Sequential recurrent loop (optimized: column vectors + matmul)
-        // Pre-compute all per-step values as column/row vectors
-        let decay_all = g.exp()?.reshape(&[B, H, L, 1, 1])?;     // [B, H, L, 1, 1]
-        let k_col_all = k.reshape(&[B, H, L, K_dim, 1])?;         // [B, H, L, K, 1]
-        let q_col_all = q.reshape(&[B, H, L, K_dim, 1])?;         // [B, H, L, K, 1]
-        let v_col_all = v.reshape(&[B, H, L, V_dim, 1])?;         // [B, H, L, V, 1]
-        let beta_col_all = beta.reshape(&[B, H, L, 1, 1])?;       // [B, H, L, 1, 1]
-        let k_row_all = k_col_all.transpose_axes(&[0, 1, 2, 4, 3])?; // [B, H, L, 1, K]
-
-        // State in [B, H, V, K] layout for matmul
-        let mut state_t = state.transpose_axes(&[0, 1, 3, 2])?;
-
-        let mut outputs = Vec::with_capacity(L as usize);
-        for t in 0..L {
-            let decay_t = decay_all.index((.., .., t, .., ..));     // [B, H, 1, 1]
-            let k_t = k_col_all.index((.., .., t, .., ..));         // [B, H, K, 1]
-            let v_col = v_col_all.index((.., .., t, .., ..));       // [B, H, V, 1]
-            let beta_t = beta_col_all.index((.., .., t, .., ..));   // [B, H, 1, 1]
-            let q_t = q_col_all.index((.., .., t, .., ..));         // [B, H, K, 1]
-            let k_row = k_row_all.index((.., .., t, .., ..));       // [B, H, 1, K]
-
-            // 1. Decay (1 op)
-            state_t = state_t.multiply(&decay_t)?;
-
-            // 2. kv_mem = state_t @ k_t (1 matmul)
-            let kv_mem = state_t.matmul(&k_t)?;
-
-            // 3. delta = (v - kv_mem) * beta (2 ops)
-            let delta = v_col.subtract(&kv_mem)?.multiply(&beta_t)?;
-
-            // 4. state += delta @ k_row (1 matmul + 1 add)
-            state_t = state_t.add(delta.matmul(&k_row)?)?;
-
-            // 5. out = state_t @ q_t (1 matmul)
-            outputs.push(state_t.matmul(&q_t)?);
-
-            // Async eval periodically to limit graph depth
-            if L > EVAL_INTERVAL && (t + 1) % EVAL_INTERVAL == 0 {
-                async_eval([&state_t])?;
+        // Single fused Metal kernel for the delta-rule scan: one SIMD-group
+        // per (b, h, v_pos), K split across its 32 threads, state column held
+        // in registers across all L timesteps. Replaces ~13 MLX ops × L
+        // timesteps with one kernel launch. Falls back to the prior loop
+        // when K isn't 32-aligned.
+        let (output_bhlv, new_state) = if K_dim % 32 == 0 {
+            mlx_rs_core::deltanet_recurrence(&q, &k, &v, &decay, &beta, &state_in)?
+        } else {
+            let decay_5d = decay.reshape(&[B, H, L, 1, 1])?;
+            let k_col_all = k.reshape(&[B, H, L, K_dim, 1])?;
+            let q_col_all = q.reshape(&[B, H, L, K_dim, 1])?;
+            let v_col_all = v.reshape(&[B, H, L, V_dim, 1])?;
+            let beta_col_all = beta.reshape(&[B, H, L, 1, 1])?;
+            let k_row_all = k_col_all.transpose_axes(&[0, 1, 2, 4, 3])?;
+            let mut state_t = state_in.transpose_axes(&[0, 1, 3, 2])?;
+            let mut outputs = Vec::with_capacity(L as usize);
+            for t in 0..L {
+                let decay_t = decay_5d.index((.., .., t, .., ..));
+                let k_t = k_col_all.index((.., .., t, .., ..));
+                let v_col = v_col_all.index((.., .., t, .., ..));
+                let beta_t = beta_col_all.index((.., .., t, .., ..));
+                let q_t = q_col_all.index((.., .., t, .., ..));
+                let k_row = k_row_all.index((.., .., t, .., ..));
+                state_t = state_t.multiply(&decay_t)?;
+                let kv_mem = state_t.matmul(&k_t)?;
+                let delta = v_col.subtract(&kv_mem)?.multiply(&beta_t)?;
+                state_t = state_t.add(delta.matmul(&k_row)?)?;
+                outputs.push(state_t.matmul(&q_t)?);
+                if L > EVAL_INTERVAL && (t + 1) % EVAL_INTERVAL == 0 {
+                    async_eval([&state_t])?;
+                }
             }
-        }
+            let stacked = mlx_rs::ops::stack_axis(&outputs, 2)?;
+            let out_bhlv = stacked.reshape(&[B, H, L, V_dim])?;
+            (out_bhlv, state_t.transpose_axes(&[0, 1, 3, 2])?)
+        };
 
-        // Convert state_t back to [B, H, K, V] for cache
-        let state = state_t.transpose_axes(&[0, 1, 3, 2])?;
-
-        cache.state = Some(state);
+        cache.state = Some(new_state);
         cache.step += L;
 
-        // 10. Stack outputs: [B, H, L, V, 1] → [B, L, H, V]
-        let output = mlx_rs::ops::stack_axis(&outputs, 2)?;
-        let output = output.reshape(&[B, H, L, V_dim])?;
-        let output = output.transpose_axes(&[0, 2, 1, 3])?;
+        // [B, H, L, V] → [B, L, H, V]
+        let output = output_bhlv.transpose_axes(&[0, 2, 1, 3])?;
 
         // 16. Gated RMSNorm + output projection
         let normed = self.norm.forward(&output)?;
