@@ -200,11 +200,14 @@ fn infllmv2_attention(
     let c_t = compressed.transpose_axes(&[0, 1, 3, 2])?;
     let scores = mlx_rs::ops::matmul(&q_for_scoring, &c_t)?;
 
-    // 3. Top-K selection: argsort descending, take first topk indices
+    // 3. Top-K selection: argpartition is O(n) vs argsort's O(n log n) and we
+    //    don't need the inner ordering — the downstream gather is invariant to
+    //    block selection order. Place the topk smallest of neg_scores (= topk
+    //    largest of scores) in the first `topk` positions of the result.
     let topk = config.topk.min(num_compressed);
     let neg_scores = scores.multiply(array!(-1.0f32))?;
-    let sorted_idx = mlx_rs::ops::argsort_axis(&neg_scores, -1)?;
-    let top_idx = sorted_idx.index((.., .., .., ..topk));
+    let partitioned = mlx_rs::ops::argpartition_axis(&neg_scores, topk - 1, -1)?;
+    let top_idx = partitioned.index((.., .., .., ..topk));
     // top_idx: [B, H_kv, L_q, topk]
 
     // Eval to materialize indices before CPU-side index building
