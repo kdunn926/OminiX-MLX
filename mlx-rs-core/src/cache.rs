@@ -112,6 +112,10 @@ pub struct KVCache {
     values: Option<Array>,
     offset: i32,
     step: i32,
+    /// Soft reservation hint used by the first `update_and_fetch`: when set,
+    /// the initial allocation rounds up to at least this many tokens so the
+    /// cache doesn't need to regrow mid-decode for short generations.
+    reserved: i32,
 }
 
 impl Default for KVCache {
@@ -131,7 +135,22 @@ impl KVCache {
             values: None,
             offset: 0,
             step,
+            reserved: 0,
         }
+    }
+
+    /// Hint that the cache should pre-allocate room for at least `capacity`
+    /// tokens on its first `update_and_fetch`. No-op once the buffers exist;
+    /// safe to call before prefill with `prompt_len + max_new_tokens`.
+    pub fn reserve(&mut self, capacity: i32) {
+        if capacity > self.reserved {
+            self.reserved = capacity;
+        }
+    }
+
+    /// Current preallocated buffer capacity in tokens, if any.
+    pub fn capacity(&self) -> Option<i32> {
+        self.keys.as_ref().map(|k| k.shape()[2])
     }
 
     /// Returns sliced key/value tensors up to the current offset, if any.
@@ -145,6 +164,17 @@ impl KVCache {
             }
             _ => None,
         }
+    }
+
+    /// Borrow the underlying keys/values buffers (full preallocated length,
+    /// not sliced to offset). Returns `None` until the first `update_and_fetch`.
+    /// Useful for cache adapters that need to share storage.
+    pub fn keys_buffer(&self) -> Option<&Array> {
+        self.keys.as_ref()
+    }
+
+    pub fn values_buffer(&self) -> Option<&Array> {
+        self.values.as_ref()
     }
 
     /// Materialize lazy computation graphs for cached arrays.
@@ -194,8 +224,15 @@ impl KeyValueCache for KVCache {
             let k_head_dim = keys_shape[3];
             let v_head_dim = values_shape[3];
 
-            let n_steps = (self.step + num_new - 1) / self.step;
-            let new_size = n_steps * self.step;
+            let needed = prev + num_new;
+            // Round needed up to the next step boundary, then honor any
+            // reservation hint set before the first update_and_fetch.
+            let n_steps = (needed + self.step - 1) / self.step;
+            let mut new_size = n_steps * self.step;
+            if self.keys.is_none() && self.reserved > new_size {
+                let reserved_steps = (self.reserved + self.step - 1) / self.step;
+                new_size = reserved_steps * self.step;
+            }
 
             let k_shape = &[b, n_kv_heads, new_size, k_head_dim];
             let v_shape = &[b, n_kv_heads, new_size, v_head_dim];
