@@ -99,13 +99,17 @@ impl Iterator for Generate<'_> {
                 // KV/recurrent caches across the full prompt.
                 const PREFILL_CHUNK: i32 = 64;
                 let seq_len = prompt.shape()[1];
+                // Chunked prefill: only the final chunk needs full vocab logits;
+                // earlier chunks just populate the cache, so use forward_last_logits
+                // (cheap `[B, vocab]` slice) for them too — the throwaway logits
+                // are immediately discarded.
                 let logits = if seq_len > PREFILL_CHUNK {
                     let mut pos = 0;
                     let mut last_logits = None;
                     while pos < seq_len {
                         let end = (pos + PREFILL_CHUNK).min(seq_len);
                         let chunk = prompt.index((.., pos..end));
-                        let logits = tri!(self.model.forward(&chunk, &mut self.cache));
+                        let logits = tri!(self.model.forward_last_logits(&chunk, &mut self.cache));
                         // Materialize and free intermediates between chunks.
                         tri!(eval([&logits]));
                         last_logits = Some(logits);
@@ -113,9 +117,9 @@ impl Iterator for Generate<'_> {
                     }
                     last_logits.expect("chunked prefill produced no logits")
                 } else {
-                    tri!(self.model.forward(prompt, &mut self.cache))
+                    tri!(self.model.forward_last_logits(prompt, &mut self.cache))
                 };
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let y = tri!(sample(&logits, self.temp));
 
                 let _ = async_eval([&y]);
                 let next_y = tri!(self.compute_next(&y));

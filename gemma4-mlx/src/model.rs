@@ -1010,6 +1010,29 @@ where
     }
 }
 
+impl Model {
+    /// Project only the last sequence position through the LM head.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last)?,
+            None => self.model.embed_tokens.as_linear(&last)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok(logits)
+    }
+}
+
 // ============================================================================
 // Loading
 // ============================================================================
@@ -1619,8 +1642,6 @@ where
         };
         let logits = self.model.forward(input)?;
         // Select last token before sampling to keep output shape [B], not [B, 1].
-        // Without this, the shape accumulates an extra dim each iteration,
-        // causing hidden_dim to be computed as 1 instead of hidden_size.
         self.sampler.sample(&logits.index((.., -1, ..)), self.temp)
     }
 }
@@ -1653,14 +1674,16 @@ where
                             mask: None,
                             cache: self.cache,
                         };
-                        let logits = tri!(self.model.forward(input));
+                        // forward_last_logits returns `[B, vocab]`; intermediate
+                        // chunks discard the logits, the last chunk samples.
+                        let logits = tri!(self.model.forward_last_logits(input));
                         // Eval to free intermediates before next chunk
                         tri!(mlx_rs::transforms::eval([&logits]));
                         pos = end;
 
                         // On last chunk, sample from the final logits
                         if pos >= seq_len {
-                            let y = tri!(self.sampler.sample(&logits.index((.., -1, ..)), self.temp));
+                            let y = tri!(self.sampler.sample(&logits, self.temp));
                             tri!(mlx_rs::transforms::eval([&y]));
 
                             let next_y = tri!(self.compute_next(&y));
@@ -1677,8 +1700,8 @@ where
                         mask: None,
                         cache: self.cache,
                     };
-                    let logits = tri!(self.model.forward(input));
-                    let y = tri!(self.sampler.sample(&logits.index((.., -1, ..)), self.temp));
+                    let logits = tri!(self.model.forward_last_logits(input));
+                    let y = tri!(self.sampler.sample(&logits, self.temp));
 
                     tri!(mlx_rs::transforms::async_eval([&y]));
                     tri!(mlx_rs::transforms::eval([&y]));

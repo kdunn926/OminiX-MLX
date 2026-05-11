@@ -497,6 +497,29 @@ where
     }
 }
 
+impl Model {
+    /// Run the transformer and project only the last sequence position through the
+    /// LM head, returning a `[B, vocab]` tensor. Skips a `[B, T, vocab]` matmul
+    /// during prefill where only the final token's logits are sampled.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> std::result::Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed_tokens) => embed_tokens.as_linear(&last),
+                MaybeQuantized::Quantized(q_embed_tokens) => q_embed_tokens.as_linear(&last),
+            },
+        }
+    }
+}
+
 // ============================================================================
 // Model Loading
 // ============================================================================
@@ -781,8 +804,13 @@ where
             mask: None,
             cache: self.cache,
         };
+        // During decode L=1, so the [B, T-1, vocab] save from
+        // forward_last_logits doesn't apply — and the extra hidden-state
+        // slice it introduces makes per-token decode measurably slower
+        // (~35% on M-series). Keep the original [B, 1, vocab] full forward
+        // and slice logits at the sample step.
         let logits = self.model.forward(input)?;
-        sample(&logits, self.temp)
+        sample(&logits.index((.., -1, ..)), self.temp)
     }
 }
 
@@ -811,8 +839,8 @@ where
                     mask: None,
                     cache: self.cache,
                 };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let logits = tri!(self.model.forward_last_logits(input));
+                let y = tri!(sample(&logits, self.temp));
 
                 let _ = async_eval([&y]);
                 let next_y = tri!(self.compute_next(&y));

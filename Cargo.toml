@@ -53,6 +53,7 @@ members = [
     "qwen3.6-mlx",
     "deepseek-ocr2-mlx",
     "qwen3-vl-mlx",
+    "gemma4-mlx",
     "xtask",
 ]
 

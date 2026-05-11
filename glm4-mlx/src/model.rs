@@ -510,6 +510,27 @@ where
     }
 }
 
+impl Model {
+    /// Project only the last sequence position through the LM head.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> std::result::Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed_tokens) => embed_tokens.as_linear(&last),
+                MaybeQuantized::Quantized(q_embed_tokens) => q_embed_tokens.as_linear(&last),
+            },
+        }
+    }
+}
+
 // ============================================================================
 // Model Loading
 // ============================================================================
@@ -781,8 +802,8 @@ where
                     mask: None,
                     cache: self.cache,
                 };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let logits = tri!(self.model.forward_last_logits(input));
+                let y = tri!(sample(&logits, self.temp));
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
             }
@@ -794,7 +815,7 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits, self.temp));
+                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
             }

@@ -443,6 +443,21 @@ impl<C: KeyValueCache + Default> Module<ModelInput<'_, C>> for Model {
     }
 }
 
+impl Model {
+    /// Project only the last sequence position through the LM head.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> std::result::Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        self.lm_head.forward(&last)
+    }
+}
+
 // ============================================================================
 // Model Loading
 // ============================================================================
@@ -645,7 +660,7 @@ impl<'a, C: KeyValueCache + Default> Generate<'a, C> {
 
     fn compute_next(&mut self, y: &Array) -> std::result::Result<Array, Exception> {
         let input = ModelInput { inputs: &y.index((.., NewAxis)), mask: None, cache: self.cache };
-        sample(&self.model.forward(input)?, self.temp)
+        sample(&self.model.forward(input)?.index((.., -1, ..)), self.temp)
     }
 }
 
@@ -662,8 +677,8 @@ impl<'a, C: KeyValueCache + Default> Iterator for Generate<'a, C> {
         match &self.state {
             GenerateState::Prefill { prompt_token } => {
                 let input = ModelInput { inputs: prompt_token, mask: None, cache: self.cache };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let logits = tri!(self.model.forward_last_logits(input));
+                let y = tri!(sample(&logits, self.temp));
 
                 let _ = async_eval([&y]);
                 let next_y = tri!(self.compute_next(&y));

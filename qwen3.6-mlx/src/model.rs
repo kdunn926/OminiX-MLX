@@ -5,6 +5,7 @@ use mlx_rs::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
     nn,
+    ops::indexing::IndexOp,
     quantization::MaybeQuantized,
     Array,
 };
@@ -92,8 +93,42 @@ pub struct Model {
 }
 
 impl Model {
+    /// Run the transformer and project only the last sequence position through
+    /// the LM head. Avoids a `[B, T, vocab]` matmul during prefill.
+    pub fn forward_last_logits(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden(inputs, cache)?;
+        let last = h.index((.., -1, ..));
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last),
+            None => match &mut self.text_model.embed_tokens {
+                MaybeQuantized::Original(e) => e.as_linear(&last),
+                MaybeQuantized::Quantized(qe) => qe.as_linear(&last),
+            },
+        }
+    }
+
     #[allow(non_snake_case)]
     pub fn forward(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<Array, Exception> {
+        let h = self.forward_hidden(inputs, cache)?;
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&h),
+            None => match &mut self.text_model.embed_tokens {
+                MaybeQuantized::Original(e) => e.as_linear(&h),
+                MaybeQuantized::Quantized(qe) => qe.as_linear(&h),
+            },
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn forward_hidden(
         &mut self,
         inputs: &Array,
         cache: &mut Vec<HybridCache>,
@@ -124,15 +159,7 @@ impl Model {
             h = layer.forward(&h, mask.as_ref(), c)?;
         }
 
-        h = self.text_model.norm.forward(&h)?;
-
-        match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&h),
-            None => match &mut self.text_model.embed_tokens {
-                MaybeQuantized::Original(e) => e.as_linear(&h),
-                MaybeQuantized::Quantized(qe) => qe.as_linear(&h),
-            },
-        }
+        self.text_model.norm.forward(&h)
     }
 }
 

@@ -703,6 +703,21 @@ where
     }
 }
 
+impl Model {
+    /// Project only the last sequence position through the LM head.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        self.lm_head.forward(&last)
+    }
+}
+
 // ============================================================================
 // Loading functions
 // ============================================================================
@@ -1183,7 +1198,7 @@ where
             cache: self.cache,
         };
         let logits = self.model.forward(input)?;
-        sample(&logits, self.temp)
+        sample(&logits.index((.., -1, ..)), self.temp)
     }
 }
 
@@ -1203,8 +1218,8 @@ where
                     mask: None,
                     cache: self.cache,
                 };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let logits = tri!(self.model.forward_last_logits(input));
+                let y = tri!(sample(&logits, self.temp));
 
                 tri!(mlx_rs::transforms::async_eval([&y]));
                 tri!(mlx_rs::transforms::eval([&y]));
