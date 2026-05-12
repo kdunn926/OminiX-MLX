@@ -2,6 +2,7 @@
 
 use mlx_rs::{error::Exception, ops::concatenate_axis, ops::zeros_dtype, Array};
 use mlx_rs::ops::indexing::{IndexMutOp, IndexOp, Ellipsis};
+use mlx_rs::ops::{dequantize, quantize};
 
 /// Trait for key-value caches used in attention
 pub trait KeyValueCache {
@@ -281,5 +282,417 @@ impl KeyValueCache for KVCache {
 
     fn eval(&self) -> Result<(), Exception> {
         KVCache::eval(self)
+    }
+}
+
+// ============================================================================
+// QuantizedKVCache — K=q8, V=q4 mixed-precision KV cache
+// ============================================================================
+
+/// Mixed-precision KV cache: keys stored at q8, values at q4.
+///
+/// Tokens accumulate in an fp16 residual buffer until `step` tokens are
+/// ready, then the full block is quantized and appended.  Every call to
+/// `update_and_fetch` returns a fully dequantized view so attention
+/// computation is unaffected.
+///
+/// Storage shape convention (B=batch, H=heads, T=tokens, D=head_dim):
+/// - `k_q`      : `[B, H, n_quantized, D/(32/k_bits)]`
+/// - `k_scales` : `[B, H, n_quantized, D/group_size]`
+/// - `k_biases` : same shape as scales
+/// - Residual   : `[B, H, r, D]`  where `r < step`
+#[derive(Debug, Clone)]
+pub struct QuantizedKVCache {
+    // Quantized key storage [B, H, n_quantized, packed_cols]
+    k_q: Option<Array>,
+    k_scales: Option<Array>,
+    k_biases: Option<Array>,
+    // Quantized value storage [B, H, n_quantized, packed_cols]
+    v_q: Option<Array>,
+    v_scales: Option<Array>,
+    v_biases: Option<Array>,
+    // fp16 residual (tokens not yet quantized)
+    k_residual: Option<Array>,
+    v_residual: Option<Array>,
+    /// Group size used for quantization (must divide head_dim).
+    pub group_size: i32,
+    /// Bits per element for keys (8 recommended).
+    pub k_bits: i32,
+    /// Bits per element for values (4 recommended).
+    pub v_bits: i32,
+    /// Accumulate this many tokens before quantizing.
+    pub step: i32,
+    // Dimensions (set on first update_and_fetch)
+    batch: i32,
+    n_kv_heads: i32,
+    k_head_dim: i32,
+    v_head_dim: i32,
+    // Total tokens quantized (not counting residual)
+    n_quantized: i32,
+    offset: i32,
+}
+
+impl QuantizedKVCache {
+    /// Create a cache with explicit configuration.
+    ///
+    /// # Params
+    /// - `group_size` : quantization group size (must divide head_dim, typically 64)
+    /// - `k_bits`     : bits for keys (8)
+    /// - `v_bits`     : bits for values (4)
+    /// - `step`       : tokens to buffer before quantizing (256 matches KVCache default)
+    pub fn new(group_size: i32, k_bits: i32, v_bits: i32, step: i32) -> Self {
+        Self {
+            k_q: None,
+            k_scales: None,
+            k_biases: None,
+            v_q: None,
+            v_scales: None,
+            v_biases: None,
+            k_residual: None,
+            v_residual: None,
+            group_size,
+            k_bits,
+            v_bits,
+            step,
+            batch: 0,
+            n_kv_heads: 0,
+            k_head_dim: 0,
+            v_head_dim: 0,
+            n_quantized: 0,
+            offset: 0,
+        }
+    }
+
+    /// Default: K=q8, V=q4, group_size=64, step=256.
+    pub fn default_config() -> Self {
+        Self::new(64, 8, 4, 256)
+    }
+
+    /// Dequantize stored keys/values and concatenate with residual.
+    fn reconstruct(&self) -> Result<(Array, Array), Exception> {
+        let b = self.batch;
+        let h = self.n_kv_heads;
+        let kd = self.k_head_dim;
+        let vd = self.v_head_dim;
+        let n_q = self.n_quantized;
+
+        let (quant_k, quant_v) = if n_q > 0 {
+            // Flatten [B, H, n_q, packed] → [B*H*n_q, packed] for dequantize
+            let kq = self.k_q.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let ks = self.k_scales.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let kb = self.k_biases.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let k_deq = dequantize(&kq, &ks, &kb, self.group_size, self.k_bits, None::<&str>)?
+                .reshape(&[b, h, n_q, kd])?;
+
+            let vq = self.v_q.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let vs = self.v_scales.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let vb = self.v_biases.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let v_deq = dequantize(&vq, &vs, &vb, self.group_size, self.v_bits, None::<&str>)?
+                .reshape(&[b, h, n_q, vd])?;
+
+            (Some(k_deq), Some(v_deq))
+        } else {
+            (None, None)
+        };
+
+        let full_k = match (quant_k, self.k_residual.as_ref()) {
+            (Some(qk), Some(r)) => concatenate_axis(&[qk, r.clone()], 2)?,
+            (Some(qk), None) => qk,
+            (None, Some(r)) => r.clone(),
+            (None, None) => return Err(Exception::custom("QuantizedKVCache: reconstruct on empty cache")),
+        };
+        let full_v = match (quant_v, self.v_residual.as_ref()) {
+            (Some(qv), Some(r)) => concatenate_axis(&[qv, r.clone()], 2)?,
+            (Some(qv), None) => qv,
+            (None, Some(r)) => r.clone(),
+            (None, None) => return Err(Exception::custom("QuantizedKVCache: reconstruct on empty cache")),
+        };
+
+        Ok((full_k, full_v))
+    }
+
+    /// Quantize a `[B, H, T, D]` block and store into `[B, H, T, packed_cols]`.
+    fn quantize_block(
+        arr: &Array,
+        b: i32, h: i32, t: i32, d: i32,
+        group_size: i32, bits: i32,
+    ) -> Result<(Array, Array, Array), Exception> {
+        // Flatten to 2D for the MLX quantize op
+        let flat = arr.reshape(&[b * h * t, d])?;
+        let (q, s, bv) = quantize(&flat, group_size, bits, None::<&str>)?;
+        // Reshape back so tokens stay on axis-2
+        let packed_cols = q.shape()[1];
+        let scale_cols = s.shape()[1];
+        Ok((
+            q.reshape(&[b, h, t, packed_cols])?,
+            s.reshape(&[b, h, t, scale_cols])?,
+            bv.reshape(&[b, h, t, scale_cols])?,
+        ))
+    }
+}
+
+impl Default for QuantizedKVCache {
+    fn default() -> Self {
+        Self::default_config()
+    }
+}
+
+impl KeyValueCache for QuantizedKVCache {
+    fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        None
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.group_size, self.k_bits, self.v_bits, self.step);
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+    ) -> Result<(Array, Array), Exception> {
+        let ks = keys.shape();
+        let b = ks[0] as i32;
+        let h = ks[1] as i32;
+        let t = ks[2] as i32;
+        let kd = ks[3] as i32;
+        let vd = values.shape()[3] as i32;
+
+        // Validate dimensions on subsequent calls
+        if self.batch == 0 {
+            if kd % self.group_size != 0 {
+                return Err(Exception::custom(format!(
+                    "QuantizedKVCache: k_head_dim={kd} not divisible by group_size={}",
+                    self.group_size
+                )));
+            }
+            if vd % self.group_size != 0 {
+                return Err(Exception::custom(format!(
+                    "QuantizedKVCache: v_head_dim={vd} not divisible by group_size={}",
+                    self.group_size
+                )));
+            }
+            self.batch = b;
+            self.n_kv_heads = h;
+            self.k_head_dim = kd;
+            self.v_head_dim = vd;
+        } else if b != self.batch || h != self.n_kv_heads {
+            return Err(Exception::custom(format!(
+                "QuantizedKVCache: batch/heads mismatch: expected ({},{}) got ({b},{h})",
+                self.batch, self.n_kv_heads
+            )));
+        }
+
+        // Grow residual by appending new tokens along axis-2
+        let k_res = match self.k_residual.take() {
+            Some(prev) => concatenate_axis(&[prev, keys], 2)?,
+            None => keys,
+        };
+        let v_res = match self.v_residual.take() {
+            Some(prev) => concatenate_axis(&[prev, values], 2)?,
+            None => values,
+        };
+
+        let res_len = k_res.shape()[2] as i32;
+        let n_full_steps = res_len / self.step;
+
+        if n_full_steps > 0 {
+            let tokens_to_q = n_full_steps * self.step;
+            let remaining = res_len - tokens_to_q;
+
+            // Slice the tokens to quantize [B, H, tokens_to_q, D]
+            let k_to_q = k_res.index((Ellipsis, ..tokens_to_q, ..));
+            let v_to_q = v_res.index((Ellipsis, ..tokens_to_q, ..));
+
+            // Quantize keeping [B, H, tokens_to_q, packed] shape
+            let (new_kq, new_ks, new_kb) =
+                Self::quantize_block(&k_to_q, b, h, tokens_to_q, kd, self.group_size, self.k_bits)?;
+            let (new_vq, new_vs, new_vb) =
+                Self::quantize_block(&v_to_q, b, h, tokens_to_q, vd, self.group_size, self.v_bits)?;
+
+            // Append along token axis-2
+            self.k_q = Some(match self.k_q.take() {
+                Some(prev) => concatenate_axis(&[prev, new_kq], 2)?,
+                None => new_kq,
+            });
+            self.k_scales = Some(match self.k_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, new_ks], 2)?,
+                None => new_ks,
+            });
+            self.k_biases = Some(match self.k_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, new_kb], 2)?,
+                None => new_kb,
+            });
+            self.v_q = Some(match self.v_q.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vq], 2)?,
+                None => new_vq,
+            });
+            self.v_scales = Some(match self.v_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vs], 2)?,
+                None => new_vs,
+            });
+            self.v_biases = Some(match self.v_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vb], 2)?,
+                None => new_vb,
+            });
+
+            self.n_quantized += tokens_to_q;
+
+            if remaining > 0 {
+                self.k_residual = Some(k_res.index((Ellipsis, tokens_to_q.., ..)));
+                self.v_residual = Some(v_res.index((Ellipsis, tokens_to_q.., ..)));
+            }
+            // else: residual is empty; leave as None
+        } else {
+            self.k_residual = Some(k_res);
+            self.v_residual = Some(v_res);
+        }
+
+        self.offset += t;
+        self.reconstruct()
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        if self.offset == 0 {
+            return None;
+        }
+        self.reconstruct().ok()
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        let mut arrays: Vec<&Array> = Vec::new();
+        macro_rules! push_opt {
+            ($f:expr) => { if let Some(a) = &$f { arrays.push(a); } };
+        }
+        push_opt!(self.k_q);
+        push_opt!(self.k_scales);
+        push_opt!(self.k_biases);
+        push_opt!(self.v_q);
+        push_opt!(self.v_scales);
+        push_opt!(self.v_biases);
+        push_opt!(self.k_residual);
+        push_opt!(self.v_residual);
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::Array;
+
+    fn make_kv(b: i32, h: i32, t: i32, d: i32, seed: f32) -> (Array, Array) {
+        // Simple deterministic fill: value = (index * seed) % 1.0
+        let k_size = (b * h * t * d) as usize;
+        let k_data: Vec<f32> = (0..k_size).map(|i| ((i as f32) * seed) % 1.0).collect();
+        let v_data: Vec<f32> = (0..k_size).map(|i| ((i as f32) * seed * 0.5) % 1.0).collect();
+        (
+            Array::from_slice(&k_data, &[b, h, t, d]),
+            Array::from_slice(&v_data, &[b, h, t, d]),
+        )
+    }
+
+    #[test]
+    fn quantized_kv_cache_output_shape_single_call() {
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 256);
+        let (k, v) = make_kv(1, 4, 10, 256, 0.01);
+        let (k_out, v_out) = cache.update_and_fetch(k, v).unwrap();
+        assert_eq!(k_out.shape(), &[1, 4, 10, 256]);
+        assert_eq!(v_out.shape(), &[1, 4, 10, 256]);
+        assert_eq!(cache.offset(), 10);
+    }
+
+    #[test]
+    fn quantized_kv_cache_grows_across_decode_steps() {
+        // step=8 so quantization triggers after 8 tokens
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 8);
+        for i in 0..4_i32 {
+            let (k, v) = make_kv(1, 2, 4, 256, 0.01);
+            let (k_out, v_out) = cache.update_and_fetch(k, v).unwrap();
+            let expected = ((i + 1) * 4) as i32;
+            assert_eq!(k_out.shape()[2], expected);
+            assert_eq!(v_out.shape()[2], expected);
+            assert_eq!(cache.offset(), expected);
+        }
+    }
+
+    #[test]
+    fn quantized_kv_cache_step_triggers_quantization() {
+        // After exactly `step` tokens the residual should be empty
+        let step = 64_i32;
+        let mut cache = QuantizedKVCache::new(64, 8, 4, step);
+        let (k, v) = make_kv(1, 4, step, 256, 0.01);
+        let _ = cache.update_and_fetch(k, v).unwrap();
+        assert_eq!(cache.n_quantized, step);
+        assert!(cache.k_residual.is_none(), "residual should be empty after full step");
+    }
+
+    #[test]
+    fn quantized_kv_cache_reset_clears_state() {
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 8);
+        let (k, v) = make_kv(1, 2, 8, 256, 0.01);
+        cache.update_and_fetch(k, v).unwrap();
+        assert_eq!(cache.offset(), 8);
+        cache.reset();
+        assert_eq!(cache.offset(), 0);
+        assert_eq!(cache.n_quantized, 0);
+        assert!(cache.k_q.is_none());
+        assert!(cache.k_residual.is_none());
+    }
+
+    #[test]
+    fn quantized_kv_cache_prefill_then_decode() {
+        // Prefill 100 tokens, then decode 50 single-token steps
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 64);
+        let (k_pre, v_pre) = make_kv(1, 4, 100, 256, 0.01);
+        let (k_out, _) = cache.update_and_fetch(k_pre, v_pre).unwrap();
+        assert_eq!(k_out.shape()[2], 100);
+
+        for step in 1..=50_i32 {
+            let (k, v) = make_kv(1, 4, 1, 256, 0.01 + step as f32 * 0.001);
+            let (k_out, _) = cache.update_and_fetch(k, v).unwrap();
+            assert_eq!(k_out.shape()[2], 100 + step);
+            assert_eq!(cache.offset(), 100 + step);
+        }
+    }
+
+    #[test]
+    fn quantized_kv_cache_residual_matches_fp16_before_quantize() {
+        // With step=256, first 255 tokens stay in residual; output should be
+        // numerically identical to KVCache (no quantization applied yet).
+        let mut fp16 = KVCache::new();
+        let mut qkv = QuantizedKVCache::new(64, 8, 4, 256);
+
+        for i in 0..10_i32 {
+            let (k, v) = make_kv(1, 4, 1, 256, 0.01 + i as f32 * 0.001);
+            let (fp_k, fp_v) = fp16.update_and_fetch(k.clone(), v.clone()).unwrap();
+            let (q_k, q_v) = qkv.update_and_fetch(k, v).unwrap();
+            // shapes must match
+            assert_eq!(fp_k.shape(), q_k.shape(), "K shape mismatch at step {i}");
+            assert_eq!(fp_v.shape(), q_v.shape(), "V shape mismatch at step {i}");
+        }
+        // No quantization triggered yet
+        assert_eq!(qkv.n_quantized, 0);
+        assert!(qkv.k_q.is_none());
+    }
+
+    #[test]
+    fn quantized_kv_cache_invalid_group_size_errors() {
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 256);
+        // head_dim=100 is not divisible by group_size=64
+        let (k, v) = make_kv(1, 4, 1, 100, 0.01);
+        let result = cache.update_and_fetch(k, v);
+        assert!(result.is_err(), "Expected error for non-divisible head_dim");
     }
 }

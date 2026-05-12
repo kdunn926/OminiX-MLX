@@ -19,8 +19,8 @@ pub mod model;
 
 pub use cache::HybridCache;
 pub use config::ModelArgs;
-pub use model::{load_model, Model};
-pub use mlx_rs_core::{error::Error, load_tokenizer};
+pub use model::{load_model, KVCacheMode, Model};
+pub use mlx_rs_core::{cache::QuantizedKVCache, error::Error, load_tokenizer};
 
 use mlx_rs::{
     argmax_axis, array, categorical,
@@ -66,6 +66,19 @@ impl<'a> Generate<'a> {
         Self {
             model,
             cache: Vec::new(),
+            temp,
+            state: GenerateState::Prefill { prompt },
+            prefetched: None,
+            token_count: 0,
+        }
+    }
+
+    /// Same as `new` but pre-allocates mixed-precision KV caches (K=q8, V=q4).
+    pub fn new_quantized_kv(model: &'a mut Model, temp: f32, prompt: &'a Array) -> Self {
+        let cache = model.new_cache(KVCacheMode::Quantized);
+        Self {
+            model,
+            cache,
             temp,
             state: GenerateState::Prefill { prompt },
             prefetched: None,

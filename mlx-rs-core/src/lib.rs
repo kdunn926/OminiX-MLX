@@ -26,7 +26,7 @@ pub mod sampler;
 pub mod speculative;
 pub mod utils;
 
-pub use cache::{ConcatKeyValueCache, KVCache, KeyValueCache};
+pub use cache::{ConcatKeyValueCache, KVCache, KeyValueCache, QuantizedKVCache};
 pub use error::{Error, Result};
 pub use metal_kernels::{deltanet_recurrence, fused_modulate, fused_swiglu};
 pub use sampler::{DefaultSampler, Sampler};

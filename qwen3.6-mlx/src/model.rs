@@ -11,7 +11,7 @@ use mlx_rs::{
 };
 
 use mlx_rs_core::{
-    cache::KVCache,
+    cache::{KVCache, QuantizedKVCache},
     error::Error,
     utils::initialize_rope,
 };
@@ -64,6 +64,13 @@ impl TransformerBlock {
                     cache: Some(kv_cache),
                 })?
             }
+            (AttentionLayer::FullAttention(attn), HybridCache::QuantizedKV(qkv_cache)) => {
+                attn.forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(qkv_cache),
+                })?
+            }
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
                 let L = normed.shape()[1];
                 if L > 1 {
@@ -89,6 +96,16 @@ impl TransformerBlock {
 // Full Model
 // ============================================================================
 
+/// Selects which KV cache implementation to use for full-attention layers.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum KVCacheMode {
+    /// Standard fp16 KV cache (default).
+    #[default]
+    Standard,
+    /// Mixed-precision cache: K=q8, V=q4.
+    Quantized,
+}
+
 pub struct Qwen36TextModel {
     pub embed_tokens: MaybeQuantized<nn::Embedding>,
     pub layers: Vec<TransformerBlock>,
@@ -103,6 +120,23 @@ pub struct Model {
 }
 
 impl Model {
+    /// Allocate a fresh cache vector appropriate for this model.
+    ///
+    /// - `mode = Standard`   → full-attention layers get `KVCache`
+    /// - `mode = Quantized`  → full-attention layers get `QuantizedKVCache` (K=q8, V=q4)
+    pub fn new_cache(&self, mode: KVCacheMode) -> Vec<HybridCache> {
+        self.text_model.layer_types.iter().map(|lt| {
+            if lt == "full_attention" {
+                match mode {
+                    KVCacheMode::Standard => HybridCache::KV(KVCache::new()),
+                    KVCacheMode::Quantized => HybridCache::QuantizedKV(QuantizedKVCache::default()),
+                }
+            } else {
+                HybridCache::Recurrent(RecurrentState::new())
+            }
+        }).collect()
+    }
+
     /// Run the transformer and project only the last sequence position through
     /// the LM head. Avoids a `[B, T, vocab]` matmul during prefill.
     pub fn forward_last_logits(
@@ -155,6 +189,8 @@ impl Model {
             None
         };
 
+        // Lazily allocate standard caches; callers that want quantized caches
+        // should pre-populate via `model.new_cache(KVCacheMode::Quantized)`.
         if cache.is_empty() {
             for layer_type in &self.text_model.layer_types {
                 if layer_type == "full_attention" {

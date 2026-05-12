@@ -43,18 +43,18 @@ pub struct GatedAttention {
     pub rope: nn::Rope,
 }
 
-pub struct GatedAttentionInput<'a> {
+pub struct GatedAttentionInput<'a, C: KeyValueCache> {
     pub x: &'a Array,
     pub mask: Option<&'a AttentionMask>,
-    pub cache: Option<&'a mut KVCache>,
+    pub cache: Option<&'a mut C>,
 }
 
-impl Module<GatedAttentionInput<'_>> for GatedAttention {
+impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
     type Output = Array;
     type Error = Exception;
 
     #[allow(non_snake_case)]
-    fn forward(&mut self, input: GatedAttentionInput<'_>) -> Result<Self::Output, Self::Error> {
+    fn forward(&mut self, input: GatedAttentionInput<'_, C>) -> Result<Self::Output, Self::Error> {
         let GatedAttentionInput { x, mask, mut cache } = input;
 
         let shape = x.shape();

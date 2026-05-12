@@ -1,5 +1,5 @@
 use mlx_rs::Array;
-use mlx_rs_core::cache::{KVCache, KeyValueCache};
+use mlx_rs_core::cache::{KVCache, KeyValueCache, QuantizedKVCache};
 
 /// Recurrent state for DeltaNet layers.
 ///
@@ -33,10 +33,12 @@ impl Default for RecurrentState {
 
 /// Unified cache for hybrid model layers.
 ///
-/// Full attention layers use KV cache; DeltaNet layers use recurrent state.
+/// Full attention layers use KV cache or quantized KV cache;
+/// DeltaNet layers use recurrent state.
 #[derive(Debug, Clone)]
 pub enum HybridCache {
     KV(KVCache),
+    QuantizedKV(QuantizedKVCache),
     Recurrent(RecurrentState),
 }
 
@@ -44,6 +46,7 @@ impl HybridCache {
     pub fn offset(&self) -> i32 {
         match self {
             HybridCache::KV(kv) => kv.offset(),
+            HybridCache::QuantizedKV(qkv) => qkv.offset(),
             HybridCache::Recurrent(rec) => rec.step,
         }
     }
