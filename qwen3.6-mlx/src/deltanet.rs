@@ -208,7 +208,8 @@ impl GatedDeltaNet {
         // timesteps with one kernel launch. Falls back to the prior loop
         // when K isn't 32-aligned.
         let (output_bhlv, new_state) = if K_dim % 32 == 0 {
-            mlx_rs_core::deltanet_recurrence(&q, &k, &v, &decay, &beta, &state_in)?
+            let (out, state) = mlx_rs_core::deltanet_recurrence(&q, &k, &v, &decay, &beta, &state_in)?;
+            (out, state)
         } else {
             let decay_5d = decay.reshape(&[B, H, L, 1, 1])?;
             let k_col_all = k.reshape(&[B, H, L, K_dim, 1])?;

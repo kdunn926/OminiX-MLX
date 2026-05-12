@@ -173,20 +173,24 @@ const DELTANET_RECURRENCE_KERNEL_SOURCE: &str = r#"
             k_local[kk] = k_in[qk_base + kk];
         }
 
-        // 1) kv_mem = sum_k state[k] * k_t[k]
+        // 1) Apply decay first, then compute kv_mem = sum_k (decay*state[k]) * k_t[k].
+        //    The correct delta rule retrieves from the already-decayed state so that
+        //    delta = v_t - (alpha * S_{t-1})^T k_t.  Using the undecayed state here
+        //    produces wrong corrections and causes the model to collapse to EOS.
         T local_kv = T(0);
         for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            state_local[kk] *= decay_t;
             local_kv += state_local[kk] * k_local[kk];
         }
         T kv_mem = simd_sum(local_kv);
 
         T delta = (v_t - kv_mem) * beta_t;
 
-        // 2) state[k] = state[k] * decay + k_t[k] * delta
+        // 2) state[k] += k_t[k] * delta  (decay already applied above)
         // 3) output local accumulator: sum_k state[k] * q_t[k] (post-update)
         T local_out = T(0);
         for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
-            state_local[kk] = state_local[kk] * decay_t + k_local[kk] * delta;
+            state_local[kk] += k_local[kk] * delta;
             local_out += state_local[kk] * q_local[kk];
         }
         T out_val = simd_sum(local_out);
@@ -593,6 +597,11 @@ pub fn deltanet_recurrence(
                 "deltanet_recurrence Metal kernel execution failed"));
         }
 
+        // mlx_fast_metal_kernel_apply creates lazy arrays in MLX's computation
+        // graph — the kernel runs when eval() is triggered downstream, not here.
+        // mlx_synchronize is therefore a no-op here but is harmless to keep.
+        mlx_sys::mlx_synchronize(stream);
+
         let mut out_result = mlx_sys::mlx_array_new();
         mlx_sys::mlx_vector_array_get(&mut out_result, outputs, 0);
         let mut state_result = mlx_sys::mlx_array_new();
@@ -604,5 +613,144 @@ pub fn deltanet_recurrence(
         mlx_sys::mlx_stream_free(stream);
 
         Ok((Array::from_ptr(out_result), Array::from_ptr(state_result)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::ops::indexing::IndexOp;
+    use mlx_rs::Array;
+
+    /// Reference implementation of the delta rule recurrence in pure Rust/MLX ops.
+    ///
+    /// Matches the fallback loop in deltanet.rs (forward_prefill):
+    ///   - decay applied first
+    ///   - kv_mem retrieved from decayed state
+    ///   - state updated with k ⊗ delta (no second decay)
+    ///
+    /// Inputs:
+    ///   q, k: [B, H, L, K]   (float32)
+    ///   v:    [B, H, L, V]   (float32)
+    ///   decay: [B, H, L]     (float32, pre-exponentiated α)
+    ///   beta:  [B, H, L]     (float32)
+    ///   state_in: [B, H, K, V] (float32)
+    ///
+    /// Returns (output [B, H, L, V], state_out [B, H, K, V])
+    fn delta_rule_reference(
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        decay: &Array,
+        beta: &Array,
+        state_in: &Array,
+    ) -> Result<(Array, Array), mlx_rs::error::Exception> {
+        let shape = q.shape();
+        let (b, h, l, k_dim) = (shape[0], shape[1], shape[2], shape[3]);
+        let v_dim = v.shape()[3];
+
+        // state_t: [B, H, V, K] (transposed for matmul convenience)
+        let mut state_t = state_in.transpose_axes(&[0, 1, 3, 2])?;
+
+        let decay_5d = decay.reshape(&[b, h, l, 1, 1])?;
+        let k_col = k.reshape(&[b, h, l, k_dim, 1])?;
+        let q_col = q.reshape(&[b, h, l, k_dim, 1])?;
+        let v_col = v.reshape(&[b, h, l, v_dim, 1])?;
+        let beta_col = beta.reshape(&[b, h, l, 1, 1])?;
+        let k_row = k_col.transpose_axes(&[0, 1, 2, 4, 3])?;
+
+        let mut outputs = Vec::with_capacity(l as usize);
+        for t in 0..l {
+            let decay_t = decay_5d.index((.., .., t, .., ..));
+            let k_t   = k_col.index((.., .., t, .., ..));
+            let v_t   = v_col.index((.., .., t, .., ..));
+            let beta_t = beta_col.index((.., .., t, .., ..));
+            let q_t   = q_col.index((.., .., t, .., ..));
+            let k_r   = k_row.index((.., .., t, .., ..));
+
+            state_t = state_t.multiply(&decay_t)?;
+            let kv_mem = state_t.matmul(&k_t)?;
+            let delta = v_t.subtract(&kv_mem)?.multiply(&beta_t)?;
+            state_t = state_t.add(delta.matmul(&k_r)?)?;
+            outputs.push(state_t.matmul(&q_t)?);
+        }
+
+        let stacked = mlx_rs::ops::stack_axis(&outputs, 2)?;
+        let out_bhlv = stacked.reshape(&[b, h, l, v_dim])?;
+        let state_out = state_t.transpose_axes(&[0, 1, 3, 2])?;
+        Ok((out_bhlv, state_out))
+    }
+
+    /// Assert two arrays are element-wise close (max absolute diff < tol).
+    fn assert_arrays_close(a: &Array, b: &Array, tol: f32, label: &str) {
+        mlx_rs::transforms::eval([a, b]).unwrap();
+        let a_cont = a.contiguous().unwrap();
+        let b_cont = b.contiguous().unwrap();
+        mlx_rs::transforms::eval([&a_cont, &b_cont]).unwrap();
+        let a_slice = a_cont.as_slice::<f32>();
+        let b_slice = b_cont.as_slice::<f32>();
+        assert_eq!(a_slice.len(), b_slice.len(), "{}: array sizes differ", label);
+        let max_diff = a_slice
+            .iter()
+            .zip(b_slice.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < tol,
+            "{}: max absolute difference {} exceeds tolerance {}",
+            label, max_diff, tol,
+        );
+    }
+
+    /// Verify the Metal delta-rule kernel matches the reference fallback for a
+    /// small (B=1, H=2, L=4, K=32, V=32) input.  K=32 satisfies the K%32==0
+    /// condition so the fast kernel path is exercised.
+    ///
+    /// This test guards against the bug where the kernel retrieved kv_mem from
+    /// the *undecayed* state instead of the decayed state, causing the model to
+    /// collapse to EOS on the first decode token.
+    #[test]
+    fn test_deltanet_kernel_matches_reference() {
+        let b = 1i32;
+        let h = 2i32;
+        let l = 4i32;
+        let k_dim = 32i32;
+        let v_dim = 32i32;
+
+        let q_data: Vec<f32> = (0..(b * h * l * k_dim) as usize)
+            .map(|i| ((i as f32) * 0.01 - 0.5).tanh())
+            .collect();
+        let k_data: Vec<f32> = (0..(b * h * l * k_dim) as usize)
+            .map(|i| ((i as f32) * 0.013 - 0.3).tanh())
+            .collect();
+        let v_data: Vec<f32> = (0..(b * h * l * v_dim) as usize)
+            .map(|i| ((i as f32) * 0.007).sin() * 0.5)
+            .collect();
+        // decay in (0, 1): pre-exponentiated α values
+        let decay_data: Vec<f32> = (0..(b * h * l) as usize)
+            .map(|i| (-((i as f32) * 0.1 + 0.1).exp()).exp())
+            .collect();
+        let beta_data: Vec<f32> = (0..(b * h * l) as usize)
+            .map(|i| 1.0 / (1.0 + (-((i as f32) * 0.2)).exp()))
+            .collect();
+        let state_data = vec![0.0f32; (b * h * k_dim * v_dim) as usize];
+
+        let q = Array::from_slice(&q_data, &[b, h, l, k_dim]);
+        let k = Array::from_slice(&k_data, &[b, h, l, k_dim]);
+        let v = Array::from_slice(&v_data, &[b, h, l, v_dim]);
+        let decay = Array::from_slice(&decay_data, &[b, h, l]);
+        let beta = Array::from_slice(&beta_data, &[b, h, l]);
+        let state_in = Array::from_slice(&state_data, &[b, h, k_dim, v_dim]);
+
+        let (ref_out, ref_state) =
+            delta_rule_reference(&q, &k, &v, &decay, &beta, &state_in)
+                .expect("reference recurrence failed");
+
+        let (kernel_out, kernel_state) =
+            deltanet_recurrence(&q, &k, &v, &decay, &beta, &state_in)
+                .expect("Metal kernel recurrence failed");
+
+        assert_arrays_close(&kernel_out, &ref_out, 1e-4, "output");
+        assert_arrays_close(&kernel_state, &ref_state, 1e-4, "state_out");
     }
 }
