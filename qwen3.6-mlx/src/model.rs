@@ -21,7 +21,7 @@ use crate::cache::{HybridCache, RecurrentState};
 use crate::config::{ModelArgs, TextConfig};
 use crate::deltanet::GatedDeltaNet;
 use crate::moe::{
-    MoeBlock, QuantizedSwitchLinear, SharedExpert, SwitchGLU,
+    DenseMlp, MoeBlock, QuantizedSwitchLinear, SharedExpert, SwitchGLU,
 };
 
 // ============================================================================
@@ -33,9 +33,15 @@ pub enum AttentionLayer {
     LinearAttention(GatedDeltaNet),
 }
 
+/// FFN for a transformer block — either MoE (35B) or dense MLP (27B).
+pub enum FfnBlock {
+    Moe(MoeBlock),
+    Dense(DenseMlp),
+}
+
 pub struct TransformerBlock {
     pub attention: AttentionLayer,
-    pub moe: MoeBlock,
+    pub ffn: FfnBlock,
     pub input_layernorm: nn::RmsNorm,
     pub post_attention_layernorm: nn::RmsNorm,
 }
@@ -70,7 +76,11 @@ impl TransformerBlock {
         };
 
         let h = x.add(attn_out)?;
-        let mlp_out = self.moe.forward(&self.post_attention_layernorm.forward(&h)?)?;
+        let normed_h = self.post_attention_layernorm.forward(&h)?;
+        let mlp_out = match &mut self.ffn {
+            FfnBlock::Moe(m) => m.forward(&normed_h)?,
+            FfnBlock::Dense(d) => d.forward(&normed_h)?,
+        };
         h.add(mlp_out)
     }
 }
@@ -330,8 +340,18 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     }
 
     eprintln!(
-        "Loading {}-bit quantized Qwen3.6-35B-A3B ({} layers, {} experts, top-{})...",
-        bits, tc.num_hidden_layers, tc.num_experts, tc.num_experts_per_tok
+        "Loading {}-bit quantized Qwen3.6 ({} layers, {})...",
+        bits,
+        tc.num_hidden_layers,
+        if tc.is_moe() {
+            format!(
+                "MoE {} experts top-{}",
+                tc.num_experts.unwrap_or(0),
+                tc.num_experts_per_tok.unwrap_or(0)
+            )
+        } else {
+            "dense MLP".to_string()
+        }
     );
 
     let weights = load_all_weights(model_dir)?;
@@ -362,75 +382,105 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
             )?)
         };
 
-        // MoE: routing gate (8-bit) + switch experts (4-bit) + shared expert
-        let gate = MaybeQuantized::Quantized(make_quantized_linear(
-            &weights,
-            &format!("{}.mlp.gate", layer_prefix),
-            group_size,
-            8, // 8-bit for routing accuracy
-        )?);
+        // FFN: MoE for 35B, dense MLP for 27B
+        let ffn = if tc.is_moe() {
+            let num_experts = tc.num_experts.ok_or_else(|| {
+                Error::Model("MoE config missing num_experts".to_string())
+            })?;
+            let top_k = tc.num_experts_per_tok.ok_or_else(|| {
+                Error::Model("MoE config missing num_experts_per_tok".to_string())
+            })?;
 
-        let switch_mlp = SwitchGLU {
-            gate_proj: make_quantized_switch_linear(
+            let gate = MaybeQuantized::Quantized(make_quantized_linear(
                 &weights,
-                &format!("{}.mlp.switch_mlp.gate_proj", layer_prefix),
+                &format!("{}.mlp.gate", layer_prefix),
                 group_size,
-                bits,
-            )?,
-            up_proj: make_quantized_switch_linear(
-                &weights,
-                &format!("{}.mlp.switch_mlp.up_proj", layer_prefix),
-                group_size,
-                bits,
-            )?,
-            down_proj: make_quantized_switch_linear(
-                &weights,
-                &format!("{}.mlp.switch_mlp.down_proj", layer_prefix),
-                group_size,
-                bits,
-            )?,
-        };
+                8, // 8-bit for routing accuracy
+            )?);
 
-        let shared_expert = SharedExpert {
-            gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                &weights,
-                &format!("{}.mlp.shared_expert.gate_proj", layer_prefix),
-                group_size,
-                bits,
-            )?),
-            up_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                &weights,
-                &format!("{}.mlp.shared_expert.up_proj", layer_prefix),
-                group_size,
-                bits,
-            )?),
-            down_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                &weights,
-                &format!("{}.mlp.shared_expert.down_proj", layer_prefix),
-                group_size,
-                bits,
-            )?),
-        };
+            let switch_mlp = SwitchGLU {
+                gate_proj: make_quantized_switch_linear(
+                    &weights,
+                    &format!("{}.mlp.switch_mlp.gate_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?,
+                up_proj: make_quantized_switch_linear(
+                    &weights,
+                    &format!("{}.mlp.switch_mlp.up_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?,
+                down_proj: make_quantized_switch_linear(
+                    &weights,
+                    &format!("{}.mlp.switch_mlp.down_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?,
+            };
 
-        let shared_expert_gate = MaybeQuantized::Quantized(make_quantized_linear(
-            &weights,
-            &format!("{}.mlp.shared_expert_gate", layer_prefix),
-            group_size,
-            8, // 8-bit for gating accuracy
-        )?);
+            let shared_expert = SharedExpert {
+                gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    &weights,
+                    &format!("{}.mlp.shared_expert.gate_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+                up_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    &weights,
+                    &format!("{}.mlp.shared_expert.up_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+                down_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    &weights,
+                    &format!("{}.mlp.shared_expert.down_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+            };
 
-        let moe = MoeBlock {
-            num_experts: tc.num_experts,
-            top_k: tc.num_experts_per_tok,
-            gate,
-            switch_mlp,
-            shared_expert,
-            shared_expert_gate,
+            let shared_expert_gate = MaybeQuantized::Quantized(make_quantized_linear(
+                &weights,
+                &format!("{}.mlp.shared_expert_gate", layer_prefix),
+                group_size,
+                8, // 8-bit for gating accuracy
+            )?);
+
+            FfnBlock::Moe(MoeBlock {
+                num_experts,
+                top_k,
+                gate,
+                switch_mlp,
+                shared_expert,
+                shared_expert_gate,
+            })
+        } else {
+            FfnBlock::Dense(DenseMlp {
+                gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    &weights,
+                    &format!("{}.mlp.gate_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+                up_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    &weights,
+                    &format!("{}.mlp.up_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+                down_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    &weights,
+                    &format!("{}.mlp.down_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+            })
         };
 
         let block = TransformerBlock {
             attention,
-            moe,
+            ffn,
             input_layernorm: load_rms_norm(
                 &weights,
                 &format!("{}.input_layernorm.weight", layer_prefix),

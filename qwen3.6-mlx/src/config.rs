@@ -59,12 +59,15 @@ pub struct TextConfig {
     #[serde(default)]
     pub attn_output_gate: bool,
 
-    // MoE config
-    pub num_experts: i32,
-    pub num_experts_per_tok: i32,
-    pub moe_intermediate_size: i32,
+    // MoE config — absent for dense models
     #[serde(default)]
-    pub shared_expert_intermediate_size: i32,
+    pub num_experts: Option<i32>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<i32>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<i32>,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: Option<i32>,
 
     // Quantization (sometimes inside text_config)
     #[serde(default)]
@@ -73,6 +76,13 @@ pub struct TextConfig {
 
 fn default_max_pos() -> i32 {
     262144
+}
+
+impl TextConfig {
+    /// Returns true if this config describes a Mixture-of-Experts model.
+    pub fn is_moe(&self) -> bool {
+        self.num_experts.unwrap_or(0) > 0
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,5 +100,78 @@ impl ModelArgs {
         self.quantization
             .as_ref()
             .or(self.text_config.quantization.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_text_config(extras: &str) -> TextConfig {
+        let json = format!(
+            r#"{{
+                "hidden_size": 5120,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 248320,
+                "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "rope_parameters": {{"rope_theta": 10000000.0, "partial_rotary_factor": 0.25}}
+                {}
+            }}"#,
+            if extras.is_empty() { String::new() } else { format!(", {}", extras) }
+        );
+        serde_json::from_str(&json).expect("minimal TextConfig parse failed")
+    }
+
+    #[test]
+    fn is_moe_false_for_dense_config() {
+        let tc = minimal_text_config("");
+        assert!(!tc.is_moe(), "dense config should not be MoE");
+        assert_eq!(tc.num_experts, None);
+        assert_eq!(tc.num_experts_per_tok, None);
+    }
+
+    #[test]
+    fn is_moe_true_for_moe_config() {
+        let tc = minimal_text_config(
+            r#""num_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 2048"#,
+        );
+        assert!(tc.is_moe(), "MoE config should report is_moe() true");
+        assert_eq!(tc.num_experts, Some(256));
+        assert_eq!(tc.num_experts_per_tok, Some(8));
+    }
+
+    #[test]
+    fn is_moe_false_when_num_experts_is_zero() {
+        let tc = minimal_text_config(r#""num_experts": 0"#);
+        assert!(!tc.is_moe(), "num_experts=0 should not be MoE");
+    }
+
+    #[test]
+    fn quantization_top_level_takes_precedence() {
+        let json = r#"{
+            "text_config": {
+                "hidden_size": 5120, "num_hidden_layers": 4, "num_attention_heads": 24,
+                "num_key_value_heads": 4, "head_dim": 256, "rms_norm_eps": 1e-6,
+                "vocab_size": 248320,
+                "layer_types": ["linear_attention","linear_attention","linear_attention","full_attention"],
+                "linear_num_key_heads": 16, "linear_num_value_heads": 48,
+                "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "rope_parameters": {"rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
+                "quantization": {"group_size": 64, "bits": 4}
+            },
+            "quantization": {"group_size": 32, "bits": 8}
+        }"#;
+        let args: ModelArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.quantization().unwrap().bits, 8, "top-level quant should win");
     }
 }

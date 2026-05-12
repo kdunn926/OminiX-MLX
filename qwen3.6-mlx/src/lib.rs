@@ -1,9 +1,12 @@
-//! Qwen3.6-35B-A3B hybrid inference on Apple Silicon with MLX.
+//! Qwen3.6 hybrid inference on Apple Silicon with MLX.
 //!
-//! This crate implements the Qwen3.6-35B-A3B model which uses a hybrid architecture:
-//! - **30 DeltaNet layers** (linear attention with fixed-size recurrent state)
-//! - **10 Gated Attention layers** (full attention with partial RoPE and output gate)
-//! - **MoE** on every layer: 256 experts (top-8 routed) + 1 shared expert
+//! This crate implements Qwen3.6 models using a hybrid attention architecture:
+//! - **Linear attention layers** (GatedDeltaNet — fixed-size recurrent state)
+//! - **Full attention layers** (GatedAttention — with partial RoPE and output gate)
+//!
+//! Supported variants:
+//! - **Qwen3.6-35B-A3B**: 256 routed experts (top-8) + 1 shared expert per layer (MoE)
+//! - **Qwen3.6-27B**: Standard dense MLP (gate/up/down_proj) per layer
 //!
 //! Supports 4-bit quantized models from the `mlx-community` HuggingFace hub.
 

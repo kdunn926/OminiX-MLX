@@ -148,8 +148,36 @@ impl SwitchGLU {
 }
 
 // ============================================================================
-// Shared Expert — dense MLP that always participates
+// DenseMlp — standard gate/up/down SwiGLU MLP for dense (non-MoE) models
 // ============================================================================
+
+/// Dense MLP: `down_proj(fused_swiglu(up_proj(x), gate_proj(x)))`.
+/// Identical SwiGLU pattern to `SharedExpert`, used for dense Qwen3.6 variants.
+#[derive(Debug, ModuleParameters)]
+pub struct DenseMlp {
+    #[param]
+    pub gate_proj: MaybeQuantized<nn::Linear>,
+    #[param]
+    pub up_proj: MaybeQuantized<nn::Linear>,
+    #[param]
+    pub down_proj: MaybeQuantized<nn::Linear>,
+}
+
+impl Module<&Array> for DenseMlp {
+    type Output = Array;
+    type Error = Exception;
+
+    fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
+        let gate = self.gate_proj.forward(x)?;
+        let up = self.up_proj.forward(x)?;
+        let activated = fused_swiglu(&up, &gate)?;
+        self.down_proj.forward(&activated)
+    }
+
+    fn training_mode(&mut self, _mode: bool) {}
+}
+
+
 
 #[derive(Debug, ModuleParameters)]
 pub struct SharedExpert {
