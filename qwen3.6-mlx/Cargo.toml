@@ -12,7 +12,8 @@ mlx-rs-core = { path = "../mlx-rs-core" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokenizers = "0.21"
+tokenizers = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [dev-dependencies]
 anyhow = "1"

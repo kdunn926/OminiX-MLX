@@ -10,12 +10,12 @@
 //!   cargo run --example bench_kv_quant --release -- \
 //!     ../OminiX-MLX/models/Qwen3.6-35B-A3B-4bit 50
 
-use std::collections::HashSet;
 use mlx_rs::{
     ops::indexing::{IndexOp, NewAxis},
     Array,
 };
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
+use std::collections::HashSet;
 
 struct BenchResult {
     ctx_tokens: usize,
@@ -96,9 +96,9 @@ fn main() -> anyhow::Result<()> {
 
     // Load EOS tokens once
     let eos_tokens: HashSet<u32> = {
-        let cfg: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(std::path::Path::new(&model_dir).join("config.json"))?,
-        )?;
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            std::path::Path::new(&model_dir).join("config.json"),
+        )?)?;
         match &cfg["eos_token_id"] {
             serde_json::Value::Array(ids) => ids
                 .iter()
@@ -115,7 +115,10 @@ fn main() -> anyhow::Result<()> {
     // Per token: fp16 = 64 layers * 2 * 4 heads * 256 head_dim * 2 bytes = 256 KB
     //            q8k/q4v ≈ 104 KB (59% savings)
     eprintln!("Theoretical KV-cache memory (27B dense):");
-    eprintln!("{:<8} {:>10} {:>12} {:>10}", "ctx(K)", "fp16(GB)", "q8k/q4v(GB)", "savings%");
+    eprintln!(
+        "{:<8} {:>10} {:>12} {:>10}",
+        "ctx(K)", "fp16(GB)", "q8k/q4v(GB)", "savings%"
+    );
     for k in [1, 4, 8, 16, 32, 64, 128, 256] {
         let fp16 = k as f64 * 1024.0 * 256.0 / 1e9;
         let qkv = k as f64 * 1024.0 * 104.0 / 1e9;

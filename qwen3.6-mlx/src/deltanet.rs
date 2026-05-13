@@ -3,11 +3,7 @@ use mlx_rs::{
     error::Exception,
     module::{Module, Param},
     nn,
-    ops::{
-        broadcast_to, concatenate_axis,
-        indexing::IndexOp,
-        zeros_dtype,
-    },
+    ops::{broadcast_to, concatenate_axis, indexing::IndexOp, zeros_dtype},
     quantization::MaybeQuantized,
     transforms::async_eval,
     Array,
@@ -30,14 +26,14 @@ const EVAL_INTERVAL: i32 = 8;
 /// that serves as a compressed memory, replacing the growing KV cache.
 pub struct GatedDeltaNet {
     pub in_proj_qkv: MaybeQuantized<nn::Linear>, // hidden → key_dim*2 + value_dim
-    pub in_proj_z: MaybeQuantized<nn::Linear>,    // hidden → value_dim (output gate)
-    pub in_proj_a: MaybeQuantized<nn::Linear>,    // hidden → num_v_heads (alpha/decay)
-    pub in_proj_b: MaybeQuantized<nn::Linear>,    // hidden → num_v_heads (beta/update)
-    pub conv1d_weight: Param<Array>,              // [conv_dim, 1, kernel_size]
-    pub a_log: Param<Array>,                      // [num_v_heads]
-    pub dt_bias: Param<Array>,                    // [num_v_heads]
-    pub norm: nn::RmsNorm,                        // weight shape [value_head_dim]
-    pub out_proj: MaybeQuantized<nn::Linear>,     // value_dim → hidden
+    pub in_proj_z: MaybeQuantized<nn::Linear>,   // hidden → value_dim (output gate)
+    pub in_proj_a: MaybeQuantized<nn::Linear>,   // hidden → num_v_heads (alpha/decay)
+    pub in_proj_b: MaybeQuantized<nn::Linear>,   // hidden → num_v_heads (beta/update)
+    pub conv1d_weight: Param<Array>,             // [conv_dim, 1, kernel_size]
+    pub a_log: Param<Array>,                     // [num_v_heads]
+    pub dt_bias: Param<Array>,                   // [num_v_heads]
+    pub norm: nn::RmsNorm,                       // weight shape [value_head_dim]
+    pub out_proj: MaybeQuantized<nn::Linear>,    // value_dim → hidden
 
     // Dimensions
     pub num_k_heads: i32,
@@ -71,9 +67,9 @@ impl GatedDeltaNet {
 
         // 1. Project
         let qkv = self.in_proj_qkv.forward(x)?; // [B, 1, conv_dim]
-        let z = self.in_proj_z.forward(x)?;      // [B, 1, value_dim]
-        let a = self.in_proj_a.forward(x)?;      // [B, 1, num_v_heads]
-        let b = self.in_proj_b.forward(x)?;      // [B, 1, num_v_heads]
+        let z = self.in_proj_z.forward(x)?; // [B, 1, value_dim]
+        let a = self.in_proj_a.forward(x)?; // [B, 1, num_v_heads]
+        let b = self.in_proj_b.forward(x)?; // [B, 1, num_v_heads]
 
         // 2. Causal Conv1d update
         // qkv: [B, 1, conv_dim] → [B, conv_dim, 1]
@@ -149,9 +145,9 @@ impl GatedDeltaNet {
 
         // 1. Project full sequence (parallel)
         let qkv = self.in_proj_qkv.forward(x)?; // [B, L, conv_dim]
-        let z = self.in_proj_z.forward(x)?;      // [B, L, value_dim]
-        let a = self.in_proj_a.forward(x)?;      // [B, L, num_v_heads]
-        let b = self.in_proj_b.forward(x)?;      // [B, L, num_v_heads]
+        let z = self.in_proj_z.forward(x)?; // [B, L, value_dim]
+        let a = self.in_proj_a.forward(x)?; // [B, L, num_v_heads]
+        let b = self.in_proj_b.forward(x)?; // [B, L, num_v_heads]
 
         // 2. Causal Conv1d on full sequence (parallel)
         let qkv_cf = qkv.transpose_axes(&[0, 2, 1])?; // [B, conv_dim, L]
@@ -189,11 +185,21 @@ impl GatedDeltaNet {
         let K_dim = self.key_head_dim;
         let V_dim = self.value_head_dim;
 
-        let q = q.as_dtype(mlx_rs::Dtype::Float32)?.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.as_dtype(mlx_rs::Dtype::Float32)?.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.as_dtype(mlx_rs::Dtype::Float32)?.transpose_axes(&[0, 2, 1, 3])?;
-        let g = g.as_dtype(mlx_rs::Dtype::Float32)?.transpose_axes(&[0, 2, 1])?;
-        let beta = beta.as_dtype(mlx_rs::Dtype::Float32)?.transpose_axes(&[0, 2, 1])?;
+        let q = q
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k = k
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let v = v
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let g = g
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1])?;
+        let beta = beta
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1])?;
         // q, k: [B, H, L, K], v: [B, H, L, V], g, beta: [B, H, L]
 
         let state_in = match cache.state.take() {
@@ -208,7 +214,8 @@ impl GatedDeltaNet {
         // timesteps with one kernel launch. Falls back to the prior loop
         // when K isn't 32-aligned.
         let (output_bhlv, new_state) = if K_dim % 32 == 0 {
-            let (out, state) = mlx_rs_core::deltanet_recurrence(&q, &k, &v, &decay, &beta, &state_in)?;
+            let (out, state) =
+                mlx_rs_core::deltanet_recurrence(&q, &k, &v, &decay, &beta, &state_in)?;
             (out, state)
         } else {
             let decay_5d = decay.reshape(&[B, H, L, 1, 1])?;
@@ -279,7 +286,10 @@ impl GatedDeltaNet {
         cache.conv_state = Some(combined.index((.., .., 1..)));
 
         // Depthwise conv: weight [conv_dim, 1, kernel_size] → [conv_dim, kernel_size]
-        let w = self.conv1d_weight.as_ref().reshape(&[self.conv_dim, kernel_size])?;
+        let w = self
+            .conv1d_weight
+            .as_ref()
+            .reshape(&[self.conv_dim, kernel_size])?;
         // combined [B, conv_dim, kernel_size] * w [conv_dim, kernel_size] → sum over last dim
         let out = combined.multiply(&w)?.sum_axis(-1, false)?; // [B, conv_dim]
         let out = nn::silu(out)?;
@@ -300,17 +310,17 @@ impl GatedDeltaNet {
         let kernel_size = self.conv_kernel_size;
 
         // Pad left with zeros: [B, conv_dim, kernel_size-1 + L]
-        let zero_pad = zeros_dtype(
-            &[B, self.conv_dim, kernel_size - 1],
-            qkv_cf.dtype(),
-        )?;
+        let zero_pad = zeros_dtype(&[B, self.conv_dim, kernel_size - 1], qkv_cf.dtype())?;
         let padded = concatenate_axis(&[&zero_pad, qkv_cf], -1)?;
 
         // Save conv state: last kernel_size-1 elements of raw qkv
         cache.conv_state = Some(qkv_cf.index((.., .., -(kernel_size - 1)..)));
 
         // Apply depthwise conv using kernel tap loop (kernel_size=4 iterations)
-        let w = self.conv1d_weight.as_ref().reshape(&[self.conv_dim, kernel_size])?;
+        let w = self
+            .conv1d_weight
+            .as_ref()
+            .reshape(&[self.conv_dim, kernel_size])?;
         let mut result = zeros_dtype(&[B, self.conv_dim, L], qkv_cf.dtype())?;
         for tap in 0..kernel_size {
             let window = padded.index((.., .., tap..tap + L));
@@ -391,7 +401,12 @@ impl GatedDeltaNet {
         let a = a.as_dtype(mlx_rs::Dtype::Float32)?;
         let a_plus_bias = a.add(self.dt_bias.as_ref())?;
         let sp = nn::softplus(a_plus_bias)?;
-        let neg_exp_a_log = self.a_log.as_ref().as_dtype(mlx_rs::Dtype::Float32)?.exp()?.negative()?;
+        let neg_exp_a_log = self
+            .a_log
+            .as_ref()
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .exp()?
+            .negative()?;
         neg_exp_a_log.multiply(sp)
     }
 
@@ -400,7 +415,12 @@ impl GatedDeltaNet {
         let a = a.as_dtype(mlx_rs::Dtype::Float32)?;
         let a_plus_bias = a.add(self.dt_bias.as_ref())?;
         let sp = nn::softplus(a_plus_bias)?;
-        let neg_exp_a_log = self.a_log.as_ref().as_dtype(mlx_rs::Dtype::Float32)?.exp()?.negative()?;
+        let neg_exp_a_log = self
+            .a_log
+            .as_ref()
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .exp()?
+            .negative()?;
         neg_exp_a_log.multiply(sp)
     }
 
@@ -408,11 +428,7 @@ impl GatedDeltaNet {
     ///
     /// Input: [B, ..., num_k_heads, head_dim]
     /// Output: [B, ..., num_v_heads, head_dim]
-    fn repeat_interleave_heads(
-        &self,
-        x: &Array,
-        ratio: i32,
-    ) -> Result<Array, Exception> {
+    fn repeat_interleave_heads(&self, x: &Array, ratio: i32) -> Result<Array, Exception> {
         if ratio == 1 {
             return Ok(x.clone());
         }

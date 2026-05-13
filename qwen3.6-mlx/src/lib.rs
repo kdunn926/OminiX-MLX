@@ -14,13 +14,15 @@ pub mod attention;
 pub mod cache;
 pub mod config;
 pub mod deltanet;
-pub mod moe;
 pub mod model;
+pub mod moe;
+pub mod vision;
 
 pub use cache::HybridCache;
-pub use config::ModelArgs;
-pub use model::{load_model, KVCacheMode, Model};
+pub use config::{ModelArgs, VisionConfig};
 pub use mlx_rs_core::{cache::QuantizedKVCache, error::Error, load_tokenizer};
+pub use model::{load_model, load_vl_model, KVCacheMode, Model, VlModel};
+pub use vision::{preprocess_image, VisionTower};
 
 use mlx_rs::{
     argmax_axis, array, categorical,
@@ -28,6 +30,72 @@ use mlx_rs::{
     ops::indexing::{IndexOp, NewAxis},
     Array,
 };
+
+/// A single message in a multi-turn VL chat, with pre-formatted text content.
+pub struct VlChatMessage {
+    pub role: String,
+    pub text: String,
+    /// Number of image placeholder tokens to insert (from visual_features.shape()[0]).
+    pub n_visual_tokens: Option<usize>,
+}
+
+pub fn build_chat_tokens_for_messages(
+    tokenizer: &tokenizers::Tokenizer,
+    messages: &[VlChatMessage],
+    image_token_id: i32,
+    vision_start_token_id: i32,
+    vision_end_token_id: i32,
+) -> Result<Vec<i32>, mlx_rs_core::error::Error> {
+    let im_start = tokenizer
+        .token_to_id("<|im_start|>")
+        .ok_or_else(|| mlx_rs_core::error::Error::Tokenizer("Missing <|im_start|>".into()))?
+        as i32;
+    let im_end = tokenizer
+        .token_to_id("<|im_end|>")
+        .ok_or_else(|| mlx_rs_core::error::Error::Tokenizer("Missing <|im_end|>".into()))?
+        as i32;
+    let newline = tokenizer.token_to_id("\n").unwrap_or(198) as i32;
+
+    let encode = |text: &str| -> Result<Vec<i32>, mlx_rs_core::error::Error> {
+        let enc = tokenizer.encode(text, false)?;
+        Ok(enc.get_ids().iter().map(|&id| id as i32).collect())
+    };
+
+    let mut tokens: Vec<i32> = Vec::new();
+
+    for msg in messages {
+        let role_tokens = encode(&msg.role)?;
+        let text_tokens = if msg.text.is_empty() {
+            vec![]
+        } else {
+            encode(&msg.text)?
+        };
+
+        tokens.push(im_start);
+        tokens.extend_from_slice(&role_tokens);
+        tokens.push(newline);
+
+        if let Some(n_visual) = msg.n_visual_tokens {
+            tokens.push(vision_start_token_id);
+            for _ in 0..n_visual {
+                tokens.push(image_token_id);
+            }
+            tokens.push(vision_end_token_id);
+            tokens.push(newline);
+        }
+
+        tokens.extend_from_slice(&text_tokens);
+        tokens.push(im_end);
+        tokens.push(newline);
+    }
+
+    let assistant_tokens = encode("assistant")?;
+    tokens.push(im_start);
+    tokens.extend_from_slice(&assistant_tokens);
+    tokens.push(newline);
+
+    Ok(tokens)
+}
 
 // ============================================================================
 // Sampling

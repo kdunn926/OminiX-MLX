@@ -11,7 +11,7 @@ use mlx_rs::{
     nn,
     ops::{
         self,
-        indexing::{IndexOp, NewAxis, take_along_axis, take_axis},
+        indexing::{take_along_axis, take_axis, IndexOp, NewAxis},
     },
     quantization::MaybeQuantized,
     Array,
@@ -41,7 +41,12 @@ pub struct QuantizedSwitchLinear {
 
 impl QuantizedSwitchLinear {
     /// Apply gather_qmm with expert selection indices.
-    pub fn apply(&self, x: &Array, indices: &Array, sorted_indices: bool) -> Result<Array, Exception> {
+    pub fn apply(
+        &self,
+        x: &Array,
+        indices: &Array,
+        sorted_indices: bool,
+    ) -> Result<Array, Exception> {
         mlx_rs::ops::gather_qmm(
             x,
             &*self.weight,
@@ -83,7 +88,11 @@ fn gather_sort(x: &Array, indices: &Array) -> Result<(Array, Array, Array), Exce
 }
 
 /// Unsort output back to original token order.
-fn scatter_unsort(x: &Array, inv_order: &Array, original_shape: &[i32]) -> Result<Array, Exception> {
+fn scatter_unsort(
+    x: &Array,
+    inv_order: &Array,
+    original_shape: &[i32],
+) -> Result<Array, Exception> {
     let x_shape = x.shape();
     let d = *x_shape.last().unwrap() as i32;
 
@@ -128,9 +137,15 @@ impl SwitchGLU {
             let activated = fused_swiglu(&up, &gate)?;
             let output = self.down_proj.apply(&activated, &indices_sorted, true)?;
 
-            let output_unsorted = scatter_unsort(&output, &inv_order, &[b as i32, l as i32, k as i32])?;
+            let output_unsorted =
+                scatter_unsort(&output, &inv_order, &[b as i32, l as i32, k as i32])?;
             let shape = output_unsorted.shape();
-            output_unsorted.reshape(&[shape[0] as i32, shape[1] as i32, shape[2] as i32, shape[4] as i32])
+            output_unsorted.reshape(&[
+                shape[0] as i32,
+                shape[1] as i32,
+                shape[2] as i32,
+                shape[4] as i32,
+            ])
         } else {
             let gate = self.gate_proj.apply(&x_expanded, indices, false)?;
             let up = self.up_proj.apply(&x_expanded, indices, false)?;
@@ -139,7 +154,12 @@ impl SwitchGLU {
 
             let shape = output.shape();
             if shape.len() == 5 {
-                output.reshape(&[shape[0] as i32, shape[1] as i32, shape[2] as i32, shape[4] as i32])
+                output.reshape(&[
+                    shape[0] as i32,
+                    shape[1] as i32,
+                    shape[2] as i32,
+                    shape[4] as i32,
+                ])
             } else {
                 Ok(output)
             }
@@ -176,8 +196,6 @@ impl Module<&Array> for DenseMlp {
 
     fn training_mode(&mut self, _mode: bool) {}
 }
-
-
 
 #[derive(Debug, ModuleParameters)]
 pub struct SharedExpert {

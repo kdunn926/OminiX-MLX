@@ -92,6 +92,17 @@ pub struct ModelArgs {
     pub tie_word_embeddings: bool,
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
+    // VL fields (absent for text-only models)
+    #[serde(default)]
+    pub vision_config: Option<VisionConfig>,
+    #[serde(default)]
+    pub image_token_id: Option<i32>,
+    #[serde(default)]
+    pub vision_start_token_id: Option<i32>,
+    #[serde(default)]
+    pub vision_end_token_id: Option<i32>,
+    #[serde(default)]
+    pub language_model_only: Option<bool>,
 }
 
 impl ModelArgs {
@@ -101,6 +112,66 @@ impl ModelArgs {
             .as_ref()
             .or(self.text_config.quantization.as_ref())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct VisionConfig {
+    #[serde(default = "default_vis_depth")]
+    pub depth: usize,
+    #[serde(default = "default_vis_hidden")]
+    pub hidden_size: i32,
+    #[serde(default = "default_vis_heads")]
+    pub num_heads: i32,
+    #[serde(default = "default_vis_intermediate")]
+    pub intermediate_size: i32,
+    #[serde(default = "default_vis_patch_size")]
+    pub patch_size: i32,
+    #[serde(default = "default_temporal_patch_size")]
+    pub temporal_patch_size: i32,
+    #[serde(default = "default_in_channels")]
+    pub in_channels: i32,
+    #[serde(default = "default_out_hidden_size")]
+    pub out_hidden_size: i32,
+    #[serde(default = "default_num_pos_emb")]
+    pub num_position_embeddings: i32,
+    #[serde(default = "default_spatial_merge_size")]
+    pub spatial_merge_size: i32,
+    #[serde(default = "default_deepstack_indexes")]
+    pub deepstack_visual_indexes: Vec<usize>,
+}
+
+fn default_vis_depth() -> usize {
+    24
+}
+fn default_vis_hidden() -> i32 {
+    1152
+}
+fn default_vis_heads() -> i32 {
+    16
+}
+fn default_vis_intermediate() -> i32 {
+    4096
+}
+fn default_vis_patch_size() -> i32 {
+    16
+}
+fn default_temporal_patch_size() -> i32 {
+    2
+}
+fn default_in_channels() -> i32 {
+    3
+}
+fn default_out_hidden_size() -> i32 {
+    5120
+}
+fn default_num_pos_emb() -> i32 {
+    2304
+}
+fn default_spatial_merge_size() -> i32 {
+    2
+}
+fn default_deepstack_indexes() -> Vec<usize> {
+    vec![5, 11, 17]
 }
 
 #[cfg(test)]
@@ -126,7 +197,11 @@ mod tests {
                 "rope_parameters": {{"rope_theta": 10000000.0, "partial_rotary_factor": 0.25}}
                 {}
             }}"#,
-            if extras.is_empty() { String::new() } else { format!(", {}", extras) }
+            if extras.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", extras)
+            }
         );
         serde_json::from_str(&json).expect("minimal TextConfig parse failed")
     }
@@ -172,6 +247,10 @@ mod tests {
             "quantization": {"group_size": 32, "bits": 8}
         }"#;
         let args: ModelArgs = serde_json::from_str(json).unwrap();
-        assert_eq!(args.quantization().unwrap().bits, 8, "top-level quant should win");
+        assert_eq!(
+            args.quantization().unwrap().bits,
+            8,
+            "top-level quant should win"
+        );
     }
 }

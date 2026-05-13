@@ -20,9 +20,8 @@ use crate::attention::{GatedAttention, GatedAttentionInput};
 use crate::cache::{HybridCache, RecurrentState};
 use crate::config::{ModelArgs, TextConfig};
 use crate::deltanet::GatedDeltaNet;
-use crate::moe::{
-    DenseMlp, MoeBlock, QuantizedSwitchLinear, SharedExpert, SwitchGLU,
-};
+use crate::moe::{DenseMlp, MoeBlock, QuantizedSwitchLinear, SharedExpert, SwitchGLU};
+use crate::vision::VisionTower;
 
 // ============================================================================
 // Layer Types
@@ -64,13 +63,12 @@ impl TransformerBlock {
                     cache: Some(kv_cache),
                 })?
             }
-            (AttentionLayer::FullAttention(attn), HybridCache::QuantizedKV(qkv_cache)) => {
-                attn.forward(GatedAttentionInput {
+            (AttentionLayer::FullAttention(attn), HybridCache::QuantizedKV(qkv_cache)) => attn
+                .forward(GatedAttentionInput {
                     x: &normed,
                     mask,
                     cache: Some(qkv_cache),
-                })?
-            }
+                })?,
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
                 let L = normed.shape()[1];
                 if L > 1 {
@@ -125,16 +123,22 @@ impl Model {
     /// - `mode = Standard`   → full-attention layers get `KVCache`
     /// - `mode = Quantized`  → full-attention layers get `QuantizedKVCache` (K=q8, V=q4)
     pub fn new_cache(&self, mode: KVCacheMode) -> Vec<HybridCache> {
-        self.text_model.layer_types.iter().map(|lt| {
-            if lt == "full_attention" {
-                match mode {
-                    KVCacheMode::Standard => HybridCache::KV(KVCache::new()),
-                    KVCacheMode::Quantized => HybridCache::QuantizedKV(QuantizedKVCache::default()),
+        self.text_model
+            .layer_types
+            .iter()
+            .map(|lt| {
+                if lt == "full_attention" {
+                    match mode {
+                        KVCacheMode::Standard => HybridCache::KV(KVCache::new()),
+                        KVCacheMode::Quantized => {
+                            HybridCache::QuantizedKV(QuantizedKVCache::default())
+                        }
+                    }
+                } else {
+                    HybridCache::Recurrent(RecurrentState::new())
                 }
-            } else {
-                HybridCache::Recurrent(RecurrentState::new())
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Run the transformer and project only the last sequence position through
@@ -169,6 +173,49 @@ impl Model {
                 MaybeQuantized::Quantized(qe) => qe.as_linear(&h),
             },
         }
+    }
+
+    /// Forward pass starting from pre-built embeddings instead of token IDs.
+    /// Used for multimodal generation where visual features are spliced in.
+    pub fn forward_from_embeds(
+        &mut self,
+        embeddings: &Array,
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<Array, Exception> {
+        let mut h = embeddings.clone();
+        let t = h.shape()[1];
+        let mask = if t > 1 {
+            Some(mlx_rs_core::utils::AttentionMask::Causal)
+        } else {
+            None
+        };
+        if cache.is_empty() {
+            for layer_type in &self.text_model.layer_types {
+                if layer_type == "full_attention" {
+                    cache.push(HybridCache::KV(KVCache::new()));
+                } else {
+                    cache.push(HybridCache::Recurrent(RecurrentState::new()));
+                }
+            }
+        }
+        for (block, c) in self.text_model.layers.iter_mut().zip(cache.iter_mut()) {
+            h = block.forward(&h, mask.as_ref(), c)?;
+        }
+        h = self.text_model.norm.forward(&h)?;
+        let last = h.index((.., -1i32, ..));
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last),
+            None => match &mut self.text_model.embed_tokens {
+                MaybeQuantized::Original(e) => e.as_linear(&last),
+                MaybeQuantized::Quantized(qe) => qe.as_linear(&last),
+            },
+        }
+    }
+
+    /// Embed a slice of token IDs.
+    pub fn embed_tokens(&mut self, ids: &[i32]) -> Result<Array, Exception> {
+        let arr = Array::from_slice(ids, &[1, ids.len() as i32]);
+        self.text_model.embed_tokens.forward(&arr)
     }
 
     #[allow(non_snake_case)]
@@ -354,17 +401,20 @@ fn detect_lm_head_prefix(weights: &HashMap<String, Array>) -> &'static str {
     }
 }
 
-pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
-    let model_dir = model_dir.as_ref();
-
-    let config_file = std::fs::File::open(model_dir.join("config.json"))?;
-    let args: ModelArgs = serde_json::from_reader(config_file)?;
+fn build_model_from_weights(
+    weights: &HashMap<String, Array>,
+    args: &ModelArgs,
+) -> Result<Model, Error> {
     let tc = &args.text_config;
 
     let quant = args.quantization();
     let (group_size, bits) = match quant {
         Some(q) => (q.group_size, q.bits),
-        None => return Err(Error::Model("Only quantized models are supported".to_string())),
+        None => {
+            return Err(Error::Model(
+                "Only quantized models are supported".to_string(),
+            ))
+        }
     };
 
     if tc.layer_types.len() != tc.num_hidden_layers as usize {
@@ -374,6 +424,196 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
             tc.num_hidden_layers
         )));
     }
+
+    let prefix = detect_prefix(weights);
+    let lm_head_prefix = detect_lm_head_prefix(weights);
+
+    let mut layers = Vec::with_capacity(tc.num_hidden_layers as usize);
+    for i in 0..tc.num_hidden_layers {
+        let layer_prefix = format!("{}.layers.{}", prefix, i);
+        let layer_type = &tc.layer_types[i as usize];
+
+        let attention = if layer_type == "full_attention" {
+            AttentionLayer::FullAttention(load_gated_attention(
+                weights,
+                &layer_prefix,
+                tc,
+                group_size,
+                bits,
+            )?)
+        } else {
+            AttentionLayer::LinearAttention(load_gated_deltanet(
+                weights,
+                &layer_prefix,
+                tc,
+                group_size,
+                bits,
+            )?)
+        };
+
+        let ffn = if tc.is_moe() {
+            let num_experts = tc
+                .num_experts
+                .ok_or_else(|| Error::Model("MoE config missing num_experts".to_string()))?;
+            let top_k = tc.num_experts_per_tok.ok_or_else(|| {
+                Error::Model("MoE config missing num_experts_per_tok".to_string())
+            })?;
+
+            let gate = MaybeQuantized::Quantized(make_quantized_linear(
+                weights,
+                &format!("{}.mlp.gate", layer_prefix),
+                group_size,
+                8,
+            )?);
+
+            let switch_mlp = SwitchGLU {
+                gate_proj: make_quantized_switch_linear(
+                    weights,
+                    &format!("{}.mlp.switch_mlp.gate_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?,
+                up_proj: make_quantized_switch_linear(
+                    weights,
+                    &format!("{}.mlp.switch_mlp.up_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?,
+                down_proj: make_quantized_switch_linear(
+                    weights,
+                    &format!("{}.mlp.switch_mlp.down_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?,
+            };
+
+            let shared_expert = SharedExpert {
+                gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    weights,
+                    &format!("{}.mlp.shared_expert.gate_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+                up_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    weights,
+                    &format!("{}.mlp.shared_expert.up_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+                down_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    weights,
+                    &format!("{}.mlp.shared_expert.down_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+            };
+
+            let shared_expert_gate = MaybeQuantized::Quantized(make_quantized_linear(
+                weights,
+                &format!("{}.mlp.shared_expert_gate", layer_prefix),
+                group_size,
+                8,
+            )?);
+
+            FfnBlock::Moe(MoeBlock {
+                num_experts,
+                top_k,
+                gate,
+                switch_mlp,
+                shared_expert,
+                shared_expert_gate,
+            })
+        } else {
+            FfnBlock::Dense(DenseMlp {
+                gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    weights,
+                    &format!("{}.mlp.gate_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+                up_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    weights,
+                    &format!("{}.mlp.up_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+                down_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                    weights,
+                    &format!("{}.mlp.down_proj", layer_prefix),
+                    group_size,
+                    bits,
+                )?),
+            })
+        };
+
+        let block = TransformerBlock {
+            attention,
+            ffn,
+            input_layernorm: load_rms_norm(
+                weights,
+                &format!("{}.input_layernorm.weight", layer_prefix),
+                tc.rms_norm_eps,
+            )?,
+            post_attention_layernorm: load_rms_norm(
+                weights,
+                &format!("{}.post_attention_layernorm.weight", layer_prefix),
+                tc.rms_norm_eps,
+            )?,
+        };
+
+        layers.push(block);
+    }
+
+    let embed_tokens = MaybeQuantized::Quantized(make_quantized_embedding(
+        weights,
+        &format!("{}.embed_tokens", prefix),
+        group_size,
+        bits,
+    )?);
+
+    let norm = load_rms_norm(weights, &format!("{}.norm.weight", prefix), tc.rms_norm_eps)?;
+
+    let lm_head = if !args.tie_word_embeddings {
+        Some(MaybeQuantized::Quantized(make_quantized_linear(
+            weights,
+            lm_head_prefix,
+            group_size,
+            bits,
+        )?))
+    } else {
+        None
+    };
+
+    let text_model = Qwen36TextModel {
+        embed_tokens,
+        layers,
+        norm,
+        layer_types: tc.layer_types.clone(),
+    };
+
+    Ok(Model {
+        args: args.clone(),
+        text_model,
+        lm_head,
+    })
+}
+
+pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
+    let model_dir = model_dir.as_ref();
+
+    let config_file = std::fs::File::open(model_dir.join("config.json"))?;
+    let args: ModelArgs = serde_json::from_reader(config_file)?;
+    let tc = &args.text_config;
+
+    let quant = args.quantization();
+    let (_, bits) = match quant {
+        Some(q) => (q.group_size, q.bits),
+        None => {
+            return Err(Error::Model(
+                "Only quantized models are supported".to_string(),
+            ))
+        }
+    };
 
     eprintln!(
         "Loading {}-bit quantized Qwen3.6 ({} layers, {})...",
@@ -391,182 +631,203 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     );
 
     let weights = load_all_weights(model_dir)?;
-    let prefix = detect_prefix(&weights);
-    let lm_head_prefix = detect_lm_head_prefix(&weights);
+    build_model_from_weights(&weights, &args)
+}
 
-    let mut layers = Vec::with_capacity(tc.num_hidden_layers as usize);
-    for i in 0..tc.num_hidden_layers {
-        let layer_prefix = format!("{}.layers.{}", prefix, i);
-        let layer_type = &tc.layer_types[i as usize];
+pub struct VlModel {
+    pub text: Model,
+    pub vision: VisionTower,
+    pub image_token_id: i32,
+    pub vision_start_token_id: i32,
+    pub vision_end_token_id: i32,
+}
 
-        // Attention: gated full attention or DeltaNet
-        let attention = if layer_type == "full_attention" {
-            AttentionLayer::FullAttention(load_gated_attention(
-                &weights,
-                &layer_prefix,
-                tc,
-                group_size,
-                bits,
-            )?)
-        } else {
-            AttentionLayer::LinearAttention(load_gated_deltanet(
-                &weights,
-                &layer_prefix,
-                tc,
-                group_size,
-                bits,
-            )?)
-        };
-
-        // FFN: MoE for 35B, dense MLP for 27B
-        let ffn = if tc.is_moe() {
-            let num_experts = tc.num_experts.ok_or_else(|| {
-                Error::Model("MoE config missing num_experts".to_string())
-            })?;
-            let top_k = tc.num_experts_per_tok.ok_or_else(|| {
-                Error::Model("MoE config missing num_experts_per_tok".to_string())
-            })?;
-
-            let gate = MaybeQuantized::Quantized(make_quantized_linear(
-                &weights,
-                &format!("{}.mlp.gate", layer_prefix),
-                group_size,
-                8, // 8-bit for routing accuracy
-            )?);
-
-            let switch_mlp = SwitchGLU {
-                gate_proj: make_quantized_switch_linear(
-                    &weights,
-                    &format!("{}.mlp.switch_mlp.gate_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?,
-                up_proj: make_quantized_switch_linear(
-                    &weights,
-                    &format!("{}.mlp.switch_mlp.up_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?,
-                down_proj: make_quantized_switch_linear(
-                    &weights,
-                    &format!("{}.mlp.switch_mlp.down_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?,
-            };
-
-            let shared_expert = SharedExpert {
-                gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    &weights,
-                    &format!("{}.mlp.shared_expert.gate_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-                up_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    &weights,
-                    &format!("{}.mlp.shared_expert.up_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-                down_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    &weights,
-                    &format!("{}.mlp.shared_expert.down_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-            };
-
-            let shared_expert_gate = MaybeQuantized::Quantized(make_quantized_linear(
-                &weights,
-                &format!("{}.mlp.shared_expert_gate", layer_prefix),
-                group_size,
-                8, // 8-bit for gating accuracy
-            )?);
-
-            FfnBlock::Moe(MoeBlock {
-                num_experts,
-                top_k,
-                gate,
-                switch_mlp,
-                shared_expert,
-                shared_expert_gate,
-            })
-        } else {
-            FfnBlock::Dense(DenseMlp {
-                gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    &weights,
-                    &format!("{}.mlp.gate_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-                up_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    &weights,
-                    &format!("{}.mlp.up_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-                down_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    &weights,
-                    &format!("{}.mlp.down_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-            })
-        };
-
-        let block = TransformerBlock {
-            attention,
-            ffn,
-            input_layernorm: load_rms_norm(
-                &weights,
-                &format!("{}.input_layernorm.weight", layer_prefix),
-                tc.rms_norm_eps,
-            )?,
-            post_attention_layernorm: load_rms_norm(
-                &weights,
-                &format!("{}.post_attention_layernorm.weight", layer_prefix),
-                tc.rms_norm_eps,
-            )?,
-        };
-
-        layers.push(block);
+impl VlModel {
+    pub fn new_cache(&self, mode: KVCacheMode) -> Vec<HybridCache> {
+        self.text.new_cache(mode)
     }
 
-    let embed_tokens = MaybeQuantized::Quantized(make_quantized_embedding(
-        &weights,
-        &format!("{}.embed_tokens", prefix),
-        group_size,
-        bits,
-    )?);
+    /// Encode image bytes (JPEG/PNG/etc) into visual feature tokens.
+    /// Returns `(visual_features: Array [N_vis, hidden], h_patches, w_patches)`.
+    pub fn encode_image_bytes(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(Array, i32, i32), mlx_rs_core::error::Error> {
+        let img = image::load_from_memory(bytes).map_err(|e| {
+            mlx_rs_core::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            ))
+        })?;
+        let patch_size = self
+            .text
+            .args
+            .vision_config
+            .as_ref()
+            .map(|vc| vc.patch_size)
+            .unwrap_or(16);
+        let temporal_patch_size = self
+            .text
+            .args
+            .vision_config
+            .as_ref()
+            .map(|vc| vc.temporal_patch_size)
+            .unwrap_or(2);
+        let (pixel_array, h_patches, w_patches) =
+            crate::vision::preprocess_image(&img, patch_size, temporal_patch_size)?;
+        let visual_features = self.vision.forward(&pixel_array, h_patches, w_patches)?;
+        Ok((visual_features, h_patches, w_patches))
+    }
 
-    let norm = load_rms_norm(
-        &weights,
-        &format!("{}.norm.weight", prefix),
-        tc.rms_norm_eps,
-    )?;
+    /// Prefill with mixed text+image content.
+    pub fn prefill_multimodal(
+        &mut self,
+        input_ids: &[i32],
+        visual_features: &Array,
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<Array, mlx_rs_core::error::Error> {
+        let n_visual = visual_features.shape()[0] as usize;
+        let hidden_size = visual_features.shape()[1];
 
-    let lm_head = if !args.tie_word_embeddings {
-        Some(MaybeQuantized::Quantized(make_quantized_linear(
-            &weights,
-            lm_head_prefix,
-            group_size,
-            bits,
-        )?))
-    } else {
-        None
-    };
+        let image_token_id = self.image_token_id;
+        let block_start = input_ids.iter().position(|&t| t == image_token_id);
 
-    let text_model = Qwen36TextModel {
-        embed_tokens,
-        layers,
-        norm,
-        layer_types: tc.layer_types.clone(),
-    };
+        let logits = if let Some(start) = block_start {
+            let block_len = input_ids[start..]
+                .iter()
+                .take_while(|&&t| t == image_token_id)
+                .count();
+            if block_len != n_visual {
+                return Err(mlx_rs_core::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Image token count mismatch: {} placeholders vs {} visual tokens",
+                        block_len, n_visual
+                    ),
+                )));
+            }
 
-    Ok(Model {
-        args,
-        text_model,
-        lm_head,
+            let pre_ids = &input_ids[..start];
+            let post_ids = &input_ids[start + block_len..];
+
+            let mut parts: Vec<Array> = Vec::new();
+
+            if !pre_ids.is_empty() {
+                let pre_emb = self.text.embed_tokens(pre_ids).map_err(|e| {
+                    mlx_rs_core::error::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
+                parts.push(pre_emb);
+            }
+
+            let vis = visual_features.reshape(&[1, n_visual as i32, hidden_size])?;
+            parts.push(vis);
+
+            if !post_ids.is_empty() {
+                let post_emb = self.text.embed_tokens(post_ids).map_err(|e| {
+                    mlx_rs_core::error::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?;
+                parts.push(post_emb);
+            }
+
+            let combined = if parts.len() == 1 {
+                parts.remove(0)
+            } else {
+                let refs: Vec<&Array> = parts.iter().collect();
+                mlx_rs::ops::concatenate_axis(&refs, 1).map_err(|e| {
+                    mlx_rs_core::error::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?
+            };
+
+            self.text
+                .forward_from_embeds(&combined, cache)
+                .map_err(|e| {
+                    mlx_rs_core::error::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?
+        } else {
+            let arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            self.text.forward_last_logits(&arr, cache).map_err(|e| {
+                mlx_rs_core::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?
+        };
+
+        Ok(logits)
+    }
+
+    pub fn prefill_text(
+        &mut self,
+        input_ids: &[i32],
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<Array, mlx_rs_core::error::Error> {
+        let arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+        self.text.forward_last_logits(&arr, cache).map_err(|e| {
+            mlx_rs_core::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })
+    }
+
+    /// Single-token decode step. `token_id` is the previously sampled token.
+    pub fn decode_token(
+        &mut self,
+        token_id: i32,
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<Array, mlx_rs_core::error::Error> {
+        let arr = Array::from_slice(&[token_id], &[1, 1]);
+        self.text.forward_last_logits(&arr, cache).map_err(|e| {
+            mlx_rs_core::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))
+        })
+    }
+}
+
+pub fn load_vl_model(model_dir: impl AsRef<Path>) -> Result<VlModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let config_file = std::fs::File::open(model_dir.join("config.json"))?;
+    let args: ModelArgs = serde_json::from_reader(config_file)?;
+
+    let vc = args
+        .vision_config
+        .as_ref()
+        .ok_or_else(|| Error::Model("Not a VL model: missing vision_config".to_string()))?;
+    let image_token_id = args.image_token_id.unwrap_or(248056);
+    let vision_start_token_id = args.vision_start_token_id.unwrap_or(248053);
+    let vision_end_token_id = args.vision_end_token_id.unwrap_or(248054);
+
+    if vc.out_hidden_size != args.text_config.hidden_size {
+        return Err(Error::Model(format!(
+            "Vision out_hidden_size ({}) != text hidden_size ({})",
+            vc.out_hidden_size, args.text_config.hidden_size
+        )));
+    }
+
+    let weights = load_all_weights(model_dir)?;
+    let text = build_model_from_weights(&weights, &args)?;
+    let vision = crate::vision::load_vision_tower(&weights, vc)?;
+
+    Ok(VlModel {
+        text,
+        vision,
+        image_token_id,
+        vision_start_token_id,
+        vision_end_token_id,
     })
 }
 
@@ -684,14 +945,8 @@ fn load_gated_deltanet(
             weights,
             &format!("{}.conv1d.weight", attn_prefix),
         )?),
-        a_log: Param::new(get_weight(
-            weights,
-            &format!("{}.A_log", attn_prefix),
-        )?),
-        dt_bias: Param::new(get_weight(
-            weights,
-            &format!("{}.dt_bias", attn_prefix),
-        )?),
+        a_log: Param::new(get_weight(weights, &format!("{}.A_log", attn_prefix))?),
+        dt_bias: Param::new(get_weight(weights, &format!("{}.dt_bias", attn_prefix))?),
         norm: load_rms_norm(
             weights,
             &format!("{}.norm.weight", attn_prefix),

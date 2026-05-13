@@ -1,12 +1,6 @@
 use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    ops::indexing::IndexOp,
-    quantization::MaybeQuantized,
-    Array,
+    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
+    ops::indexing::IndexOp, quantization::MaybeQuantized, Array,
 };
 use mlx_rs_core::{
     cache::{KVCache, KeyValueCache},
@@ -74,9 +68,9 @@ impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
         let values = self.v_proj.forward(x)?;
 
         // Reshape and transpose to [B, heads, L, head_dim]
-        let mut queries = self.q_norm.forward(
-            &queries.transpose_axes(&[0, 2, 1, 3])?,
-        )?;
+        let mut queries = self
+            .q_norm
+            .forward(&queries.transpose_axes(&[0, 2, 1, 3])?)?;
         let mut keys = self.k_norm.forward(
             &keys
                 .reshape(&[B, L, self.n_kv_heads, -1])?
@@ -156,8 +150,7 @@ impl GatedAttention {
             .eps(config.rms_norm_eps)
             .build()?;
 
-        let rope_dims =
-            (head_dim as f32 * config.rope_parameters.partial_rotary_factor) as i32;
+        let rope_dims = (head_dim as f32 * config.rope_parameters.partial_rotary_factor) as i32;
         let rope = initialize_rope(
             rope_dims,
             config.rope_parameters.rope_theta,

@@ -1,6 +1,6 @@
-use std::collections::HashSet;
 use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
+use std::collections::HashSet;
 
 fn main() -> anyhow::Result<()> {
     let use_cpu = std::env::args().any(|a| a == "--cpu");
@@ -35,15 +35,9 @@ fn main() -> anyhow::Result<()> {
     let prompt_tokens = prompt_tokens.index(NewAxis);
     eprintln!("Prompt: {} tokens", encoding.get_ids().len());
 
-    let max_tokens: usize = args
-        .get(3)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(500);
+    let max_tokens: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(500);
 
-    let temp: f32 = args
-        .get(4)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.7);
+    let temp: f32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.7);
 
     let eos_tokens: HashSet<u32> = {
         let config_path = std::path::Path::new(&model_dir).join("config.json");
