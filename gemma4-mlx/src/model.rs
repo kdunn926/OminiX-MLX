@@ -16,6 +16,7 @@ use mlx_rs::{
         self,
         indexing::{take_along_axis, take_axis, IndexOp, NewAxis},
     },
+    transforms::eval,
     Array, Dtype,
 };
 use serde::Deserialize;
@@ -23,10 +24,15 @@ use serde_json::Value;
 use tokenizers::Tokenizer;
 
 use mlx_rs_core::{
-    cache::KeyValueCache,
+    cache::{KVCache, KeyValueCache},
     error::Error,
     sampler::{DefaultSampler, Sampler},
     utils::{create_causal_mask, scaled_dot_product_attention, SdpaMask},
+};
+
+use crate::vision::{
+    load_embed_vision, load_vision_model, preprocess_image_gemma4, EmbedVision,
+    Gemma4VisionConfig, VisionModel,
 };
 
 // ============================================================================
@@ -45,6 +51,16 @@ where
 pub struct Gemma4Config {
     pub model_type: String,
     pub text_config: Gemma4TextConfig,
+    #[serde(default)]
+    pub vision_config: Option<Gemma4VisionConfig>,
+    #[serde(default)]
+    pub vision_soft_tokens_per_image: usize,
+    #[serde(default)]
+    pub image_token_id: Option<u32>,
+    #[serde(default)]
+    pub boi_token_id: Option<u32>,
+    #[serde(default)]
+    pub eoi_token_id: Option<u32>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
 }
@@ -977,6 +993,59 @@ where
     }
 }
 
+impl LanguageModel {
+    pub fn forward_from_embeds<C>(
+        &mut self,
+        inputs_embeds: &Array,
+        mask: Option<&Array>,
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        assert!(
+            !cache.is_empty(),
+            "Cache must be pre-allocated with init_cache() before calling Gemma4 forward_from_embeds",
+        );
+
+        if self.hidden_size_per_layer_input > 0 {
+            return Err(Exception::custom(
+                "forward_from_embeds does not support Gemma4 per-layer embeddings",
+            ));
+        }
+
+        let mut hidden_states = inputs_embeds.clone();
+
+        let mut shared_kv_store: HashMap<usize, (Array, Array)> = HashMap::new();
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let cache_slot = self.kv_cache_map[i];
+            let is_shared = layer.self_attn.is_kv_shared;
+            let shared_kv = if is_shared {
+                shared_kv_store.get(&cache_slot).cloned()
+            } else {
+                None
+            };
+
+            hidden_states = layer.forward(DecoderLayerInput {
+                hidden_states: &hidden_states,
+                mask,
+                cache: &mut cache[cache_slot],
+                shared_kv,
+                per_layer_input: None,
+            })?;
+
+            if self.kv_store_layers.contains(&i) {
+                if let Some(kv) = cache[cache_slot].current_kv() {
+                    shared_kv_store.insert(cache_slot, kv);
+                }
+            }
+        }
+
+        self.norm.forward(&hidden_states)
+    }
+}
+
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct Model {
     pub args: Gemma4TextConfig,
@@ -1035,6 +1104,33 @@ impl Model {
             logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
         }
         Ok(logits)
+    }
+
+    pub fn forward_from_embeds<C>(
+        &mut self,
+        embeds: &Array,
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward_from_embeds(embeds, None, cache)?;
+        let last = out.index((.., -1, ..));
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last)?,
+            None => self.model.embed_tokens.as_linear(&last)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok(logits)
+    }
+
+    pub fn embed_tokens_slice(&mut self, ids: &[i32]) -> Result<Array, Exception> {
+        let input = Array::from_slice(ids, &[1, ids.len() as i32]);
+        let embeds = self.model.embed_tokens.forward(&input)?;
+        embeds.reshape(&[ids.len() as i32, self.args.hidden_size])
     }
 }
 
@@ -1096,6 +1192,35 @@ fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
         }
     }
 
+    Ok(all_weights)
+}
+
+fn load_all_weights_unfiltered(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
+    let weights_index = model_dir.join("model.safetensors.index.json");
+    let single_file = model_dir.join("model.safetensors");
+
+    let weight_files: Vec<std::path::PathBuf> = if weights_index.exists() {
+        let json = std::fs::read_to_string(&weights_index)?;
+        let weight_map: WeightMap = serde_json::from_str(&json)?;
+        weight_map
+            .weight_map
+            .values()
+            .map(|file| model_dir.join(file))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect()
+    } else if single_file.exists() {
+        vec![single_file]
+    } else {
+        return Err(Error::Model(
+            "No model.safetensors or model.safetensors.index.json found".to_string(),
+        ));
+    };
+
+    let mut all_weights = HashMap::new();
+    for weights_filename in weight_files {
+        all_weights.extend(Array::load_safetensors(&weights_filename)?);
+    }
     Ok(all_weights)
 }
 
@@ -1175,6 +1300,15 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
 }
 
 fn load_model_inner(model_dir: &Path, config: Gemma4Config, args: Gemma4TextConfig) -> Result<Model, Error> {
+    let weights = load_all_weights(model_dir)?;
+    build_model_from_weights(&config, args, &weights)
+}
+
+fn build_model_from_weights(
+    config: &Gemma4Config,
+    args: Gemma4TextConfig,
+    weights: &HashMap<String, Array>,
+) -> Result<Model, Error> {
 
     if args.use_double_wide_mlp {
         return Err(Error::Model(
@@ -1194,7 +1328,6 @@ fn load_model_inner(model_dir: &Path, config: Gemma4Config, args: Gemma4TextConf
     }
 
     let activation = GemmaActivation::from_name(&args.hidden_activation)?;
-    let weights = load_all_weights(model_dir)?;
 
     // Infer global_head_dim from weight shapes when config has null/0.
     // Full attention layers have larger q_proj (more dims per head).
@@ -1573,6 +1706,172 @@ fn load_model_inner(model_dir: &Path, config: Gemma4Config, args: Gemma4TextConf
 
 pub fn init_cache<C: KeyValueCache + Default>(num_layers: usize) -> Vec<C> {
     (0..num_layers).map(|_| C::default()).collect()
+}
+
+pub struct Gemma4VlModel {
+    pub text: Model,
+    pub vision: VisionModel,
+    pub embed_vision: EmbedVision,
+    pub image_token_id: u32,
+    pub boi_token_id: u32,
+    pub eoi_token_id: u32,
+    pub n_vision_tokens: usize,
+}
+
+impl Gemma4VlModel {
+    pub fn new_cache(&self) -> Vec<KVCache> {
+        let num_slots = *self.text.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
+        init_cache::<KVCache>(num_slots)
+    }
+
+    pub fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Array, Error> {
+        let (pixel_values, patch_positions, padding_mask) = preprocess_image_gemma4(bytes)?;
+        let num_positions = padding_mask.len() as i32;
+        let patch_positions = Array::from_slice(&patch_positions, &[1, num_positions, 2]);
+        let padding_bool: Vec<bool> = padding_mask.iter().map(|&v| v != 0).collect();
+        let padding_positions = Array::from_slice(&padding_bool, &[1, num_positions]);
+        let hidden = self
+            .vision
+            .forward(&pixel_values, &patch_positions, &padding_positions)?;
+        let embeds = self.embed_vision.forward(&hidden)?;
+        let s1 = embeds.shape()[1];
+        let s2 = embeds.shape()[2];
+        embeds.reshape(&[s1, s2]).map_err(Into::into)
+    }
+
+    pub fn prefill_multimodal(
+        &mut self,
+        input_ids: &[i32],
+        visual_features: &Array,
+        cache: &mut Vec<KVCache>,
+    ) -> Result<Array, Error> {
+        let image_positions: Vec<usize> = input_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &id)| (id as u32 == self.image_token_id).then_some(idx))
+            .collect();
+        if image_positions.is_empty() {
+            return self.prefill_text(input_ids, cache);
+        }
+
+        let text_embeds = self.text.embed_tokens_slice(input_ids)?;
+        let scale = Array::from((self.text.args.hidden_size as f32).sqrt())
+            .as_dtype(Dtype::Bfloat16)?
+            .as_dtype(text_embeds.dtype())?;
+        let text_embeds = text_embeds.multiply(&scale)?;
+        let seq_len = input_ids.len();
+        let hidden_size = self.text.args.hidden_size as usize;
+        let text_f32 = text_embeds.as_dtype(Dtype::Float32)?;
+        eval([&text_f32]).map_err(|e| Error::Model(format!("eval text_embeds: {e}")))?;
+        let text_slice = text_f32.try_as_slice::<f32>().map_err(|e| {
+            Error::Model(format!("text embeddings must be contiguous for multimodal scatter: {e}"))
+        })?;
+
+        let vis_len = visual_features.shape()[0] as usize;
+        if vis_len == 0 {
+            return Err(Error::Model("encode_image_bytes returned zero visual tokens".into()));
+        }
+        let vis_f32 = visual_features.as_dtype(Dtype::Float32)?;
+        eval([&vis_f32]).map_err(|e| Error::Model(format!("eval visual_features: {e}")))?;
+        let vis_slice = vis_f32.try_as_slice::<f32>().map_err(|e| {
+            Error::Model(format!("visual features must be contiguous for multimodal scatter: {e}"))
+        })?;
+
+        let mut combined = text_slice.to_vec();
+        for (out_idx, &token_idx) in image_positions.iter().enumerate() {
+            let src_row = out_idx % vis_len;
+            let dst_start = token_idx * hidden_size;
+            let src_start = src_row * hidden_size;
+            combined[dst_start..dst_start + hidden_size]
+                .copy_from_slice(&vis_slice[src_start..src_start + hidden_size]);
+        }
+
+        let combined_f32 = Array::from_slice(
+            &combined,
+            &[1, seq_len as i32, self.text.args.hidden_size],
+        );
+        eval([&combined_f32]).map_err(|e| Error::Model(format!("eval combined_f32: {e}")))?;
+        let combined = combined_f32.as_dtype(text_embeds.dtype())?;
+        eval([&combined]).map_err(|e| Error::Model(format!("eval combined: {e}")))?;
+
+        // Process in fixed-size chunks to bound peak GPU memory during MoE dispatch.
+        // Single-shot prefill with seq_len=314 would create a ~18 GB intermediate
+        // tensor in forward_topk (take_axis on 128 experts × 8 top-k × 314 tokens).
+        // Chunked at PREFILL_CHUNK=32 keeps peak intermediate at ~2 GB, matching
+        // the text-only path.
+        const PREFILL_CHUNK: i32 = 32;
+        let total = seq_len as i32;
+        let mut pos: i32 = 0;
+        while pos < total {
+            let end = (pos + PREFILL_CHUNK).min(total);
+            let chunk = combined.index((.., pos..end, ..));
+            if end < total {
+                // Intermediate chunk: update KV cache, discard hidden states.
+                let hidden = self.text.model.forward_from_embeds(&chunk, None, cache)?;
+                eval([&hidden])
+                    .map_err(|e| Error::Model(format!("prefill chunk {pos}: {e}")))?;
+            } else {
+                // Final chunk: apply lm_head and return logits.
+                return self.text.forward_from_embeds(&chunk, cache).map_err(Into::into);
+            }
+            pos = end;
+        }
+        Err(Error::Model("prefill_multimodal: unexpected empty sequence".into()))
+    }
+
+    pub fn prefill_text(
+        &mut self,
+        input_ids: &[i32],
+        cache: &mut Vec<KVCache>,
+    ) -> Result<Array, Error> {
+        let input = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+        self.text
+            .forward_last_logits(ModelInput {
+                inputs: &input,
+                mask: None,
+                cache,
+            })
+            .map_err(Into::into)
+    }
+
+    pub fn decode_token(
+        &mut self,
+        token_id: u32,
+        cache: &mut Vec<KVCache>,
+    ) -> Result<Array, Error> {
+        let input = Array::from_slice(&[token_id as i32], &[1, 1]);
+        self.text
+            .forward_last_logits(ModelInput {
+                inputs: &input,
+                mask: None,
+                cache,
+            })
+            .map_err(Into::into)
+    }
+}
+
+pub fn load_vl_model(model_dir: impl AsRef<Path>) -> Result<Gemma4VlModel, Error> {
+    let model_dir = model_dir.as_ref();
+    let config = get_model_args(model_dir)?;
+    let vision_config = config
+        .vision_config
+        .clone()
+        .ok_or_else(|| Error::Model("Not a Gemma4-VL model: missing vision_config".to_string()))?;
+    let weights = load_all_weights_unfiltered(model_dir)?;
+
+    let text = build_model_from_weights(&config, config.text_config.clone(), &weights)?;
+    let vision = load_vision_model(&weights, &vision_config)?;
+    let embed_vision = load_embed_vision(&weights, vision_config.rms_norm_eps)?;
+
+    Ok(Gemma4VlModel {
+        text,
+        vision,
+        embed_vision,
+        image_token_id: config.image_token_id.unwrap_or(258880),
+        boi_token_id: config.boi_token_id.unwrap_or(255999),
+        eoi_token_id: config.eoi_token_id.unwrap_or(258882),
+        n_vision_tokens: config.vision_soft_tokens_per_image.max(vision_config.default_output_length as usize),
+    })
 }
 
 pub struct Generate<'a, C, S: Sampler = DefaultSampler> {
