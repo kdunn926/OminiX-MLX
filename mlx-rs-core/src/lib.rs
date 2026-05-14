@@ -21,6 +21,7 @@ pub mod convert;
 pub mod cache;
 pub mod error;
 pub mod generate;
+pub mod memory;
 pub mod metal_kernels;
 pub mod sampler;
 pub mod speculative;
@@ -28,6 +29,10 @@ pub mod utils;
 
 pub use cache::{ConcatKeyValueCache, KVCache, KeyValueCache, QuantizedKVCache};
 pub use error::{Error, Result};
+pub use memory::{
+    clear_cache, flush_cache_if_needed, get_device_info, get_memory_stats, reset_peak_memory,
+    set_cache_limit, set_memory_limit, set_wired_limit, DeviceInfo, MemoryStats,
+};
 pub use metal_kernels::{deltanet_recurrence, fused_modulate, fused_swiglu};
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{
