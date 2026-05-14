@@ -994,11 +994,17 @@ where
 }
 
 impl LanguageModel {
+    /// Forward pass from pre-computed embeddings.
+    ///
+    /// `per_layer_inputs`: optional `[B, L, num_layers, ple_dim]` tensor computed by
+    /// `compute_per_layer_inputs`.  Must be provided when `hidden_size_per_layer_input > 0`
+    /// (i.e. E4B-style PLE models); may be `None` for non-PLE models.
     pub fn forward_from_embeds<C>(
         &mut self,
         inputs_embeds: &Array,
         mask: Option<&Array>,
         cache: &mut Vec<C>,
+        per_layer_inputs: Option<&Array>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache + Default,
@@ -1007,12 +1013,6 @@ impl LanguageModel {
             !cache.is_empty(),
             "Cache must be pre-allocated with init_cache() before calling Gemma4 forward_from_embeds",
         );
-
-        if self.hidden_size_per_layer_input > 0 {
-            return Err(Exception::custom(
-                "forward_from_embeds does not support Gemma4 per-layer embeddings",
-            ));
-        }
 
         let mut hidden_states = inputs_embeds.clone();
 
@@ -1027,12 +1027,15 @@ impl LanguageModel {
                 None
             };
 
+            // Slice per-layer input for this layer: [B, L, ple_dim]
+            let ple_slice = per_layer_inputs.map(|p| p.index((.., .., i as i32, ..)));
+
             hidden_states = layer.forward(DecoderLayerInput {
                 hidden_states: &hidden_states,
                 mask,
                 cache: &mut cache[cache_slot],
                 shared_kv,
-                per_layer_input: None,
+                per_layer_input: ple_slice.as_ref(),
             })?;
 
             if self.kv_store_layers.contains(&i) {
@@ -1043,6 +1046,57 @@ impl LanguageModel {
         }
 
         self.norm.forward(&hidden_states)
+    }
+
+    /// Compute the per-layer-embedding (PLE) tensor for the given sequence.
+    ///
+    /// Returns `Ok(Some(...))` with shape `[B, L, num_layers, ple_dim]` when PLE is
+    /// enabled (`hidden_size_per_layer_input > 0`), or `Ok(None)` for non-PLE models.
+    ///
+    /// `input_ids`: `[B, L]` token IDs (image positions may use `image_token_id`).
+    /// `hidden_states`: `[B, L, hidden_size]` scaled input embeddings.
+    pub fn compute_per_layer_inputs(
+        &mut self,
+        input_ids: &Array,
+        hidden_states: &Array,
+    ) -> Result<Option<Array>, Exception> {
+        if self.hidden_size_per_layer_input <= 0 {
+            return Ok(None);
+        }
+        let ple_dim = self.hidden_size_per_layer_input;
+        let num_layers = self.num_hidden_layers;
+        let hidden_dim = hidden_states.shape()[2] as f32;
+
+        let ple_embed = self
+            .embed_tokens_per_layer
+            .as_mut()
+            .expect("PLE embed_tokens_per_layer missing")
+            .forward(input_ids)?;
+        let ple_scale = Array::from((ple_dim as f32).sqrt())
+            .as_dtype(Dtype::Bfloat16)?
+            .as_dtype(ple_embed.dtype())?;
+        let ple_embed = ple_embed.multiply(&ple_scale)?;
+        let b = ple_embed.shape()[0];
+        let l = ple_embed.shape()[1];
+        let ple_embed = ple_embed.reshape(&[b, l, num_layers, ple_dim])?;
+
+        let proj = self
+            .per_layer_model_projection
+            .as_mut()
+            .expect("PLE per_layer_model_projection missing")
+            .forward(hidden_states)?;
+        let proj_scale = array!((hidden_dim).powf(-0.5));
+        let proj = proj.multiply(&proj_scale)?;
+        let proj = proj.reshape(&[b, l, num_layers, ple_dim])?;
+        let proj = self
+            .per_layer_projection_norm
+            .as_mut()
+            .expect("PLE per_layer_projection_norm missing")
+            .forward(&proj)?;
+
+        let combined = proj.add(&ple_embed)?;
+        let input_scale = array!(std::f32::consts::FRAC_1_SQRT_2);
+        Ok(Some(combined.multiply(&input_scale)?))
     }
 }
 
@@ -1110,11 +1164,12 @@ impl Model {
         &mut self,
         embeds: &Array,
         cache: &mut Vec<C>,
+        per_layer_inputs: Option<&Array>,
     ) -> Result<Array, Exception>
     where
         C: KeyValueCache + Default,
     {
-        let out = self.model.forward_from_embeds(embeds, None, cache)?;
+        let out = self.model.forward_from_embeds(embeds, None, cache, per_layer_inputs)?;
         let last = out.index((.., -1, ..));
         let mut logits = match self.lm_head.as_mut() {
             Some(lm_head) => lm_head.forward(&last)?,
@@ -1794,6 +1849,17 @@ impl Gemma4VlModel {
         let combined = combined_f32.as_dtype(text_embeds.dtype())?;
         eval([&combined]).map_err(|e| Error::Model(format!("eval combined: {e}")))?;
 
+        // For PLE (per-layer embedding) models like E4B, compute the full-sequence PLE
+        // tensor [1, seq_len, num_layers, ple_dim] before chunking.  Image positions
+        // use image_token_id as the auxiliary token — acceptable because PLE is a
+        // secondary modulating input, not the primary feature stream.
+        let input_ids_arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+        let per_layer_inputs_full = self
+            .text
+            .model
+            .compute_per_layer_inputs(&input_ids_arr, &combined)
+            .map_err(|e| Error::Model(format!("compute_per_layer_inputs: {e}")))?;
+
         // Process in fixed-size chunks to bound peak GPU memory during MoE dispatch.
         // Single-shot prefill with seq_len=314 would create a ~18 GB intermediate
         // tensor in forward_topk (take_axis on 128 experts × 8 top-k × 314 tokens).
@@ -1805,14 +1871,24 @@ impl Gemma4VlModel {
         while pos < total {
             let end = (pos + PREFILL_CHUNK).min(total);
             let chunk = combined.index((.., pos..end, ..));
+            // Slice the PLE tensor to match this chunk's sequence positions.
+            let ple_chunk = per_layer_inputs_full
+                .as_ref()
+                .map(|p| p.index((.., pos..end, .., ..)));
             if end < total {
                 // Intermediate chunk: update KV cache, discard hidden states.
-                let hidden = self.text.model.forward_from_embeds(&chunk, None, cache)?;
+                let hidden = self
+                    .text
+                    .model
+                    .forward_from_embeds(&chunk, None, cache, ple_chunk.as_ref())?;
                 eval([&hidden])
                     .map_err(|e| Error::Model(format!("prefill chunk {pos}: {e}")))?;
             } else {
                 // Final chunk: apply lm_head and return logits.
-                return self.text.forward_from_embeds(&chunk, cache).map_err(Into::into);
+                return self
+                    .text
+                    .forward_from_embeds(&chunk, cache, ple_chunk.as_ref())
+                    .map_err(Into::into);
             }
             pos = end;
         }
