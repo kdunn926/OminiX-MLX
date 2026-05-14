@@ -416,7 +416,7 @@ impl Gemma4ChatTemplate {
         Ok(prompt)
     }
 
-    fn render_tool_instructions(&self, tools: &[Gemma4ToolSpec]) -> Result<String> {
+    pub fn render_tool_instructions(&self, tools: &[Gemma4ToolSpec]) -> Result<String> {
         let mut body = String::from("Available tools:\n");
         for tool in tools {
             body.push_str(&self.tokens.tool_start);
