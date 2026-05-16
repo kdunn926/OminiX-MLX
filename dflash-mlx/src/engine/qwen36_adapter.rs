@@ -73,6 +73,11 @@ pub struct Qwen36TargetAdapter {
     /// layer that recorded a tape; `None` for full-attention layers.
     /// Cleared by `prefill` and `rollback_kv`.
     gdn_snapshots: Vec<Option<GdnRollbackSnapshot>>,
+    /// Captures emitted by the most recent verify pass, full block `[B, L, K*H]`.
+    /// On rollback, we slice this to `n_keep` rows and append to the
+    /// pre-verify accumulator — avoiding the desync where target KV holds
+    /// `n_keep` more tokens than the hidden accumulator reflects.
+    verify_captures: Option<Array>,
 }
 
 impl Qwen36TargetAdapter {
@@ -92,6 +97,7 @@ impl Qwen36TargetAdapter {
             target_hidden_accumulated: None,
             verify_hidden_snapshot: None,
             gdn_snapshots: Vec::new(),
+            verify_captures: None,
         }
     }
 
@@ -111,6 +117,7 @@ impl Qwen36TargetAdapter {
             target_hidden_accumulated: None,
             verify_hidden_snapshot: None,
             gdn_snapshots: Vec::new(),
+            verify_captures: None,
         }
     }
 
@@ -130,6 +137,7 @@ impl Qwen36TargetAdapter {
             target_hidden_accumulated: None,
             verify_hidden_snapshot: None,
             gdn_snapshots: Vec::new(),
+            verify_captures: None,
         }
     }
 
@@ -388,6 +396,10 @@ impl TargetModel for Qwen36TargetAdapter {
         let logits = if drafted_tokens.shape()[1] > 1 {
             let (logits, captures) = self.forward_with_hidden_capture_tape(drafted_tokens)?;
             if !self.target_layer_ids.is_empty() {
+                // Save the full-block captures BEFORE appending, so the
+                // rollback path can slice to n_keep rows (the append below
+                // assumes full acceptance — rollback corrects).
+                self.verify_captures = Some(captures.clone());
                 self.append_target_hidden(captures)?;
             }
             logits
@@ -435,14 +447,18 @@ impl TargetModel for Qwen36TargetAdapter {
                 )?;
             }
             self.step = self.verify_step + n_keep;
+            // Rebuild target_hidden_accumulated = pre_verify ++ verify_captures[:n_keep].
+            // The bug being fixed: previously this restored to pre-verify only,
+            // leaving target KV with `n_keep` more committed positions than the
+            // hidden accumulator reflected → next-cycle draft sees stale context
+            // → catastrophic acceptance collapse (~0.014 in benches).
             self.target_hidden_accumulated = self.verify_hidden_snapshot.clone();
-            // If hidden-state captures are wanted and any were kept, the
-            // verifier consumes them via `last_target_hidden`; the verify
-            // pass's captures were appended for the full block, so for
-            // n_keep < verify_len we re-derive captures only for the kept
-            // prefix.  We currently leave the verify-pass captures in place
-            // (matching the pre-tape semantics) when n_keep > 0 and no
-            // partial-capture re-forward is requested.
+            if n_keep > 0 && !self.target_layer_ids.is_empty() {
+                if let Some(full_caps) = self.verify_captures.as_ref() {
+                    let kept_caps = full_caps.index((.., ..n_keep as i32, ..));
+                    self.append_target_hidden(kept_caps)?;
+                }
+            }
         } else {
             self.cache = self.verify_snapshot.clone().ok_or_else(|| {
                 Exception::custom("target rollback requested without a verify snapshot")
@@ -465,6 +481,7 @@ impl TargetModel for Qwen36TargetAdapter {
         self.verify_snapshot = None;
         self.verify_inputs = None;
         self.verify_hidden_snapshot = None;
+        self.verify_captures = None;
         self.gdn_snapshots.clear();
         Ok(())
     }
