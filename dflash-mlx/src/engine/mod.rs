@@ -1,6 +1,7 @@
 pub mod acceptance;
 pub mod config;
 pub mod copyspec;
+pub mod ddtree;
 pub mod draft_adapter;
 pub mod gemma4_adapter;
 pub mod gqa_sdpa;

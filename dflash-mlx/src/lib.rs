@@ -12,6 +12,7 @@ pub use engine::copyspec::CopySpecIndex;
 pub use engine::draft_adapter::DFlashDraftAdapter;
 pub use engine::gemma4_adapter::Gemma4TargetAdapter;
 pub use engine::qwen36_adapter::{DraftCheckpointInfo, MockDraftAdapter, Qwen36TargetAdapter};
+pub use engine::ddtree::{accept_path, build_tree, topk_per_position, verify_tree_naive, TreeNode};
 pub use engine::spec_epoch::{
     DFlashSession, DraftBlock, DraftModel, GenerateEvent, SessionMetrics, TargetModel,
 };
