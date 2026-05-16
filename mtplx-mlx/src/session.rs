@@ -202,12 +202,17 @@ impl MtplxSession {
         // `embed_tokens` returns `[1, 1, H]`.
         let prev_emb = self.model.embed_tokens(&[last_token])?;
 
-        // Step 3: MTP draft logits → next-after-AR drafted token.
-        let mtp = self
-            .model
-            .mtp_head()
-            .expect("mtp_cycle entered without an active MTP head");
-        let mtp_logits = mtp.forward(&hidden, &prev_emb)?;
+        // Step 3: MTP draft hidden → apply host LM head → next-after-AR draft.
+        // The MTP head returns `[1, 1, H]`; we then reuse the target's
+        // `apply_lm_head` (its lm_head or tied embedding) to project to vocab.
+        let mtp_hidden = {
+            let mtp = self
+                .model
+                .mtp_head()
+                .expect("mtp_cycle entered without an active MTP head");
+            mtp.forward(&hidden, &prev_emb)?
+        };
+        let mtp_logits = self.model.apply_lm_head(&mtp_hidden)?;
         let drafted = argmax_id(&mtp_logits)?;
 
         // Step 4: verify the draft by running target on ar_next.
