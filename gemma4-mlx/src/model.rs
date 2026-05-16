@@ -1187,6 +1187,148 @@ impl Model {
         let embeds = self.model.embed_tokens.forward(&input)?;
         embeds.reshape(&[ids.len() as i32, self.args.hidden_size])
     }
+
+    /// Look up token embeddings for `ids`, returning shape `[1, T, hidden_size]`.
+    /// Used by DFlash adapters to stage a single token embedding (shape `[1, 1, H]`).
+    pub fn embed_tokens(&mut self, ids: &[i32]) -> Result<Array, Exception> {
+        let input = Array::from_slice(ids, &[1, ids.len() as i32]);
+        self.model.embed_tokens.forward(&input)
+    }
+
+    /// Forward pass that captures hidden states after each requested layer index
+    /// AND returns last-position logits.  Returns `(logits[B, vocab], captures[B, T, K*H])`
+    /// where K = `target_layer_ids.len()` and captures are concatenated along the last axis
+    /// in the same order as `target_layer_ids`.
+    ///
+    /// This is the Rust mirror of the Python `Gemma4TargetOps.forward_with_hidden_capture`
+    /// path used by DFlash speculative decoding. It is intended for the 26B-A4B variant
+    /// only: it asserts that `hidden_size_per_layer_input == 0` (no PLE) and that
+    /// `num_kv_shared_layers == 0` (no KV sharing). Both of these code paths are
+    /// deliberately skipped here to keep the function tight; callers with E4B-style
+    /// configurations should use the standard forward path.
+    pub fn forward_with_hidden_capture(
+        &mut self,
+        input_ids: &Array,
+        cache: &mut Vec<KVCache>,
+        target_layer_ids: &[usize],
+    ) -> Result<(Array, Array), Exception> {
+        if self.model.hidden_size_per_layer_input > 0 {
+            return Err(Exception::custom(
+                "forward_with_hidden_capture: PLE (hidden_size_per_layer_input > 0) is not supported \
+                 by the DFlash capture path (26B-A4B only)",
+            ));
+        }
+        if self.args.num_kv_shared_layers > 0 {
+            return Err(Exception::custom(
+                "forward_with_hidden_capture: shared KV layers are not supported by the DFlash \
+                 capture path (26B-A4B only)",
+            ));
+        }
+        if let Some(&layer_id) = target_layer_ids
+            .iter()
+            .find(|&&layer_id| layer_id >= self.model.layers.len())
+        {
+            return Err(Exception::custom(format!(
+                "capture layer index {layer_id} out of range for {} layers",
+                self.model.layers.len()
+            )));
+        }
+        assert!(
+            !cache.is_empty(),
+            "Cache must be pre-allocated with init_cache() before calling forward_with_hidden_capture",
+        );
+
+        // Embed and apply Gemma's sqrt(hidden_size) embed scale (matches the Python
+        // reference's `h = input_embeddings * embed_scale`).
+        let mut hidden_states = self.model.embed_tokens.forward(input_ids)?;
+        let hidden_dim = hidden_states.shape()[2] as f32;
+        let scale = Array::from(hidden_dim.sqrt())
+            .as_dtype(Dtype::Bfloat16)?
+            .as_dtype(hidden_states.dtype())?;
+        hidden_states = hidden_states.multiply(&scale)?;
+
+        // Build a causal mask for prefill, none for single-step decode.
+        let t = hidden_states.shape()[1];
+        let mask_arr = if t > 1 {
+            Some(create_causal_mask(t, Some(0), None, None)?)
+        } else {
+            None
+        };
+        let mask_ref = mask_arr.as_ref();
+
+        let is_prefill = t > 1;
+        let mut captures = Vec::with_capacity(target_layer_ids.len());
+
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let cache_slot = self.model.kv_cache_map[i];
+            hidden_states = layer.forward(DecoderLayerInput {
+                hidden_states: &hidden_states,
+                mask: mask_ref,
+                cache: &mut cache[cache_slot],
+                shared_kv: None,
+                per_layer_input: None,
+            })?;
+
+            if target_layer_ids.iter().any(|&id| id == i) {
+                captures.push(hidden_states.clone());
+            }
+
+            if is_prefill && self.model.has_moe {
+                eval([&hidden_states])?;
+            }
+        }
+
+        let normalized = self.model.norm.forward(&hidden_states)?;
+        let last = normalized.index((.., -1, ..));
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last)?,
+            None => self.model.embed_tokens.as_linear(&last)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+
+        let captures_concat = if captures.is_empty() {
+            Array::zeros::<f32>(&[hidden_states.shape()[0], t, 0])?
+        } else {
+            let refs: Vec<&Array> = captures.iter().collect();
+            ops::concatenate_axis(&refs, 2)?
+        };
+        Ok((logits, captures_concat))
+    }
+}
+
+/// Snapshot helper for DFlash KV rollback on gemma4 caches.
+///
+/// The Python reference implements `_trim_recent_cache(cache, n)` for both
+/// `KVCache` (decrement `offset`) and `RotatingKVCache` (rewind `_idx` +
+/// re-temporalize the ring buffer). The Rust `mlx_rs_core::cache::KVCache`
+/// exposes only `reset()` (offset → 0) and no direct offset setter — and per
+/// the DFlash worktree constraints we may not modify `mlx-rs-core`. We
+/// therefore implement DFlash KV rollback the same way `Qwen36TargetAdapter`
+/// does: snapshot `Vec<KVCache>` via `Clone` before each verify, and on
+/// rollback restore the snapshot then replay the kept prefix tokens through
+/// the forward pass.
+///
+/// 26B-A4B does NOT use `RotatingKVCache` — sliding attention is enforced by
+/// the per-layer attention mask (`create_causal_mask(..., Some(window), ..)`),
+/// not by a ring-buffered KV. So snapshot+replay correctly handles sliding
+/// layers without any special casing.
+///
+/// `snapshot_cache` returns a deep clone (mlx_rs `Array` is reference-counted,
+/// so the clone is cheap until the underlying buffer is mutated by
+/// `update_and_fetch`, at which point the snapshot keeps the pre-mutation
+/// arrays alive).
+pub fn snapshot_cache(cache: &[KVCache]) -> Vec<KVCache> {
+    cache.to_vec()
+}
+
+/// Restore a previously snapshotted cache vector in-place. Mirrors the
+/// rollback step of `_trim_recent_cache`. Callers are expected to follow this
+/// with a forward pass over the kept-prefix tokens to re-advance the offset.
+pub fn restore_cache(cache: &mut Vec<KVCache>, snapshot: Vec<KVCache>) {
+    *cache = snapshot;
 }
 
 // ============================================================================

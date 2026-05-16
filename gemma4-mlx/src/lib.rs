@@ -23,9 +23,9 @@ pub use chat::{
 
 pub use model::{
     get_model_args, init_cache, load_model, load_model_with_overrides, load_tokenizer,
-    load_vl_model, Attention, AttentionInput, DecoderLayer, DecoderLayerInput, DenseMlp,
-    Experts, Gemma4Config, Gemma4TextConfig, Gemma4VlModel, Generate, GenerateState,
-    LanguageModel, Model, ModelInput, Router, UnscaledRmsNorm,
+    load_vl_model, restore_cache, snapshot_cache, Attention, AttentionInput, DecoderLayer,
+    DecoderLayerInput, DenseMlp, Experts, Gemma4Config, Gemma4TextConfig, Gemma4VlModel,
+    Generate, GenerateState, LanguageModel, Model, ModelInput, Router, UnscaledRmsNorm,
 };
 pub use vision::{preprocess_image_gemma4, EmbedVision, Gemma4VisionConfig, VisionModel};
 
