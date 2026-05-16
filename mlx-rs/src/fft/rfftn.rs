@@ -30,7 +30,7 @@ pub fn rfft_device(
     let a = a.as_ref();
     let (n, axis) = resolve_size_and_axis_unchecked(a, n.into(), axis.into());
     Array::try_from_op(|res| unsafe {
-        mlx_sys::mlx_fft_rfft(res, a.as_ptr(), n, axis, stream.as_ref().as_ptr())
+        mlx_sys::mlx_fft_rfft(res, a.as_ptr(), n, axis, mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD, stream.as_ref().as_ptr())
     })
 }
 
@@ -72,6 +72,7 @@ pub fn rfft2_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -115,6 +116,7 @@ pub fn rfftn_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -148,7 +150,7 @@ pub fn irfft_device(
     }
 
     Array::try_from_op(|res| unsafe {
-        mlx_sys::mlx_fft_irfft(res, a.as_ptr(), n, axis, stream.as_ref().as_ptr())
+        mlx_sys::mlx_fft_irfft(res, a.as_ptr(), n, axis, mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD, stream.as_ref().as_ptr())
     })
 }
 
@@ -198,6 +200,7 @@ pub fn irfft2_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -250,6 +253,7 @@ pub fn irfftn_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })

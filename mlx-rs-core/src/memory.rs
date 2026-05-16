@@ -74,13 +74,52 @@ pub fn get_memory_stats() -> Option<MemoryStats> {
 }
 
 /// Return Metal device information (memory sizes, buffer limits).
+///
+/// mlx-c 0.6 replaced the typed `mlx_metal_device_info` struct with a generic
+/// key-value lookup on a `mlx_device_info` object. Missing keys return 0 — on
+/// Apple Silicon all three are populated by the Metal backend.
 pub fn get_device_info() -> DeviceInfo {
     unsafe {
-        let info = mlx_sys::mlx_metal_device_info();
+        let mut dev = mlx_sys::mlx_device_new();
+        if mlx_sys::mlx_get_default_device(&mut dev) != 0 {
+            mlx_sys::mlx_device_free(dev);
+            return DeviceInfo::default();
+        }
+        let info = mlx_sys::mlx_device_info_new();
+        let mut info_local = info;
+        if mlx_sys::mlx_device_info_get(&mut info_local, dev) != 0 {
+            mlx_sys::mlx_device_info_free(info);
+            mlx_sys::mlx_device_free(dev);
+            return DeviceInfo::default();
+        }
+        let memory_size = read_size_key(info_local, c"memory_size");
+        let max_recommended_working_set_size =
+            read_size_key(info_local, c"max_recommended_working_set_size");
+        let max_buffer_length = read_size_key(info_local, c"max_buffer_length");
+        mlx_sys::mlx_device_info_free(info_local);
+        mlx_sys::mlx_device_free(dev);
         DeviceInfo {
-            memory_size: info.memory_size,
-            max_recommended_working_set_size: info.max_recommended_working_set_size,
-            max_buffer_length: info.max_buffer_length,
+            memory_size,
+            max_recommended_working_set_size,
+            max_buffer_length,
+        }
+    }
+}
+
+unsafe fn read_size_key(info: mlx_sys::mlx_device_info, key: &core::ffi::CStr) -> usize {
+    let mut value: usize = 0;
+    if mlx_sys::mlx_device_info_get_size(&mut value, info, key.as_ptr()) != 0 {
+        return 0;
+    }
+    value
+}
+
+impl Default for DeviceInfo {
+    fn default() -> Self {
+        Self {
+            memory_size: 0,
+            max_recommended_working_set_size: 0,
+            max_buffer_length: 0,
         }
     }
 }

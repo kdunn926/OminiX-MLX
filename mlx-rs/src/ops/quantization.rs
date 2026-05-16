@@ -58,6 +58,7 @@ pub fn quantize_device(
             optional_int(group_size),
             optional_int(bits),
             mode_cstr.as_ptr(),
+            mlx_sys::mlx_array_ { ctx: std::ptr::null_mut() },
             stream.as_ref().as_ptr(),
         );
         if status != 0 {
@@ -146,6 +147,7 @@ pub fn dequantize_device(
             optional_int(group_size),
             optional_int(bits),
             mode_cstr.as_ptr(),
+            mlx_sys::mlx_array_ { ctx: std::ptr::null_mut() },
             optional_dtype_none(),
             stream.as_ref().as_ptr(),
         )
