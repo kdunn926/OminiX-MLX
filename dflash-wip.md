@@ -337,3 +337,46 @@ The current best-known benchmark configuration is still the targeted `qkv/z` thr
 2. Continue target-side quantized parity work
 3. Revisit projected-context/cache equivalence only after target hard gate is understood
 
+---
+
+## Update — post-runtime-bump investigation
+
+### What was resolved
+
+1. **Runtime provenance aligned.** Vendored `mlx-c` upgraded from `0.4.1` to upstream main (post-`v0.6.0`, pins `mlx v0.31.2` — same as Python). Wrapper fixes: `mlx_quantize`/`mlx_dequantize` `global_scale`, FFT `mlx_fft_norm`, `mlx_metal_device_info` → key-value `mlx_device_info_*` API.
+2. **Layer-0 quantized projections now bit-exact to Python on GPU.** Verified via `scripts/python_layer0_token_dump.py` ↔ `qwen3.6-mlx/examples/target_layer0_token_dump.rs` at len=9: `embeddings`, `layer0_input_norm`, `qkv_direct`, `z_direct`, `a_direct`, `b_direct` all `max_abs=0`.
+3. **`exact_small_proj` workaround removed.** It was a workaround for the mlx 0.30.1 Metal qmm kernel bug at `(M=small, N=8192)`. With mlx 0.31.2 it is redundant and actively harmful on `z` (padded path drifts by 0.125 max_abs vs direct). Side-benefit: AR decode 30 → 67 tok/s on Qwen3.6-35B-A3B-4bit.
+
+### What was disconfirmed
+
+1. **MLX-runtime-skew hypothesis as primary acceptance cause.** Bumping Rust to mlx 0.31.1 (one patch off Python) left acceptance unchanged at 0.128. Bumping to mlx 0.31.2 (= Python) left it at 0.120. Runtime alignment fixes the layer-0 numerics but not the acceptance ratio.
+2. **Projected-context cache contract as a parity issue.** Walked Python `ContextOnlyDraftKVCache` end-to-end. Every op in the projected-context pipeline (`fc`, `hidden_norm`, `k_proj`/`v_proj`, `k_norm`, RoPE) is per-token, so caching post-projection k/v vs recomputing is bit-exact equivalent. This is a perf optimization, not a parity fix.
+3. **Fused DeltaNet Metal kernel as the drift source.** Forcing the standard-MLX-ops fallback (gating `mlx_rs_core::deltanet_recurrence` off) produced **bit-identical** layer-0 output to the fused path on layers 0/9/18/27. Acceptance moved 0.120 → 0.134 — within noise.
+
+### New leading hypothesis — drift is inside DeltaNet, downstream of in_proj_*, not in the recurrent scan
+
+Cycle-0 end-to-end diff (`scripts/python_cycle0_parity.py` ↔ `dflash-mlx/examples/cycle0_parity.rs`):
+
+| Tensor | rel max | Notes |
+|---|---|---|
+| `prompt_ids`, `noise_emb`, `staged_token` | 0 | bit-exact |
+| `layer0_input_norm`, `qkv_direct`, `z_direct`, `a_direct`, `b_direct` | 0 | bit-exact (separate len=9 dump) |
+| `raw_target_hidden`[layer 0 output] | **3.8%** | linear_attention (DeltaNet) |
+| `raw_target_hidden`[layers 9/18/27/36] | ~0.3% each | |
+| `prefill_logits` | 2.8% | propagated drift |
+| `draft_hidden` | 5.6% | |
+| `draft_logits` | 13% | lm_head amplification |
+| `draft_tokens` | 13/15 agree | |
+
+Remaining suspects inside layer-0 DeltaNet, between `in_proj_*` and layer output:
+
+- `conv1d` over qkv
+- L2 normalization of q / k
+- `decay` computation (`softplus(a + dt_bias) → exp`)
+- `RMSNormGated` (output gate by `z`)
+- **`out_proj`** — quantized matmul, shape `4096 → 2048`. Strongest hypothesis because the previous mlx-0.30.1 qmm bug was also shape-specific, and we have not yet verified `out_proj` at this shape between Rust and Python.
+
+### Next-step plan
+
+Add a `debug_first_layer` analog to `LinearAttention` in `qwen3.6-mlx/src/deltanet.rs` that returns per-step intermediates (post-conv, post-l2-norm, decay, beta, post-recurrence, post-rmsnorm-gated, post-out_proj). Mirror in Python; diff on the same prefill state to find which sub-step diverges first.
+
