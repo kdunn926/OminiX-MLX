@@ -1279,10 +1279,12 @@ impl Model {
         }
 
         let normalized = self.model.norm.forward(&hidden_states)?;
-        let last = normalized.index((.., -1, ..));
+        // Return per-position logits [B, T, vocab] (NOT just the last token).
+        // DFlash verify indexes `logits[.., t, ..]` across the block to extract
+        // each position's predicted next-token distribution for acceptance checks.
         let mut logits = match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&last)?,
-            None => self.model.embed_tokens.as_linear(&last)?,
+            Some(lm_head) => lm_head.forward(&normalized)?,
+            None => self.model.embed_tokens.as_linear(&normalized)?,
         };
         if let Some(softcap) = self.args.final_logit_softcapping {
             let cap = array!(softcap);
