@@ -208,9 +208,142 @@ const DELTANET_RECURRENCE_KERNEL_SOURCE: &str = r#"
     }
 "#;
 
+// =============================================================================
+// DeltaNet recurrence with innovation tape (for speculative-decoding rollback)
+// =============================================================================
+//
+// Same delta-rule scan as `deltanet_recurrence` (decayed-state retrieval) but
+// also records the per-timestep `delta` ("innovation") tensor to global memory
+// so that the recurrent state can be cheaply rolled forward from a snapshot
+// after the verifier accepts a prefix of drafted tokens.
+//
+// Shape contract (identical to `deltanet_recurrence`):
+//   q, k     : [B, H, L, K]
+//   v        : [B, H, L, V]
+//   decay,
+//   beta     : [B, H, L]
+//   state_in : [B, H, K, V]
+//   output   : [B, H, L, V]   (kernel output 0)
+//   state_out: [B, H, K, V]   (kernel output 1)
+//   tape     : [B, H, L, V]   (kernel output 2 — `delta` per (b,h,t,v_pos))
+const DELTANET_WITH_TAPE_KERNEL_SOURCE: &str = r#"
+    constexpr uint THREADS = 32;
+    constexpr uint K_PER_THREAD = K / THREADS;
+
+    uint v_pos = threadgroup_position_in_grid.x;
+    uint h     = threadgroup_position_in_grid.y;
+    uint b     = threadgroup_position_in_grid.z;
+    uint tid   = thread_position_in_threadgroup.x;
+    uint k_base = tid * K_PER_THREAD;
+
+    uint bh_seq_base = (b * H + h) * L;
+    uint state_bh_base = ((b * H) + h) * K * V;
+    uint v_base_bh_l = bh_seq_base * V;
+
+    T state_local[K_PER_THREAD];
+    for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+        uint k_idx = k_base + kk;
+        state_local[kk] = state_in[state_bh_base + k_idx * V + v_pos];
+    }
+
+    for (uint t = 0; t < L; ++t) {
+        T decay_t = decay[bh_seq_base + t];
+        T beta_t  = beta[bh_seq_base + t];
+        T v_t     = v_in[v_base_bh_l + t * V + v_pos];
+
+        T q_local[K_PER_THREAD];
+        T k_local[K_PER_THREAD];
+        uint qk_base = bh_seq_base * K + t * K + k_base;
+        for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            q_local[kk] = q_in[qk_base + kk];
+            k_local[kk] = k_in[qk_base + kk];
+        }
+
+        T local_kv = T(0);
+        for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            state_local[kk] *= decay_t;
+            local_kv += state_local[kk] * k_local[kk];
+        }
+        T kv_mem = simd_sum(local_kv);
+
+        T delta = (v_t - kv_mem) * beta_t;
+
+        T local_out = T(0);
+        for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            state_local[kk] += k_local[kk] * delta;
+            local_out += state_local[kk] * q_local[kk];
+        }
+        T out_val = simd_sum(local_out);
+
+        if (tid == 0) {
+            output[v_base_bh_l + t * V + v_pos] = out_val;
+            tape[v_base_bh_l + t * V + v_pos] = delta;
+        }
+    }
+
+    for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+        uint k_idx = k_base + kk;
+        state_out[state_bh_base + k_idx * V + v_pos] = state_local[kk];
+    }
+"#;
+
+// Replay only the state update (no output) using a recorded innovation tape.
+// Used by speculative-decoding rollback to advance state by a prefix of
+// accepted tokens without re-deriving deltas.
+//
+// Inputs:
+//   tape  : [B, H, L, V]
+//   k     : [B, H, L, K]
+//   decay : [B, H, L]
+//   state_in : [B, H, K, V]
+// Output:
+//   state_out : [B, H, K, V]
+const DELTANET_TAPE_REPLAY_KERNEL_SOURCE: &str = r#"
+    constexpr uint THREADS = 32;
+    constexpr uint K_PER_THREAD = K / THREADS;
+
+    uint v_pos = threadgroup_position_in_grid.x;
+    uint h     = threadgroup_position_in_grid.y;
+    uint b     = threadgroup_position_in_grid.z;
+    uint tid   = thread_position_in_threadgroup.x;
+    uint k_base = tid * K_PER_THREAD;
+
+    uint bh_seq_base = (b * H + h) * L;
+    uint state_bh_base = ((b * H) + h) * K * V;
+    uint v_base_bh_l = bh_seq_base * V;
+
+    T state_local[K_PER_THREAD];
+    for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+        uint k_idx = k_base + kk;
+        state_local[kk] = state_in[state_bh_base + k_idx * V + v_pos];
+    }
+
+    for (uint t = 0; t < L; ++t) {
+        T decay_t = decay[bh_seq_base + t];
+        T delta_t = tape[v_base_bh_l + t * V + v_pos];
+
+        T k_local[K_PER_THREAD];
+        uint qk_base = bh_seq_base * K + t * K + k_base;
+        for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            k_local[kk] = k_in[qk_base + kk];
+        }
+
+        for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+            state_local[kk] = state_local[kk] * decay_t + k_local[kk] * delta_t;
+        }
+    }
+
+    for (uint kk = 0; kk < K_PER_THREAD; ++kk) {
+        uint k_idx = k_base + kk;
+        state_out[state_bh_base + k_idx * V + v_pos] = state_local[kk];
+    }
+"#;
+
 static SWIGLU_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 static MODULATE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 static DELTANET_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+static DELTANET_WITH_TAPE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+static DELTANET_TAPE_REPLAY_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 
 struct MetalKernel {
     kernel: mlx_sys::mlx_fast_metal_kernel,
@@ -616,6 +749,312 @@ pub fn deltanet_recurrence(
     }
 }
 
+fn create_deltanet_with_tape_kernel() -> MetalKernel {
+    unsafe {
+        let q_name = CString::new("q_in").unwrap();
+        let k_name = CString::new("k_in").unwrap();
+        let v_name = CString::new("v_in").unwrap();
+        let decay_name = CString::new("decay").unwrap();
+        let beta_name = CString::new("beta").unwrap();
+        let state_in_name = CString::new("state_in").unwrap();
+
+        let output_name = CString::new("output").unwrap();
+        let state_out_name = CString::new("state_out").unwrap();
+        let tape_name = CString::new("tape").unwrap();
+
+        let input_names = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(input_names, q_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, k_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, v_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, decay_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, beta_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, state_in_name.as_ptr());
+
+        let output_names = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(output_names, output_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(output_names, state_out_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(output_names, tape_name.as_ptr());
+
+        let source = CString::new(DELTANET_WITH_TAPE_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("deltanet_with_tape").unwrap();
+
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            input_names,
+            output_names,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+
+        MetalKernel {
+            kernel,
+            input_names,
+            output_names,
+        }
+    }
+}
+
+fn create_deltanet_tape_replay_kernel() -> MetalKernel {
+    unsafe {
+        let tape_name = CString::new("tape").unwrap();
+        let k_name = CString::new("k_in").unwrap();
+        let decay_name = CString::new("decay").unwrap();
+        let state_in_name = CString::new("state_in").unwrap();
+        let state_out_name = CString::new("state_out").unwrap();
+
+        let input_names = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(input_names, tape_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, k_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, decay_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(input_names, state_in_name.as_ptr());
+
+        let output_names = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(output_names, state_out_name.as_ptr());
+
+        let source = CString::new(DELTANET_TAPE_REPLAY_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("deltanet_tape_replay").unwrap();
+
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            input_names,
+            output_names,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+
+        MetalKernel {
+            kernel,
+            input_names,
+            output_names,
+        }
+    }
+}
+
+/// Same as `deltanet_recurrence`, but additionally records the per-timestep
+/// `delta` ("innovation") tensor.
+///
+/// Returns `(output, state_out, tape)`:
+///   output: [B, H, L, V]
+///   state_out: [B, H, K, V]
+///   tape: [B, H, L, V]
+///
+/// The tape can later be fed to `deltanet_tape_replay` together with a
+/// snapshot of the pre-scan state and any prefix of `k`/`decay` to
+/// cheaply advance the recurrent state by an accepted prefix of tokens
+/// (used by speculative-decoding rollback).  Requires K % 32 == 0.
+pub fn deltanet_with_tape(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    decay: &Array,
+    beta: &Array,
+    state_in: &Array,
+) -> Result<(Array, Array, Array), Exception> {
+    let kernel = DELTANET_WITH_TAPE_KERNEL.get_or_init(create_deltanet_with_tape_kernel);
+
+    let q_shape = q.shape();
+    let v_shape = v.shape();
+    if q_shape.len() != 4 || v_shape.len() != 4 {
+        return Err(Exception::custom(format!(
+            "deltanet_with_tape: expected 4D q and v, got q={:?} v={:?}",
+            q_shape, v_shape
+        )));
+    }
+    let b = q_shape[0] as i32;
+    let h = q_shape[1] as i32;
+    let l = q_shape[2] as i32;
+    let kdim = q_shape[3] as i32;
+    let vdim = v_shape[3] as i32;
+    if kdim % 32 != 0 || vdim == 0 {
+        return Err(Exception::custom(format!(
+            "deltanet_with_tape: K must be a multiple of 32 (got K={kdim}, V={vdim})"
+        )));
+    }
+
+    let dtype: u32 = q.dtype().into();
+
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let t_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, t_name.as_ptr(), dtype);
+        let k_name = CString::new("K").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, k_name.as_ptr(), kdim);
+        let v_name = CString::new("V").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, v_name.as_ptr(), vdim);
+        let l_name = CString::new("L").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, l_name.as_ptr(), l);
+        let h_name = CString::new("H").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, h_name.as_ptr(), h);
+
+        let total_x = vdim * 32;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, total_x, h, b);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
+
+        let out_shape: Vec<i32> = vec![b, h, l, vdim];
+        let state_shape: Vec<i32> = vec![b, h, kdim, vdim];
+        let tape_shape: Vec<i32> = vec![b, h, l, vdim];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, out_shape.as_ptr(), out_shape.len(), dtype);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, state_shape.as_ptr(), state_shape.len(), dtype);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, tape_shape.as_ptr(), tape_shape.len(), dtype);
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, q.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, k.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, v.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, decay.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, beta.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, state_in.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream);
+
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom(
+                "deltanet_with_tape Metal kernel execution failed"));
+        }
+
+        mlx_sys::mlx_synchronize(stream);
+
+        let mut out_result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut out_result, outputs, 0);
+        let mut state_result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut state_result, outputs, 1);
+        let mut tape_result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut tape_result, outputs, 2);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok((
+            Array::from_ptr(out_result),
+            Array::from_ptr(state_result),
+            Array::from_ptr(tape_result),
+        ))
+    }
+}
+
+/// Roll the recurrent state forward by replaying `L` steps of recorded
+/// `(tape, k, decay)` from a snapshotted `state_in`.  No q/v are required
+/// because the per-step output is not needed for state rollback.
+///
+/// Shape contract:
+///   tape   : [B, H, L, V]
+///   k      : [B, H, L, K]
+///   decay  : [B, H, L]
+///   state_in : [B, H, K, V]
+/// Returns state_out : [B, H, K, V].
+/// Requires K % 32 == 0.
+pub fn deltanet_tape_replay(
+    tape: &Array,
+    k: &Array,
+    decay: &Array,
+    state_in: &Array,
+) -> Result<Array, Exception> {
+    let kernel = DELTANET_TAPE_REPLAY_KERNEL.get_or_init(create_deltanet_tape_replay_kernel);
+
+    let tape_shape = tape.shape();
+    let k_shape = k.shape();
+    if tape_shape.len() != 4 || k_shape.len() != 4 {
+        return Err(Exception::custom(format!(
+            "deltanet_tape_replay: expected 4D tape and k, got tape={:?} k={:?}",
+            tape_shape, k_shape
+        )));
+    }
+    let b = tape_shape[0] as i32;
+    let h = tape_shape[1] as i32;
+    let l = tape_shape[2] as i32;
+    let vdim = tape_shape[3] as i32;
+    let kdim = k_shape[3] as i32;
+    if k_shape[0] != b || k_shape[1] != h || k_shape[2] != l {
+        return Err(Exception::custom(format!(
+            "deltanet_tape_replay: tape/k mismatch tape={:?} k={:?}",
+            tape_shape, k_shape
+        )));
+    }
+    if kdim % 32 != 0 || vdim == 0 {
+        return Err(Exception::custom(format!(
+            "deltanet_tape_replay: K must be a multiple of 32 (got K={kdim}, V={vdim})"
+        )));
+    }
+
+    let dtype: u32 = tape.dtype().into();
+
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let t_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, t_name.as_ptr(), dtype);
+        let k_name = CString::new("K").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, k_name.as_ptr(), kdim);
+        let v_name = CString::new("V").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, v_name.as_ptr(), vdim);
+        let l_name = CString::new("L").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, l_name.as_ptr(), l);
+        let h_name = CString::new("H").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(config, h_name.as_ptr(), h);
+
+        let total_x = vdim * 32;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, total_x, h, b);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
+
+        let state_shape: Vec<i32> = vec![b, h, kdim, vdim];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, state_shape.as_ptr(), state_shape.len(), dtype);
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, tape.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, k.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, decay.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, state_in.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream);
+
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom(
+                "deltanet_tape_replay Metal kernel execution failed"));
+        }
+
+        mlx_sys::mlx_synchronize(stream);
+
+        let mut state_result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut state_result, outputs, 0);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok(Array::from_ptr(state_result))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,5 +1191,73 @@ mod tests {
 
         assert_arrays_close(&kernel_out, &ref_out, 1e-4, "output");
         assert_arrays_close(&kernel_state, &ref_state, 1e-4, "state_out");
+    }
+
+    /// Verify that `deltanet_with_tape` produces the same output/state as
+    /// `deltanet_recurrence`, and that replaying the recorded tape from the
+    /// original `state_in` (via `deltanet_tape_replay`) reproduces the final
+    /// state.  Guards against tape semantics regressions in the rollback path.
+    #[test]
+    fn test_deltanet_with_tape_and_replay() {
+        let b = 1i32;
+        let h = 2i32;
+        let l = 4i32;
+        let k_dim = 32i32;
+        let v_dim = 32i32;
+
+        let q_data: Vec<f32> = (0..(b * h * l * k_dim) as usize)
+            .map(|i| ((i as f32) * 0.01 - 0.5).tanh())
+            .collect();
+        let k_data: Vec<f32> = (0..(b * h * l * k_dim) as usize)
+            .map(|i| ((i as f32) * 0.013 - 0.3).tanh())
+            .collect();
+        let v_data: Vec<f32> = (0..(b * h * l * v_dim) as usize)
+            .map(|i| ((i as f32) * 0.007).sin() * 0.5)
+            .collect();
+        let decay_data: Vec<f32> = (0..(b * h * l) as usize)
+            .map(|i| (-((i as f32) * 0.1 + 0.1).exp()).exp())
+            .collect();
+        let beta_data: Vec<f32> = (0..(b * h * l) as usize)
+            .map(|i| 1.0 / (1.0 + (-((i as f32) * 0.2)).exp()))
+            .collect();
+        let state_data = vec![0.0f32; (b * h * k_dim * v_dim) as usize];
+
+        let q = Array::from_slice(&q_data, &[b, h, l, k_dim]);
+        let k = Array::from_slice(&k_data, &[b, h, l, k_dim]);
+        let v = Array::from_slice(&v_data, &[b, h, l, v_dim]);
+        let decay = Array::from_slice(&decay_data, &[b, h, l]);
+        let beta = Array::from_slice(&beta_data, &[b, h, l]);
+        let state_in = Array::from_slice(&state_data, &[b, h, k_dim, v_dim]);
+
+        let (ref_out, ref_state) =
+            deltanet_recurrence(&q, &k, &v, &decay, &beta, &state_in)
+                .expect("reference recurrence failed");
+        let (tape_out, tape_state, tape) =
+            deltanet_with_tape(&q, &k, &v, &decay, &beta, &state_in)
+                .expect("tape kernel failed");
+
+        assert_arrays_close(&tape_out, &ref_out, 1e-4, "tape output vs reference");
+        assert_arrays_close(&tape_state, &ref_state, 1e-4, "tape state vs reference");
+
+        // Full-length replay should reproduce the same final state.
+        let replayed = deltanet_tape_replay(&tape, &k, &decay, &state_in)
+            .expect("tape replay failed");
+        assert_arrays_close(&replayed, &ref_state, 1e-4, "full tape replay");
+
+        // Partial replay: keep first 2 steps. Compare to fresh recurrence on
+        // q[:,:,:2], k[:,:,:2], v[:,:,:2] from the same state_in.
+        let keep = 2i32;
+        let q_p = q.index((.., .., ..keep, ..));
+        let k_p = k.index((.., .., ..keep, ..));
+        let v_p = v.index((.., .., ..keep, ..));
+        let decay_p = decay.index((.., .., ..keep));
+        let beta_p = beta.index((.., .., ..keep));
+        let (_pref_out, pref_state) =
+            deltanet_recurrence(&q_p, &k_p, &v_p, &decay_p, &beta_p, &state_in)
+                .expect("partial reference failed");
+        let tape_p = tape.index((.., .., ..keep, ..));
+        let replayed_p = deltanet_tape_replay(&tape_p, &k_p, &decay_p, &state_in)
+            .expect("partial tape replay failed");
+        assert_arrays_close(&replayed_p, &pref_state, 1e-4, "partial tape replay");
     }
 }

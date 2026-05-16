@@ -33,7 +33,9 @@ pub use memory::{
     clear_cache, flush_cache_if_needed, get_device_info, get_memory_stats, reset_peak_memory,
     set_cache_limit, set_memory_limit, set_wired_limit, DeviceInfo, MemoryStats,
 };
-pub use metal_kernels::{deltanet_recurrence, fused_modulate, fused_swiglu};
+pub use metal_kernels::{
+    deltanet_recurrence, deltanet_tape_replay, deltanet_with_tape, fused_modulate, fused_swiglu,
+};
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{
     create_attention_mask, initialize_rope, scaled_dot_product_attention,

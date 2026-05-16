@@ -1,20 +1,24 @@
 use crate::kernels::tape_replay;
 use mlx_rs::{error::Exception, ops::indexing::IndexOp, Array};
 
+/// Per-GDN-layer rollback cache for speculative-decoding verify passes.
+///
+/// Layout (matches `mlx_rs_core::deltanet_recurrence`):
+///   state      : [B, H, K, V]
+///   conv_state : [B, conv_dim, kernel_size - 1]
+///   tape       : [B, H, L, V]   (recorded delta per verify step)
+///   tape_k     : [B, H, L, K]
+///   tape_decay : [B, H, L]      (= exp(g), the kernel decay tensor)
 #[derive(Debug, Clone, Default)]
 pub struct RecurrentRollbackCache {
-    /// GDN recurrent state [B, Hv, Dv, Dk]
     pub state: Option<Array>,
-    /// Conv1d sliding window [B, conv_dim, kernel_size-1]
     pub conv_state: Option<Array>,
-    /// Pre-verify snapshot of state and conv_state
     snapshot_state: Option<Array>,
     snapshot_conv: Option<Array>,
     snapshot_step: i32,
-    /// Recorded tape, keys, gates from verify pass
     tape: Option<Array>,
     tape_k: Option<Array>,
-    tape_g: Option<Array>,
+    tape_decay: Option<Array>,
     pub step: i32,
 }
 
@@ -30,11 +34,11 @@ impl RecurrentRollbackCache {
         self.snapshot_step = self.step;
     }
 
-    /// Record tape, keys, gates for the verify pass.
-    pub fn record_tape(&mut self, tape: Array, k: Array, g: Array) {
+    /// Record tape, keys, decay for the verify pass.
+    pub fn record_tape(&mut self, tape: Array, k: Array, decay: Array) {
         self.tape = Some(tape);
         self.tape_k = Some(k);
-        self.tape_g = Some(g);
+        self.tape_decay = Some(decay);
     }
 
     /// Roll back to snapshot, then replay only the accepted steps via tape_replay kernel.
@@ -59,12 +63,14 @@ impl RecurrentRollbackCache {
             .tape_k
             .as_ref()
             .ok_or_else(|| Exception::custom("rollback requested without recorded keys"))?;
-        let tape_g = self
-            .tape_g
+        let tape_decay = self
+            .tape_decay
             .as_ref()
-            .ok_or_else(|| Exception::custom("rollback requested without recorded gates"))?;
+            .ok_or_else(|| Exception::custom("rollback requested without recorded decay"))?;
 
-        let total_steps = tape.shape()[1] as usize;
+        // Tape layout: [B, H, L, V] — accepted prefix is the first n_accepted
+        // entries along the L axis.
+        let total_steps = tape.shape()[2] as usize;
         if n_accepted > total_steps {
             return Err(Exception::custom(format!(
                 "rollback requested {n_accepted} accepted steps, but only {total_steps} tape steps are available"
@@ -73,9 +79,9 @@ impl RecurrentRollbackCache {
 
         let end = n_accepted as i32;
         let replayed = tape_replay(
-            &tape.index((.., ..end, .., ..)),
-            &tape_k.index((.., ..end, .., ..)),
-            &tape_g.index((.., ..end, ..)),
+            &tape.index((.., .., ..end, ..)),
+            &tape_k.index((.., .., ..end, ..)),
+            &tape_decay.index((.., .., ..end)),
             &state,
         )?;
         self.state = Some(replayed);
@@ -103,55 +109,77 @@ mod tests {
         assert!(max_diff < tol, "max diff {max_diff} >= {tol}");
     }
 
+    /// Replay of an accepted prefix from a snapshotted state should match a
+    /// `deltanet_recurrence` run over the same prefix from the same state.
     #[test]
     fn test_recurrent_rollback_replays_accepted_prefix() {
         let _guard = crate::mlx_test_guard();
-        let snapshot_state = Array::from_slice(
-            &[
-                0.10f32, 0.20, 0.30, 0.40, -0.10, 0.00, 0.20, 0.10, 0.05, 0.15, -0.05, 0.25, 0.30,
-                -0.20, 0.10, 0.00, 0.20, 0.10, -0.10, 0.00, 0.05, 0.25, 0.15, -0.05, 0.10, -0.15,
-                0.20, 0.30, 0.00, 0.10, 0.05, 0.15,
-            ],
-            &[1, 2, 4, 4],
-        );
+
+        // Small but realistic shapes (K=32 is the minimum that satisfies the
+        // K%32==0 requirement of the Metal kernels).
+        let b = 1i32;
+        let h = 2i32;
+        let l = 3i32;
+        let k_dim = 32i32;
+        let v_dim = 4i32;
+
+        let q_data: Vec<f32> = (0..(b * h * l * k_dim) as usize)
+            .map(|i| ((i as f32) * 0.011 - 0.4).tanh())
+            .collect();
+        let k_data: Vec<f32> = (0..(b * h * l * k_dim) as usize)
+            .map(|i| ((i as f32) * 0.013 - 0.3).tanh())
+            .collect();
+        let v_data: Vec<f32> = (0..(b * h * l * v_dim) as usize)
+            .map(|i| ((i as f32) * 0.009).sin() * 0.4)
+            .collect();
+        let decay_data: Vec<f32> = (0..(b * h * l) as usize)
+            .map(|i| (-((i as f32) * 0.1 + 0.1).exp()).exp())
+            .collect();
+        let beta_data: Vec<f32> = (0..(b * h * l) as usize)
+            .map(|i| 1.0 / (1.0 + (-((i as f32) * 0.2)).exp()))
+            .collect();
+        let state_in = Array::zeros::<f32>(&[b, h, k_dim, v_dim]).unwrap();
+
+        let q = Array::from_slice(&q_data, &[b, h, l, k_dim]);
+        let k = Array::from_slice(&k_data, &[b, h, l, k_dim]);
+        let v = Array::from_slice(&v_data, &[b, h, l, v_dim]);
+        let decay = Array::from_slice(&decay_data, &[b, h, l]);
+        let beta = Array::from_slice(&beta_data, &[b, h, l]);
+
+        // Record a tape over all L steps from the snapshot state.
+        let (_out, _full_state, tape) =
+            mlx_rs_core::deltanet_with_tape(&q, &k, &v, &decay, &beta, &state_in)
+                .expect("tape capture failed");
+
         let conv_snapshot = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
-        let tape = Array::from_slice(
-            &[
-                0.30f32, -0.10, 0.20, 0.40, 0.05, 0.25, -0.15, 0.35, 0.45, 0.10, -0.05, 0.20, 0.15,
-                0.30, 0.10, -0.20,
-            ],
-            &[1, 2, 2, 4],
-        );
-        let k = Array::from_slice(
-            &[
-                0.20f32, 0.00, -0.10, 0.30, 0.10, 0.25, 0.35, -0.20, 0.30, -0.15, 0.05, 0.10, 0.20,
-                0.10, -0.25, 0.15,
-            ],
-            &[1, 2, 2, 4],
-        );
-        let g = Array::from_slice(&[0.90f32, 0.80, 0.85, 0.75], &[1, 2, 2]);
 
         let mut cache = RecurrentRollbackCache::new();
-        cache.state = Some(snapshot_state.clone());
+        cache.state = Some(state_in.clone());
         cache.conv_state = Some(conv_snapshot.clone());
         cache.step = 7;
         cache.arm_rollback();
-        cache.state = Some(Array::zeros::<f32>(&[1, 2, 4, 4]).unwrap());
+        // Pretend the verify pass moved state forward (will be discarded).
+        cache.state = Some(Array::zeros::<f32>(&[b, h, k_dim, v_dim]).unwrap());
         cache.conv_state = Some(Array::zeros::<f32>(&[1, 2, 2]).unwrap());
         cache.step = 99;
-        cache.record_tape(tape.clone(), k.clone(), g.clone());
-        cache.rollback(1).unwrap();
+        cache.record_tape(tape, k.clone(), decay.clone());
 
-        assert_eq!(cache.step, 8);
+        // Roll back, keeping the first 2 verify steps.
+        cache.rollback(2).unwrap();
+
+        assert_eq!(cache.step, 9);
         assert_arrays_close(cache.conv_state.as_ref().unwrap(), &conv_snapshot, 1e-6);
 
-        let expected = crate::kernels::tape_replay(
-            &tape.index((.., ..1, .., ..)),
-            &k.index((.., ..1, .., ..)),
-            &g.index((.., ..1, ..)),
-            &snapshot_state,
-        )
-        .unwrap();
+        // Expected state: re-run deltanet_recurrence over the first 2 steps
+        // starting from the snapshot state.
+        let q_p = q.index((.., .., ..2, ..));
+        let k_p = k.index((.., .., ..2, ..));
+        let v_p = v.index((.., .., ..2, ..));
+        let decay_p = decay.index((.., .., ..2));
+        let beta_p = beta.index((.., .., ..2));
+        let (_, expected) =
+            mlx_rs_core::deltanet_recurrence(&q_p, &k_p, &v_p, &decay_p, &beta_p, &state_in)
+                .unwrap();
         assert_arrays_close(cache.state.as_ref().unwrap(), &expected, 1e-4);
     }
 }
