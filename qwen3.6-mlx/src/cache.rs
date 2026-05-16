@@ -90,7 +90,15 @@ impl HybridCache {
                 let n_keep = (verify_len - n_drop).max(0);
                 let replayed = snap.capture.replay_prefix(&snap.state, n_keep as usize)?;
                 rec.state = Some(replayed);
-                rec.conv_state = snap.conv_state.clone();
+                // Rebuild conv1d sliding window for the post-`n_keep` position.
+                // snap.conv_state is the PRE-verify window; we need the window
+                // after the first n_keep accepted verify tokens have flowed
+                // through conv1d. Replay = take the last (k-1) elements of
+                // concat([pre_conv_state, qkv_cf[:, :, :n_keep]], -1).
+                rec.conv_state = Some(
+                    snap.capture
+                        .rolled_conv_state(snap.conv_state.as_ref(), n_keep as usize)?,
+                );
                 rec.step = snap.step + n_keep;
                 Ok(())
             }
@@ -104,6 +112,10 @@ pub struct GdnRollbackSnapshot {
     /// Pre-verify recurrent state [B, H, K, V].
     pub state: Array,
     /// Pre-verify conv1d sliding window [B, conv_dim, kernel_size - 1].
+    ///
+    /// This is the window BEFORE the verify pass consumed any tokens.
+    /// `trim_gdn` combines this with `capture.qkv_cf[:, :, :n_keep]` to
+    /// reconstruct the post-`n_keep` window.
     pub conv_state: Option<Array>,
     /// `cache.step` at the moment the snapshot was taken.
     pub step: i32,

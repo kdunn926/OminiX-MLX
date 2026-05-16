@@ -42,6 +42,16 @@ pub struct GdnTapeCapture {
     pub tape: Array,
     pub k: Array,
     pub decay: Array,
+    /// Conv1d input `qkv_cf` for the verify pass, shape `[B, conv_dim, L]`.
+    ///
+    /// Captured BEFORE `conv1d_prefill` consumes/mutates `cache.conv_state`.
+    /// Combined with `pre_conv_state` it lets `trim_gdn` reconstruct the
+    /// post-`n_keep`-token conv sliding window exactly (without re-running
+    /// the depthwise conv, since only the last `kernel_size - 1` elements
+    /// of `concat([pre_conv_state, qkv_cf[:, :, :n_keep]], -1)` are needed).
+    pub qkv_cf: Array,
+    /// Kernel size for the conv1d window (window length = kernel_size - 1).
+    pub conv_kernel_size: i32,
 }
 
 impl GdnTapeCapture {
@@ -60,6 +70,43 @@ impl GdnTapeCapture {
         let k = self.k.index((.., .., ..end, ..));
         let decay = self.decay.index((.., .., ..end));
         mlx_rs_core::deltanet_tape_replay(&tape, &k, &decay, snapshot_state)
+    }
+
+    /// Reconstruct the conv1d sliding-window state after `n_keep` accepted
+    /// tokens, starting from `pre_conv_state` (the conv state at the moment
+    /// the verify pass began — i.e. before `conv1d_prefill` mutated it).
+    ///
+    /// Semantics mirror `conv1d_prefill`:
+    ///   padded     = concat([pre_conv_state, qkv_cf[:, :, :n_keep]], -1)
+    ///   conv_state = padded[:, :, -(kernel_size - 1):]
+    ///
+    /// When `pre_conv_state` is `None` we substitute a zero left-pad of
+    /// `(kernel_size - 1)` elements, matching the cold-start branch of
+    /// `conv1d_prefill`.
+    pub fn rolled_conv_state(
+        &self,
+        pre_conv_state: Option<&Array>,
+        n_keep: usize,
+    ) -> Result<Array, Exception> {
+        let k = self.conv_kernel_size;
+        let window = k - 1;
+        let shape = self.qkv_cf.shape();
+        let b = shape[0];
+        let conv_dim = shape[1];
+        let dtype = self.qkv_cf.dtype();
+
+        let left = match pre_conv_state {
+            Some(s) => s.clone(),
+            None => zeros_dtype(&[b, conv_dim, window], dtype)?,
+        };
+        if n_keep == 0 {
+            // Last `window` elements of `left` alone — left already has length
+            // `window`, so just return it.
+            return Ok(left);
+        }
+        let kept_qkv = self.qkv_cf.index((.., .., ..(n_keep as i32)));
+        let padded = concatenate_axis(&[&left, &kept_qkv], -1)?;
+        Ok(padded.index((.., .., -window..)))
     }
 }
 
@@ -390,6 +437,9 @@ impl GatedDeltaNet {
         let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
 
         let qkv_cf = qkv.transpose_axes(&[0, 2, 1])?;
+        // Capture the conv1d input BEFORE conv1d_prefill consumes/updates
+        // cache.conv_state. Cloning is cheap (MLX arrays are reference-counted).
+        let qkv_cf_captured = qkv_cf.clone();
         let qkv_after_conv = self.conv1d_prefill(&qkv_cf, cache, B, L)?;
 
         let q_flat = qkv_after_conv.index((.., .., ..self.key_dim));
@@ -454,6 +504,8 @@ impl GatedDeltaNet {
             tape,
             k,
             decay,
+            qkv_cf: qkv_cf_captured,
+            conv_kernel_size: self.conv_kernel_size,
         };
 
         let output = output_bhlv.transpose_axes(&[0, 2, 1, 3])?;
