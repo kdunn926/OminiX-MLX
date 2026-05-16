@@ -21,6 +21,7 @@ use crate::cache::{HybridCache, RecurrentState};
 use crate::config::{ModelArgs, TextConfig};
 use crate::deltanet::GatedDeltaNet;
 use crate::moe::{DenseMlp, MoeBlock, QuantizedSwitchLinear, SharedExpert, SwitchGLU};
+use crate::mtp::{load_mtp_head, MtpHead};
 use crate::vision::VisionTower;
 
 // ============================================================================
@@ -115,9 +116,19 @@ pub struct Model {
     pub args: ModelArgs,
     pub text_model: Qwen36TextModel,
     pub lm_head: Option<MaybeQuantized<nn::Linear>>,
+    /// Optional Multi-Token Prediction head. `None` when the checkpoint
+    /// strips MTP weights (the common case for `mlx-community` releases).
+    pub mtp_head: Option<MtpHead>,
 }
 
 impl Model {
+    /// Returns the MTP head if one was loaded from the checkpoint.
+    /// Returns `None` when MTP weights were absent (the common case for
+    /// stock `mlx-community` releases, which strip `mtp.*` keys).
+    pub fn mtp_head(&mut self) -> Option<&mut MtpHead> {
+        self.mtp_head.as_mut()
+    }
+
     /// Allocate a fresh cache vector appropriate for this model.
     ///
     /// - `mode = Standard`   → full-attention layers get `KVCache`
@@ -677,10 +688,25 @@ fn build_model_from_weights(
         layer_types: tc.layer_types.clone(),
     };
 
+    let mtp_head = load_mtp_head(weights, args)?;
+    if let Some(mtp) = &mtp_head {
+        eprintln!(
+            "Loaded MTP head: {} layers, {} weight keys detected",
+            mtp.num_layers,
+            mtp.detected_weight_keys.len()
+        );
+    } else if args.mtp_num_hidden_layers() > 0 {
+        eprintln!(
+            "Config declares mtp_num_hidden_layers={} but no MTP weights found in checkpoint (this is expected for stock mlx-community releases).",
+            args.mtp_num_hidden_layers()
+        );
+    }
+
     Ok(Model {
         args: args.clone(),
         text_model,
         lm_head,
+        mtp_head,
     })
 }
 

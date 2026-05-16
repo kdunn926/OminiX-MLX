@@ -72,6 +72,15 @@ pub struct TextConfig {
     // Quantization (sometimes inside text_config)
     #[serde(default)]
     pub quantization: Option<QuantizationConfig>,
+
+    // Multi-Token Prediction (MTP) head config — used by mtplx-mlx.
+    // Qwen3.6-35B-A3B declares `mtp_num_hidden_layers: 1` and
+    // `mtp_use_dedicated_embeddings: false`. Most released checkpoints
+    // strip the MTP weights, so loaders treat these as best-effort hints.
+    #[serde(default)]
+    pub mtp_num_hidden_layers: Option<i32>,
+    #[serde(default)]
+    pub mtp_use_dedicated_embeddings: Option<bool>,
 }
 
 fn default_max_pos() -> i32 {
@@ -103,6 +112,13 @@ pub struct ModelArgs {
     pub vision_end_token_id: Option<i32>,
     #[serde(default)]
     pub language_model_only: Option<bool>,
+
+    // Top-level mirrors of MTP config (sometimes Qwen ships these at the
+    // top level instead of / in addition to inside `text_config`).
+    #[serde(default)]
+    pub mtp_num_hidden_layers: Option<i32>,
+    #[serde(default)]
+    pub mtp_use_dedicated_embeddings: Option<bool>,
 }
 
 impl ModelArgs {
@@ -111,6 +127,21 @@ impl ModelArgs {
         self.quantization
             .as_ref()
             .or(self.text_config.quantization.as_ref())
+    }
+
+    /// Number of MTP head layers (0 if disabled). Checks top-level first,
+    /// then `text_config`.
+    pub fn mtp_num_hidden_layers(&self) -> i32 {
+        self.mtp_num_hidden_layers
+            .or(self.text_config.mtp_num_hidden_layers)
+            .unwrap_or(0)
+    }
+
+    /// Whether the MTP head has its own dedicated token embeddings.
+    pub fn mtp_use_dedicated_embeddings(&self) -> bool {
+        self.mtp_use_dedicated_embeddings
+            .or(self.text_config.mtp_use_dedicated_embeddings)
+            .unwrap_or(false)
     }
 }
 
