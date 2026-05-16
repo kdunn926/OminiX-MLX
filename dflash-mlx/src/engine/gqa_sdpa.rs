@@ -45,13 +45,39 @@ pub fn grouped_gqa_sdpa<'a>(
     let grouped_queries = q
         .reshape(&[batch, kv_heads, gqa, q_len, head_dim])?
         .reshape(&[batch, kv_heads, gqa * q_len, head_dim])?;
+    // If an array mask was supplied at the pre-fold q_len, repeat each row
+    // `gqa` times so it lines up with the folded grouped query length.
+    // Boolean and additive masks both broadcast along the head dim, so we
+    // only need to grow the q-len axis.
+    let folded_mask_owned = match &mask {
+        Some(SdpaMask::Array(m)) => {
+            let m_shape = m.shape();
+            let q_axis = m_shape.len().saturating_sub(2);
+            if m_shape.get(q_axis).copied() == Some(q_len) && gqa > 1 {
+                Some(mlx_rs::ops::repeat_axis::<bool>(
+                    (*m).clone(),
+                    gqa,
+                    q_axis as i32,
+                )?)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let folded_mask = match (&mask, &folded_mask_owned) {
+        (_, Some(arr)) => Some(SdpaMask::Array(arr)),
+        (Some(SdpaMask::Causal), _) => Some(SdpaMask::Causal),
+        (Some(SdpaMask::Array(m)), _) => Some(SdpaMask::Array(*m)),
+        (None, _) => None,
+    };
     let output = scaled_dot_product_attention(
         grouped_queries,
         k.clone(),
         v.clone(),
         None::<&mut KVCache>,
         scale,
-        mask,
+        folded_mask,
     )?;
     output
         .reshape(&[batch, kv_heads, gqa, q_len, head_dim])?

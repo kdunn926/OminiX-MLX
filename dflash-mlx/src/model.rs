@@ -38,6 +38,15 @@ pub struct DFlashDraftModelArgs {
     pub dflash_config: Option<serde_json::Value>,
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
+    /// Per-layer attention type — `"sliding_attention"` or `"full_attention"`.
+    /// Defaults to all-full when missing (matches the 35B-A3B-DFlash draft).
+    /// The 27B-DFlash draft uses sliding attention in 4 of 5 layers.
+    #[serde(default)]
+    pub layer_types: Vec<String>,
+    /// Sliding-window size in tokens. Only applied to layers where
+    /// `layer_types[layer_idx] == "sliding_attention"`.
+    #[serde(default)]
+    pub sliding_window: Option<i32>,
 }
 
 impl DFlashDraftModelArgs {
@@ -247,9 +256,42 @@ pub struct DFlashDraftAttention {
     n_kv_heads: i32,
     head_dim: i32,
     scale: f32,
+    /// Sliding window size for this layer, or None for full attention.
+    /// Matches Python's `Qwen3_5.DFlashAttention.sliding_window`: when set,
+    /// the noise query at position q attends only to keys k where
+    /// `q >= k && q < k + sliding_window` (causal + windowed).
+    sliding_window: Option<i32>,
 }
 
 impl DFlashDraftAttention {
+    /// Sliding-window + causal mask, matching Python's `_attention_mask`.
+    /// Returns `None` for full-attention layers (no mask = full bidirectional).
+    /// Otherwise returns a `[block_len, total_key_len]` boolean array where
+    /// `mask[q, k] = (qpos >= kpos) && (qpos < kpos + sliding_window)`.
+    /// Cached keys live at positions `[0..cache_offset)`; noise keys at
+    /// `[cache_offset..cache_offset+block_len)`.
+    fn build_swa_mask(
+        &self,
+        block_len: i32,
+        cache_offset: i32,
+    ) -> Result<Option<Array>, Exception> {
+        let Some(window) = self.sliding_window else {
+            return Ok(None);
+        };
+        let total_key_len = cache_offset + block_len;
+        let query_positions = mlx_rs::ops::arange::<_, i32>(
+            cache_offset,
+            cache_offset + block_len,
+            None,
+        )?
+        .reshape(&[block_len, 1])?;
+        let key_positions = mlx_rs::ops::arange::<_, i32>(0, total_key_len, None)?
+            .reshape(&[1, total_key_len])?;
+        let causal = query_positions.ge(&key_positions)?;
+        let within = query_positions.lt(&key_positions.add(array!(window))?)?;
+        Ok(Some(causal.logical_and(&within)?))
+    }
+
     pub fn debug_tensors(
         &mut self,
         noise: &Array,
@@ -461,7 +503,9 @@ impl DFlashDraftAttention {
             _ => (noise_keys_t, noise_values),
         };
 
-        let attn = grouped_gqa_sdpa(&q_t, &keys, &values, self.scale, None)?;
+        let mask_arr = self.build_swa_mask(q_len, ctx_offset)?;
+        let mask = mask_arr.as_ref().map(mlx_rs_core::SdpaMask::Array);
+        let attn = grouped_gqa_sdpa(&q_t, &keys, &values, self.scale, mask)?;
         let attn = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, q_len, self.n_heads * self.head_dim])?;
@@ -646,6 +690,21 @@ impl DFlashDraftModel {
         let mut layers = Vec::with_capacity(args.num_hidden_layers as usize);
         for i in 0..args.num_hidden_layers as usize {
             let prefix = format!("layers.{i}");
+            // Per-layer SWA: matches Python's
+            //   self.sliding_window = (
+            //       config.sliding_window
+            //       if config.layer_types[layer_idx] == "sliding_attention"
+            //       else None
+            //   )
+            // Falls back to None (full attention) when layer_types is empty
+            // (e.g. 35B-A3B-DFlash draft) or sliding_window is unset.
+            let layer_sliding = args
+                .layer_types
+                .get(i)
+                .map(|t| t == "sliding_attention")
+                .unwrap_or(false)
+                .then_some(args.sliding_window)
+                .flatten();
             layers.push(DFlashDraftLayer {
                 input_layernorm: rms_norm(&weights, &format!("{prefix}.input_layernorm.weight"), eps)?,
                 self_attn: DFlashDraftAttention {
@@ -660,6 +719,7 @@ impl DFlashDraftModel {
                     n_kv_heads: args.num_key_value_heads,
                     head_dim: args.head_dim,
                     scale,
+                    sliding_window: layer_sliding,
                 },
                 post_attention_layernorm: rms_norm(
                     &weights,
