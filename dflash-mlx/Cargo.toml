@@ -17,6 +17,7 @@ memmap2 = "0.9"
 fnv = "1"
 lru = "0.12"
 qwen3-6-mlx = { path = "../qwen3.6-mlx" }
+gemma4-mlx = { path = "../gemma4-mlx" }
 
 [dev-dependencies]
 anyhow = "1"
