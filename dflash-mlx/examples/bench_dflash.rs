@@ -381,22 +381,14 @@ fn run_gemma4(
             let block_size = draft_model.args.block_size();
             let target_layer_ids = draft_model.args.target_layer_ids();
             let mask_token_id = draft_model.args.mask_token_id();
-            // Gemma4 LM head: prefer the explicit `lm_head` weight when
-            // present, otherwise tie to `embed_tokens` (matches the Python
-            // reference's tied-embedding path).
-            //
-            // TODO: gemma4-mlx does not yet expose a `get_lm_head_weight`
-            // accessor analogous to Qwen36's. For the bench-routing
-            // milestone we approximate via the embedding-tied weight, which
-            // is what the Real DFlash draft would need anyway for the
-            // mask-token embedding lookup.
+            // Gemma4 LM head: explicit lm_head when present, else the tied
+            // embedding table. Matches the Python reference path.
             let mask_emb = model
                 .embed_tokens(&[mask_token_id as i32])
                 .map_err(|e| anyhow!(e.to_string()))?;
-            // Use the embed table as the LM head weight (tied-embedding
-            // assumption). This is consistent with gemma4 fallback path
-            // `embed_tokens.as_linear` at model.rs:1285.
-            let lm_head_weight = mask_emb.clone(); // placeholder; see TODO above
+            let lm_head_weight = model
+                .get_lm_head_weight()
+                .map_err(|e| anyhow!(e.to_string()))?;
             let target = Gemma4TargetAdapter::with_dflash(model, args.temp, target_layer_ids);
             let draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
             let spec_config = SpeculativeCycleConfig {

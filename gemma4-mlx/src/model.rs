@@ -1195,6 +1195,17 @@ impl Model {
         self.model.embed_tokens.forward(&input)
     }
 
+    /// Return the LM head weight matrix `[vocab, hidden_size]`. Prefers the
+    /// explicit `lm_head.weight` when present; otherwise falls back to the
+    /// tied embedding table. Used by DFlash to project the draft model's
+    /// hidden output back to vocab logits.
+    pub fn get_lm_head_weight(&self) -> Result<Array, Exception> {
+        if let Some(lm_head) = self.lm_head.as_ref() {
+            return Ok(lm_head.weight.as_ref().clone());
+        }
+        Ok(self.model.embed_tokens.weight.as_ref().clone())
+    }
+
     /// Forward pass that captures hidden states after each requested layer index
     /// AND returns last-position logits.  Returns `(logits[B, vocab], captures[B, T, K*H])`
     /// where K = `target_layer_ids.len()` and captures are concatenated along the last axis
@@ -1248,9 +1259,16 @@ impl Model {
         hidden_states = hidden_states.multiply(&scale)?;
 
         // Build a causal mask for prefill, none for single-step decode.
+        // The mask offset must reflect any cached prefix already in the KV
+        // cache so verify blocks attend to the right key positions:
+        //   - fresh prefill (cache empty): offset=0, mask [T, T].
+        //   - verify on top of a prefill (cache has P committed tokens):
+        //     offset=P, mask [T, P+T] so each query position attends to
+        //     all P cached tokens + its causal-prefix verify positions.
         let t = hidden_states.shape()[1];
+        let cache_offset: i32 = cache.first().map(|c| c.offset()).unwrap_or(0);
         let mask_arr = if t > 1 {
-            Some(create_causal_mask(t, Some(0), None, None)?)
+            Some(create_causal_mask(t, Some(cache_offset), None, None)?)
         } else {
             None
         };
