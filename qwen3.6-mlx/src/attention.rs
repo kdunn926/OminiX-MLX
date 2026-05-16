@@ -56,7 +56,7 @@ impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
         let L = shape[1];
 
         // Q projection: outputs [B, L, n_heads * head_dim * 2] (query + gate)
-        let q_and_gate = self.q_proj.forward(x)?;
+        let q_and_gate = crate::verify_hook::quantized_linear_forward(&mut self.q_proj, x)?;
         // Reshape to [B, L, n_heads, head_dim * 2], then split
         let q_and_gate = q_and_gate.reshape(&[B, L, self.n_heads, self.head_dim * 2])?;
         let queries = q_and_gate.index((.., .., .., ..self.head_dim));
@@ -64,8 +64,8 @@ impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
         let gate = gate.reshape(&[B, L, -1])?; // [B, L, n_heads * head_dim]
 
         // K, V projections
-        let keys = self.k_proj.forward(x)?;
-        let values = self.v_proj.forward(x)?;
+        let keys = crate::verify_hook::quantized_linear_forward(&mut self.k_proj, x)?;
+        let values = crate::verify_hook::quantized_linear_forward(&mut self.v_proj, x)?;
 
         // Reshape and transpose to [B, heads, L, head_dim]
         let mut queries = self
@@ -116,7 +116,7 @@ impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
         // Apply output gate: output * sigmoid(gate)
         let gated = attn_output.multiply(nn::sigmoid(gate)?)?;
 
-        self.o_proj.forward(&gated)
+        crate::verify_hook::quantized_linear_forward(&mut self.o_proj, &gated)
     }
 
     fn training_mode(&mut self, _mode: bool) {}

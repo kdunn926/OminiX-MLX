@@ -13,11 +13,16 @@ use serde::Deserialize;
 
 use crate::engine::spec_epoch::{DraftBlock, DraftModel, TargetModel};
 
-// TODO(verify_qmm): once qwen3.6-mlx exposes a hook for quantized-linear dispatch
-// in the verify forward path, wire `crate::verify_qmm::verify_qmm_m16_mma2big`
-// behind the `OMINIX_VERIFY_QMM=1` env var. Today the verify path goes entirely
-// through `qwen3_6_mlx::Model`, which is owned by another crate (off-limits in
-// this branch's scope). Gating uses `verify_qmm::mma2big_eligible(M,K,N,bits)`.
+/// Register the verify-qmm Metal kernel with qwen3.6-mlx so that
+/// shape-eligible quantized projections (M=16, K%32==0, N%32==0, bits=4)
+/// route through `verify_qmm_m16_mma2big` when `OMINIX_VERIFY_QMM=1` is set.
+///
+/// Called from every `Qwen36TargetAdapter` constructor. `OnceLock::set` is
+/// idempotent after the first call.
+fn install_verify_qmm_hook() {
+    let _ = qwen3_6_mlx::verify_hook::QUANTIZED_VERIFY_QMM_HOOK
+        .set(crate::verify_qmm::verify_qmm_m16_mma2big);
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DraftCheckpointInfo {
@@ -65,6 +70,7 @@ pub struct Qwen36TargetAdapter {
 
 impl Qwen36TargetAdapter {
     pub fn new(model: Model, temp: f32) -> Self {
+        install_verify_qmm_hook();
         let cache = model.new_cache(KVCacheMode::Standard);
         Self {
             model,
@@ -82,6 +88,7 @@ impl Qwen36TargetAdapter {
     }
 
     pub fn with_dflash(model: Model, temp: f32, target_layer_ids: Vec<usize>) -> Self {
+        install_verify_qmm_hook();
         let cache = model.new_cache(KVCacheMode::Standard);
         Self {
             model,
@@ -99,6 +106,7 @@ impl Qwen36TargetAdapter {
     }
 
     pub fn new_quantized_kv(model: Model, temp: f32) -> Self {
+        install_verify_qmm_hook();
         let cache = model.new_cache(KVCacheMode::Quantized);
         Self {
             model,

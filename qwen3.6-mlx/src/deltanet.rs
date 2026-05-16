@@ -101,11 +101,11 @@ fn exact_small_proj_with_pad_m(
                 x.dtype(),
             )?;
             let padded = concatenate_axis(&[x, &pad], 1)?;
-            let out = linear.forward(&padded)?;
+            let out = crate::verify_hook::quantized_linear_forward(linear, &padded)?;
             return Ok(out.index((.., ..seq_len, ..)));
         }
     }
-    linear.forward(x)
+    crate::verify_hook::quantized_linear_forward(linear, x)
 }
 
 impl GatedDeltaNet {
@@ -182,7 +182,8 @@ impl GatedDeltaNet {
         let flat = gated.reshape(&[B, 1, self.value_dim])?;
 
         // 11. Output projection
-        self.out_proj.forward(&flat)?.as_dtype(x.dtype())
+        crate::verify_hook::quantized_linear_forward(&mut self.out_proj, &flat)?
+            .as_dtype(x.dtype())
     }
 
     /// Process a full sequence through the DeltaNet layer (prefill).
@@ -318,7 +319,8 @@ impl GatedDeltaNet {
         let gated = normed.multiply(z_gate)?;
         let flat = gated.reshape(&[B, L, self.value_dim])?;
 
-        self.out_proj.forward(&flat)?.as_dtype(x.dtype())
+        crate::verify_hook::quantized_linear_forward(&mut self.out_proj, &flat)?
+            .as_dtype(x.dtype())
     }
 
     pub fn debug_prefill_tensors(

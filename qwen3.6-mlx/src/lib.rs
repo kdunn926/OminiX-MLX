@@ -16,6 +16,7 @@ pub mod config;
 pub mod deltanet;
 pub mod model;
 pub mod moe;
+pub mod verify_hook;
 pub mod vision;
 
 pub use cache::HybridCache;
