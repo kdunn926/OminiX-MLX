@@ -1217,11 +1217,38 @@ impl Model {
     /// `num_kv_shared_layers == 0` (no KV sharing). Both of these code paths are
     /// deliberately skipped here to keep the function tight; callers with E4B-style
     /// configurations should use the standard forward path.
+    /// Forward with per-layer hidden capture + per-position logits `[B, T, V]`.
+    /// Used by DFlash verify, which indexes each position's predicted-next-
+    /// token distribution. Substantially more expensive than the last-only
+    /// variant because the LM head matmul scales linearly with T.
     pub fn forward_with_hidden_capture(
         &mut self,
         input_ids: &Array,
         cache: &mut Vec<KVCache>,
         target_layer_ids: &[usize],
+    ) -> Result<(Array, Array), Exception> {
+        self.forward_with_hidden_capture_impl(input_ids, cache, target_layer_ids, false)
+    }
+
+    /// Forward with per-layer hidden capture + **last-position-only** logits
+    /// `[B, V]`. Used by DFlash prefill, where only the staged-token logits
+    /// are sampled. The LM head matmul cost drops from O(T*V*H) to O(V*H),
+    /// which is significant at vocab=262k on Gemma4.
+    pub fn forward_last_logits_with_hidden_capture(
+        &mut self,
+        input_ids: &Array,
+        cache: &mut Vec<KVCache>,
+        target_layer_ids: &[usize],
+    ) -> Result<(Array, Array), Exception> {
+        self.forward_with_hidden_capture_impl(input_ids, cache, target_layer_ids, true)
+    }
+
+    fn forward_with_hidden_capture_impl(
+        &mut self,
+        input_ids: &Array,
+        cache: &mut Vec<KVCache>,
+        target_layer_ids: &[usize],
+        last_only: bool,
     ) -> Result<(Array, Array), Exception> {
         if self.model.hidden_size_per_layer_input > 0 {
             return Err(Exception::custom(
@@ -1302,12 +1329,17 @@ impl Model {
         }
 
         let normalized = self.model.norm.forward(&hidden_states)?;
-        // Return per-position logits [B, T, vocab] (NOT just the last token).
-        // DFlash verify indexes `logits[.., t, ..]` across the block to extract
-        // each position's predicted next-token distribution for acceptance checks.
+        // last_only: collapse to [B, 1, H] BEFORE the LM head matmul to skip
+        // (T-1)/T of the cost. Verify path keeps the full [B, T, H] so each
+        // drafted position's logits are available downstream.
+        let lm_in = if last_only {
+            normalized.index((.., -1, ..))
+        } else {
+            normalized
+        };
         let mut logits = match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&normalized)?,
-            None => self.model.embed_tokens.as_linear(&normalized)?,
+            Some(lm_head) => lm_head.forward(&lm_in)?,
+            None => self.model.embed_tokens.as_linear(&lm_in)?,
         };
         if let Some(softcap) = self.args.final_logit_softcapping {
             let cap = array!(softcap);
