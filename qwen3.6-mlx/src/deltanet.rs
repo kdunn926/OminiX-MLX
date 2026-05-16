@@ -21,9 +21,13 @@ use crate::cache::RecurrentState;
 /// the 48-head, 128-dim state configuration. Benchmarks on 257 tokens:
 /// interval 4 → 2.46s, 8 → 2.38s, 16 → 2.65s, none → 2.86s.
 const EVAL_INTERVAL: i32 = 8;
-const EXACT_SMALL_PROJ_AB_PAD_M: i32 = 16;
-const EXACT_SMALL_PROJ_QKV_PAD_M: i32 = 6;
-const EXACT_SMALL_PROJ_Z_PAD_M: i32 = 10;
+// Disabled (set to 0 — `seq_len < 0` is never true, so the direct path always wins)
+// on mlx 0.31.2: the underlying quantized-matmul kernel now matches Python's
+// numerically, so padding short windows just adds noise (verified on the z
+// projection at len=9: padded path drifts by max_abs=0.125 vs direct).
+const EXACT_SMALL_PROJ_AB_PAD_M: i32 = 0;
+const EXACT_SMALL_PROJ_QKV_PAD_M: i32 = 0;
+const EXACT_SMALL_PROJ_Z_PAD_M: i32 = 0;
 
 /// Gated DeltaNet — linear attention with a fixed-size recurrent state.
 ///
