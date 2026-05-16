@@ -15,6 +15,7 @@ pub use engine::spec_epoch::{
     DFlashSession, DraftBlock, DraftModel, GenerateEvent, SessionMetrics, TargetModel,
 };
 pub use kernels::{gated_delta_with_tape, tape_replay};
+pub use verify_qmm::{mma2big_eligible, verify_qmm_m16_mma2big};
 pub use model::{DFlashDraftLayer, DFlashDraftModel, DFlashDraftModelArgs};
 pub use rollback::RecurrentRollbackCache;
 pub use runtime::loading::discover_draft_for_target;

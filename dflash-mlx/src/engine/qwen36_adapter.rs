@@ -13,6 +13,12 @@ use serde::Deserialize;
 
 use crate::engine::spec_epoch::{DraftBlock, DraftModel, TargetModel};
 
+// TODO(verify_qmm): once qwen3.6-mlx exposes a hook for quantized-linear dispatch
+// in the verify forward path, wire `crate::verify_qmm::verify_qmm_m16_mma2big`
+// behind the `OMINIX_VERIFY_QMM=1` env var. Today the verify path goes entirely
+// through `qwen3_6_mlx::Model`, which is owned by another crate (off-limits in
+// this branch's scope). Gating uses `verify_qmm::mma2big_eligible(M,K,N,bits)`.
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct DraftCheckpointInfo {
     #[serde(default)]
