@@ -858,6 +858,13 @@ pub struct LanguageModel {
     pub kv_store_layers: HashSet<usize>,
 
     pub has_moe: bool,
+
+    /// Pre-materialized `sqrt(hidden_size)` scale used by Gemma's embed-scale
+    /// multiplication. Caching this as a constant Array avoids the per-step
+    /// `Array::from(...).as_dtype(...).as_dtype(...)` allocation/cast chain
+    /// that was showing up in AR-decode profiles. We eval() it once at load
+    /// time so it's a materialized constant, not a deferred graph node.
+    pub embed_scale: Array,
 }
 
 pub struct ModelInput<'a, C> {
@@ -888,12 +895,14 @@ where
 
         let mut hidden_states = self.embed_tokens.forward(inputs)?;
 
-        // Gemma models scale embeddings by sqrt(hidden_size), cast through BF16 for
-        // numerical fidelity with Google's reference implementation.
-        let hidden_dim = hidden_states.shape()[2] as f32;
-        let scale = Array::from(hidden_dim.sqrt())
-            .as_dtype(Dtype::Bfloat16)?
-            .as_dtype(hidden_states.dtype())?;
+        // Gemma models scale embeddings by sqrt(hidden_size). Use the
+        // pre-materialized `embed_scale` constant; cast to the actual hidden
+        // dtype only if it differs from bf16 (no-op in the common path).
+        let scale = if self.embed_scale.dtype() == hidden_states.dtype() {
+            self.embed_scale.clone()
+        } else {
+            self.embed_scale.as_dtype(hidden_states.dtype())?
+        };
         hidden_states = hidden_states.multiply(&scale)?;
 
         // Compute per-layer embeddings (PLE) if enabled
@@ -922,7 +931,9 @@ where
                 .as_mut()
                 .expect("PLE per_layer_model_projection missing")
                 .forward(&hidden_states)?;
-            let proj_scale = array!((hidden_dim).powf(-0.5));
+            // PLE projection inverse-sqrt scaling. Recompute locally since
+            // the cached `embed_scale` is the forward sqrt(H), not 1/sqrt(H).
+            let proj_scale = array!((hidden_states.shape()[2] as f32).powf(-0.5));
             let proj = proj.multiply(&proj_scale)?;
             let proj = proj.reshape(&[B, L, num_layers, ple_dim])?;
             let proj = self
@@ -1277,12 +1288,14 @@ impl Model {
         );
 
         // Embed and apply Gemma's sqrt(hidden_size) embed scale (matches the Python
-        // reference's `h = input_embeddings * embed_scale`).
+        // reference's `h = input_embeddings * embed_scale`). Reuse the
+        // pre-materialized constant from LanguageModel.
         let mut hidden_states = self.model.embed_tokens.forward(input_ids)?;
-        let hidden_dim = hidden_states.shape()[2] as f32;
-        let scale = Array::from(hidden_dim.sqrt())
-            .as_dtype(Dtype::Bfloat16)?
-            .as_dtype(hidden_states.dtype())?;
+        let scale = if self.model.embed_scale.dtype() == hidden_states.dtype() {
+            self.model.embed_scale.clone()
+        } else {
+            self.model.embed_scale.as_dtype(hidden_states.dtype())?
+        };
         hidden_states = hidden_states.multiply(&scale)?;
 
         // Build a causal mask for prefill, none for single-step decode.
@@ -1555,7 +1568,27 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
 
 fn load_model_inner(model_dir: &Path, config: Gemma4Config, args: Gemma4TextConfig) -> Result<Model, Error> {
     let weights = load_all_weights(model_dir)?;
-    build_model_from_weights(&config, args, &weights)
+    let model = build_model_from_weights(&config, args, &weights)?;
+
+    // Match Python `mlx_lm.utils`: ask Metal to wire enough memory to hold
+    // the model weights + a working budget for activations. This pages the
+    // weights once at load time and keeps them resident, avoiding per-step
+    // page-faults that show up as decode slowdowns under memory pressure.
+    //
+    // Budget: estimated bytes from the weights HashMap + 4 GB headroom for
+    // KV cache + per-step activations, capped at the device's
+    // max_recommended_working_set_size.
+    let weight_bytes: usize = weights.values().map(|arr| arr.nbytes()).sum();
+    let device = mlx_rs_core::memory::get_device_info();
+    let headroom: usize = 4 * 1024 * 1024 * 1024;
+    let target = weight_bytes.saturating_add(headroom);
+    let limit = target.min(device.max_recommended_working_set_size);
+    // Failure to set the wired limit is non-fatal; just degrades perf back
+    // to the previous baseline. The function returns the previous limit on
+    // success — we discard it.
+    let _ = mlx_rs_core::memory::set_wired_limit(limit);
+
+    Ok(model)
 }
 
 fn build_model_from_weights(
@@ -1928,6 +1961,16 @@ fn build_model_from_weights(
         kv_cache_map,
         kv_store_layers,
         has_moe: args.enable_moe_block,
+        embed_scale: {
+            // Materialize a constant `[1, 1, 1] = sqrt(hidden_size)` once.
+            // Broadcasted at multiply time. Eval forces it into a concrete
+            // bf16 leaf so each forward consumes a constant, not a deferred
+            // graph node.
+            let s = Array::from((args.hidden_size as f32).sqrt())
+                .as_dtype(Dtype::Bfloat16)?;
+            let _ = mlx_rs::transforms::eval([&s]);
+            s
+        },
     };
 
     let lm_head = get_first_weight(
