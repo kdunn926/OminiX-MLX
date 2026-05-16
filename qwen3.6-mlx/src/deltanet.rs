@@ -29,6 +29,87 @@ const EXACT_SMALL_PROJ_AB_PAD_M: i32 = 0;
 const EXACT_SMALL_PROJ_QKV_PAD_M: i32 = 0;
 const EXACT_SMALL_PROJ_Z_PAD_M: i32 = 0;
 
+/// Tape capture from a `forward_prefill_with_tape` call.
+///
+/// Holds the inputs needed by `mlx_rs_core::deltanet_tape_replay` to roll
+/// the recurrent state forward from a snapshot by an accepted prefix of
+/// the captured steps:
+///   tape  : [B, num_v_heads, L, value_head_dim]
+///   k     : [B, num_v_heads, L, key_head_dim]
+///   decay : [B, num_v_heads, L]
+#[derive(Debug, Clone)]
+pub struct GdnTapeCapture {
+    pub tape: Array,
+    pub k: Array,
+    pub decay: Array,
+    /// Conv1d input `qkv_cf` for the verify pass, shape `[B, conv_dim, L]`.
+    ///
+    /// Captured BEFORE `conv1d_prefill` consumes/mutates `cache.conv_state`.
+    /// Combined with `pre_conv_state` it lets `trim_gdn` reconstruct the
+    /// post-`n_keep`-token conv sliding window exactly (without re-running
+    /// the depthwise conv, since only the last `kernel_size - 1` elements
+    /// of `concat([pre_conv_state, qkv_cf[:, :, :n_keep]], -1)` are needed).
+    pub qkv_cf: Array,
+    /// Kernel size for the conv1d window (window length = kernel_size - 1).
+    pub conv_kernel_size: i32,
+}
+
+impl GdnTapeCapture {
+    /// Replay the first `n_keep` recorded steps from `snapshot_state` and
+    /// return the resulting recurrent state.
+    pub fn replay_prefix(
+        &self,
+        snapshot_state: &Array,
+        n_keep: usize,
+    ) -> Result<Array, Exception> {
+        if n_keep == 0 {
+            return Ok(snapshot_state.clone());
+        }
+        let end = n_keep as i32;
+        let tape = self.tape.index((.., .., ..end, ..));
+        let k = self.k.index((.., .., ..end, ..));
+        let decay = self.decay.index((.., .., ..end));
+        mlx_rs_core::deltanet_tape_replay(&tape, &k, &decay, snapshot_state)
+    }
+
+    /// Reconstruct the conv1d sliding-window state after `n_keep` accepted
+    /// tokens, starting from `pre_conv_state` (the conv state at the moment
+    /// the verify pass began — i.e. before `conv1d_prefill` mutated it).
+    ///
+    /// Semantics mirror `conv1d_prefill`:
+    ///   padded     = concat([pre_conv_state, qkv_cf[:, :, :n_keep]], -1)
+    ///   conv_state = padded[:, :, -(kernel_size - 1):]
+    ///
+    /// When `pre_conv_state` is `None` we substitute a zero left-pad of
+    /// `(kernel_size - 1)` elements, matching the cold-start branch of
+    /// `conv1d_prefill`.
+    pub fn rolled_conv_state(
+        &self,
+        pre_conv_state: Option<&Array>,
+        n_keep: usize,
+    ) -> Result<Array, Exception> {
+        let k = self.conv_kernel_size;
+        let window = k - 1;
+        let shape = self.qkv_cf.shape();
+        let b = shape[0];
+        let conv_dim = shape[1];
+        let dtype = self.qkv_cf.dtype();
+
+        let left = match pre_conv_state {
+            Some(s) => s.clone(),
+            None => zeros_dtype(&[b, conv_dim, window], dtype)?,
+        };
+        if n_keep == 0 {
+            // Last `window` elements of `left` alone — left already has length
+            // `window`, so just return it.
+            return Ok(left);
+        }
+        let kept_qkv = self.qkv_cf.index((.., .., ..(n_keep as i32)));
+        let padded = concatenate_axis(&[&left, &kept_qkv], -1)?;
+        Ok(padded.index((.., .., -window..)))
+    }
+}
+
 /// Gated DeltaNet — linear attention with a fixed-size recurrent state.
 ///
 /// Uses the delta rule to maintain a [num_v_heads, k_dim, v_dim] state matrix
@@ -321,6 +402,121 @@ impl GatedDeltaNet {
 
         crate::verify_hook::quantized_linear_forward(&mut self.out_proj, &flat)?
             .as_dtype(x.dtype())
+    }
+
+    /// Tape-capturing variant of `forward_prefill`.
+    ///
+    /// Runs the same delta-rule scan as `forward_prefill` but uses
+    /// `mlx_rs_core::deltanet_with_tape`, additionally returning the per-step
+    /// innovation `tape` and the (k, decay) tensors needed to replay the
+    /// recurrence from a snapshot of `cache.state`.
+    ///
+    /// Returns `(output, GdnTapeCapture)`. The caller is expected to
+    /// snapshot `cache.state` BEFORE invoking this method (the snapshot is
+    /// passed back into `tape_replay` to advance state by an accepted
+    /// prefix of tokens during speculative-decoding rollback).
+    ///
+    /// Tape layout (matches `mlx_rs_core::deltanet_with_tape`):
+    ///   tape  : [B, H, L, V]
+    ///   k     : [B, H, L, K]
+    ///   decay : [B, H, L]
+    /// where H = num_v_heads, K = key_head_dim, V = value_head_dim.
+    #[allow(non_snake_case)]
+    pub fn forward_prefill_with_tape(
+        &mut self,
+        x: &Array,
+        cache: &mut RecurrentState,
+    ) -> Result<(Array, GdnTapeCapture), Exception> {
+        let shape = x.shape();
+        let B = shape[0];
+        let L = shape[1];
+
+        let qkv = exact_small_proj_with_pad_m(&mut self.in_proj_qkv, x, EXACT_SMALL_PROJ_QKV_PAD_M)?;
+        let z = exact_small_proj_with_pad_m(&mut self.in_proj_z, x, EXACT_SMALL_PROJ_Z_PAD_M)?;
+        let a = exact_small_proj_with_pad_m(&mut self.in_proj_a, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
+        let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
+
+        let qkv_cf = qkv.transpose_axes(&[0, 2, 1])?;
+        // Capture the conv1d input BEFORE conv1d_prefill consumes/updates
+        // cache.conv_state. Cloning is cheap (MLX arrays are reference-counted).
+        let qkv_cf_captured = qkv_cf.clone();
+        let qkv_after_conv = self.conv1d_prefill(&qkv_cf, cache, B, L)?;
+
+        let q_flat = qkv_after_conv.index((.., .., ..self.key_dim));
+        let k_flat = qkv_after_conv.index((.., .., self.key_dim..self.key_dim * 2));
+        let v_flat = qkv_after_conv.index((.., .., self.key_dim * 2..));
+
+        let q = q_flat.reshape(&[B, L, self.num_k_heads, self.key_head_dim])?;
+        let k = k_flat.reshape(&[B, L, self.num_k_heads, self.key_head_dim])?;
+        let v = v_flat.reshape(&[B, L, self.num_v_heads, self.value_head_dim])?;
+        let z = z.reshape(&[B, L, self.num_v_heads, self.value_head_dim])?;
+
+        let inv_scale = 1.0 / (self.key_head_dim as f32).sqrt();
+        let q = rms_norm_no_weight(&q, 1e-6)?.multiply(array!(inv_scale * inv_scale))?;
+        let k = rms_norm_no_weight(&k, 1e-6)?.multiply(array!(inv_scale))?;
+
+        let ratio = self.num_v_heads / self.num_k_heads;
+        let q = self.repeat_interleave_heads(&q, ratio)?;
+        let k = self.repeat_interleave_heads(&k, ratio)?;
+
+        let beta = nn::sigmoid(b)?;
+        let g = self.compute_decay_batched(&a)?;
+
+        let H = self.num_v_heads;
+        let K_dim = self.key_head_dim;
+        let V_dim = self.value_head_dim;
+
+        let q = q
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k = k
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let v = v
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let g = g
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1])?;
+        let beta = beta
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1])?;
+
+        if K_dim % 32 != 0 {
+            return Err(Exception::custom(format!(
+                "forward_prefill_with_tape requires key_head_dim % 32 == 0 (got {K_dim})"
+            )));
+        }
+
+        let state_in = match cache.state.take() {
+            Some(s) => s,
+            None => zeros_dtype(&[B, H, K_dim, V_dim], mlx_rs::Dtype::Float32)?,
+        };
+        let decay = g.exp()?;
+
+        let (output_bhlv, new_state, tape) =
+            mlx_rs_core::deltanet_with_tape(&q, &k, &v, &decay, &beta, &state_in)?;
+
+        cache.state = Some(new_state);
+        cache.step += L;
+
+        let capture = GdnTapeCapture {
+            tape,
+            k,
+            decay,
+            qkv_cf: qkv_cf_captured,
+            conv_kernel_size: self.conv_kernel_size,
+        };
+
+        let output = output_bhlv.transpose_axes(&[0, 2, 1, 3])?;
+        let normed = self.norm.forward(&output)?;
+        let z_gate = nn::silu(z)?;
+        let gated = normed.multiply(z_gate)?;
+        let flat = gated.reshape(&[B, L, self.value_dim])?;
+
+        let out = crate::verify_hook::quantized_linear_forward(&mut self.out_proj, &flat)?
+            .as_dtype(x.dtype())?;
+        Ok((out, capture))
     }
 
     pub fn debug_prefill_tensors(

@@ -8,7 +8,9 @@ use mlx_rs::{
     Array,
 };
 use mlx_rs_core::utils::AttentionMask;
-use qwen3_6_mlx::{HybridCache, KVCacheMode, Model};
+use qwen3_6_mlx::{
+    cache::GdnRollbackSnapshot, model::AttentionLayer, HybridCache, KVCacheMode, Model,
+};
 use serde::Deserialize;
 
 use crate::engine::spec_epoch::{DraftBlock, DraftModel, TargetModel};
@@ -66,6 +68,16 @@ pub struct Qwen36TargetAdapter {
     target_layer_ids: Vec<usize>,
     target_hidden_accumulated: Option<Array>,
     verify_hidden_snapshot: Option<Array>,
+    /// Per-layer GDN snapshots captured during the most recent verify pass.
+    /// `gdn_snapshots[i]` is `Some` iff layer `i` is a GDN (linear-attention)
+    /// layer that recorded a tape; `None` for full-attention layers.
+    /// Cleared by `prefill` and `rollback_kv`.
+    gdn_snapshots: Vec<Option<GdnRollbackSnapshot>>,
+    /// Captures emitted by the most recent verify pass, full block `[B, L, K*H]`.
+    /// On rollback, we slice this to `n_keep` rows and append to the
+    /// pre-verify accumulator — avoiding the desync where target KV holds
+    /// `n_keep` more tokens than the hidden accumulator reflects.
+    verify_captures: Option<Array>,
 }
 
 impl Qwen36TargetAdapter {
@@ -84,6 +96,8 @@ impl Qwen36TargetAdapter {
             target_layer_ids: Vec::new(),
             target_hidden_accumulated: None,
             verify_hidden_snapshot: None,
+            gdn_snapshots: Vec::new(),
+            verify_captures: None,
         }
     }
 
@@ -102,6 +116,8 @@ impl Qwen36TargetAdapter {
             target_layer_ids,
             target_hidden_accumulated: None,
             verify_hidden_snapshot: None,
+            gdn_snapshots: Vec::new(),
+            verify_captures: None,
         }
     }
 
@@ -120,6 +136,8 @@ impl Qwen36TargetAdapter {
             target_layer_ids: Vec::new(),
             target_hidden_accumulated: None,
             verify_hidden_snapshot: None,
+            gdn_snapshots: Vec::new(),
+            verify_captures: None,
         }
     }
 
@@ -168,6 +186,137 @@ impl Qwen36TargetAdapter {
         Ok((logits, captures))
     }
 
+    /// Verify-pass forward that captures both hidden states (for downstream
+    /// dflash checks) and per-GDN-layer innovation tapes.
+    ///
+    /// For every linear-attention (GDN) layer with `L > 1`, snapshots the
+    /// pre-verify recurrent + conv state and uses
+    /// `GatedDeltaNet::forward_prefill_with_tape` so the resulting tape can
+    /// later be replayed (via `HybridCache::trim_gdn`) to roll the state
+    /// forward by the accepted prefix without a second forward pass.
+    ///
+    /// Full-attention layers are unchanged — their KV cache is trimmed in
+    /// O(1) by `KVCache::trim`.
+    fn forward_with_hidden_capture_tape(
+        &mut self,
+        inputs: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        if let Some(&layer_id) = self
+            .target_layer_ids
+            .iter()
+            .find(|&&layer_id| layer_id >= self.model.text_model.layers.len())
+        {
+            return Err(Exception::custom(format!(
+                "capture layer index {layer_id} out of range for {} layers",
+                self.model.text_model.layers.len()
+            )));
+        }
+
+        if self.cache.is_empty() {
+            self.cache = self.model.new_cache(self.kv_cache_mode);
+        }
+
+        let mut h = self.model.text_model.embed_tokens.forward(inputs)?;
+        let mask = if h.shape()[1] > 1 {
+            Some(AttentionMask::Causal)
+        } else {
+            None
+        };
+
+        let n_layers = self.model.text_model.layers.len();
+        let mut gdn_snapshots: Vec<Option<GdnRollbackSnapshot>> =
+            (0..n_layers).map(|_| None).collect();
+
+        let target_layer_ids = self.target_layer_ids.clone();
+        let mut captures = Vec::with_capacity(target_layer_ids.len());
+        for (layer_idx, (layer, cache)) in self
+            .model
+            .text_model
+            .layers
+            .iter_mut()
+            .zip(self.cache.iter_mut())
+            .enumerate()
+        {
+            let is_gdn_prefill = matches!(layer.attention, AttentionLayer::LinearAttention(_))
+                && h.shape()[1] > 1;
+
+            if is_gdn_prefill {
+                let rec = match cache {
+                    HybridCache::Recurrent(r) => r,
+                    _ => {
+                        return Err(Exception::custom(
+                            "linear-attention layer paired with non-recurrent cache",
+                        ));
+                    }
+                };
+
+                // Snapshot pre-verify recurrent state + conv state + step.
+                // `state` is None only on the very first forward (no prior
+                // prefill); we materialize a zero state in float32 so the
+                // tape-replay path has something to start from.
+                let snap_state = match rec.state.clone() {
+                    Some(s) => s,
+                    None => {
+                        let delta = match &layer.attention {
+                            AttentionLayer::LinearAttention(d) => d,
+                            _ => unreachable!(),
+                        };
+                        mlx_rs::ops::zeros_dtype(
+                            &[
+                                h.shape()[0],
+                                delta.num_v_heads,
+                                delta.key_head_dim,
+                                delta.value_head_dim,
+                            ],
+                            mlx_rs::Dtype::Float32,
+                        )?
+                    }
+                };
+                let snap_conv = rec.conv_state.clone();
+                let snap_step = rec.step;
+
+                let normed = layer.input_layernorm.forward(&h)?;
+                let delta = match &mut layer.attention {
+                    AttentionLayer::LinearAttention(d) => d,
+                    _ => unreachable!(),
+                };
+                let (attn_out, capture) = delta.forward_prefill_with_tape(&normed, rec)?;
+                let after_attn = h.add(&attn_out)?;
+                let normed_h = layer.post_attention_layernorm.forward(&after_attn)?;
+                let mlp_out = match &mut layer.ffn {
+                    qwen3_6_mlx::model::FfnBlock::Moe(m) => m.forward(&normed_h)?,
+                    qwen3_6_mlx::model::FfnBlock::Dense(d) => d.forward(&normed_h)?,
+                };
+                h = after_attn.add(mlp_out)?;
+
+                gdn_snapshots[layer_idx] = Some(GdnRollbackSnapshot {
+                    state: snap_state,
+                    conv_state: snap_conv,
+                    step: snap_step,
+                    capture,
+                });
+            } else {
+                h = layer.forward(&h, mask.as_ref(), cache)?;
+            }
+
+            if target_layer_ids.iter().any(|&id| id == layer_idx) {
+                captures.push(h.clone());
+            }
+        }
+
+        self.gdn_snapshots = gdn_snapshots;
+
+        h = self.model.text_model.norm.forward(&h)?;
+        let logits = self.model.apply_lm_head(&h)?;
+        let captures = if captures.is_empty() {
+            Array::zeros::<f32>(&[0])?
+        } else {
+            let capture_refs = captures.iter().collect::<Vec<_>>();
+            concatenate_axis(&capture_refs, 2)?
+        };
+        Ok((logits, captures))
+    }
+
     fn append_target_hidden(&mut self, captures: Array) -> Result<(), Exception> {
         self.target_hidden_accumulated = Some(match self.target_hidden_accumulated.take() {
             Some(existing) => concatenate_axis(&[&existing, &captures], 1)?,
@@ -188,6 +337,7 @@ impl TargetModel for Qwen36TargetAdapter {
         self.step = 0;
         self.target_hidden_accumulated = None;
         self.verify_hidden_snapshot = None;
+        self.gdn_snapshots.clear();
 
         let seq_len = prompt.shape()[1];
         let logits = if seq_len > PREFILL_CHUNK {
@@ -239,7 +389,21 @@ impl TargetModel for Qwen36TargetAdapter {
         // on Drop — AR/draft forwards remain untouched.
         let _verify_guard = qwen3_6_mlx::verify_hook::VerifyScope::enter();
 
-        let logits = if !self.target_layer_ids.is_empty() {
+        // Verify pass routes through the tape-capturing variant whenever the
+        // drafted block is long enough to use the GDN prefill path (L > 1),
+        // so that `rollback_kv` can replay accepted GDN steps from the
+        // pre-verify snapshot instead of cloning + re-forwarding the cache.
+        let logits = if drafted_tokens.shape()[1] > 1 {
+            let (logits, captures) = self.forward_with_hidden_capture_tape(drafted_tokens)?;
+            if !self.target_layer_ids.is_empty() {
+                // Save the full-block captures BEFORE appending, so the
+                // rollback path can slice to n_keep rows (the append below
+                // assumes full acceptance — rollback corrects).
+                self.verify_captures = Some(captures.clone());
+                self.append_target_hidden(captures)?;
+            }
+            logits
+        } else if !self.target_layer_ids.is_empty() {
             let (logits, captures) = self.forward_with_hidden_capture(drafted_tokens)?;
             self.append_target_hidden(captures)?;
             logits
@@ -267,26 +431,58 @@ impl TargetModel for Qwen36TargetAdapter {
             )));
         }
 
-        self.cache = self.verify_snapshot.clone().ok_or_else(|| {
-            Exception::custom("target rollback requested without a verify snapshot")
-        })?;
-        self.step = self.verify_step;
-        self.target_hidden_accumulated = self.verify_hidden_snapshot.clone();
+        let n_drop = (verify_len - n_keep) as i32;
+        let has_gdn_snapshots = self.gdn_snapshots.iter().any(|s| s.is_some());
 
-        if n_keep > 0 {
-            let kept = verify_inputs.index((.., ..n_keep as i32));
-            if !self.target_layer_ids.is_empty() {
-                let (_, captures) = self.forward_with_hidden_capture(&kept)?;
-                self.append_target_hidden(captures)?;
-            } else {
-                let _ = self.model.forward_last_logits(&kept, &mut self.cache)?;
+        if has_gdn_snapshots {
+            // Deterministic per-layer rollback: FA layers trim KV by `n_drop`,
+            // GDN layers replay the first `n_keep` recorded tape steps from
+            // the snapshotted state.  Avoids cloning the cache and
+            // re-forwarding the kept prefix.
+            for (layer_idx, cache) in self.cache.iter_mut().enumerate() {
+                cache.trim_gdn(
+                    n_drop,
+                    verify_len as i32,
+                    self.gdn_snapshots[layer_idx].as_ref(),
+                )?;
             }
-            self.step += n_keep;
+            self.step = self.verify_step + n_keep;
+            // Rebuild target_hidden_accumulated = pre_verify ++ verify_captures[:n_keep].
+            // The bug being fixed: previously this restored to pre-verify only,
+            // leaving target KV with `n_keep` more committed positions than the
+            // hidden accumulator reflected → next-cycle draft sees stale context
+            // → catastrophic acceptance collapse (~0.014 in benches).
+            self.target_hidden_accumulated = self.verify_hidden_snapshot.clone();
+            if n_keep > 0 && !self.target_layer_ids.is_empty() {
+                if let Some(full_caps) = self.verify_captures.as_ref() {
+                    let kept_caps = full_caps.index((.., ..n_keep as i32, ..));
+                    self.append_target_hidden(kept_caps)?;
+                }
+            }
+        } else {
+            self.cache = self.verify_snapshot.clone().ok_or_else(|| {
+                Exception::custom("target rollback requested without a verify snapshot")
+            })?;
+            self.step = self.verify_step;
+            self.target_hidden_accumulated = self.verify_hidden_snapshot.clone();
+
+            if n_keep > 0 {
+                let kept = verify_inputs.index((.., ..n_keep as i32));
+                if !self.target_layer_ids.is_empty() {
+                    let (_, captures) = self.forward_with_hidden_capture(&kept)?;
+                    self.append_target_hidden(captures)?;
+                } else {
+                    let _ = self.model.forward_last_logits(&kept, &mut self.cache)?;
+                }
+                self.step += n_keep;
+            }
         }
 
         self.verify_snapshot = None;
         self.verify_inputs = None;
         self.verify_hidden_snapshot = None;
+        self.verify_captures = None;
+        self.gdn_snapshots.clear();
         Ok(())
     }
 
