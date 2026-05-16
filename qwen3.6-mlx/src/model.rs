@@ -5,9 +5,9 @@ use mlx_rs::{
     error::Exception,
     module::{Module, ModuleParameters, Param},
     nn,
-    ops::indexing::IndexOp,
+    ops::{concatenate_axis, dequantize, indexing::IndexOp},
     quantization::MaybeQuantized,
-    Array,
+    Array, Dtype,
 };
 
 use mlx_rs_core::{
@@ -150,13 +150,7 @@ impl Model {
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, cache)?;
         let last = h.index((.., -1, ..));
-        match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&last),
-            None => match &mut self.text_model.embed_tokens {
-                MaybeQuantized::Original(e) => e.as_linear(&last),
-                MaybeQuantized::Quantized(qe) => qe.as_linear(&last),
-            },
-        }
+        self.apply_lm_head(&last)
     }
 
     #[allow(non_snake_case)]
@@ -166,13 +160,7 @@ impl Model {
         cache: &mut Vec<HybridCache>,
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, cache)?;
-        match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&h),
-            None => match &mut self.text_model.embed_tokens {
-                MaybeQuantized::Original(e) => e.as_linear(&h),
-                MaybeQuantized::Quantized(qe) => qe.as_linear(&h),
-            },
-        }
+        self.apply_lm_head(&h)
     }
 
     /// Forward pass starting from pre-built embeddings instead of token IDs.
@@ -203,19 +191,117 @@ impl Model {
         }
         h = self.text_model.norm.forward(&h)?;
         let last = h.index((.., -1i32, ..));
-        match self.lm_head.as_mut() {
-            Some(lm_head) => lm_head.forward(&last),
-            None => match &mut self.text_model.embed_tokens {
-                MaybeQuantized::Original(e) => e.as_linear(&last),
-                MaybeQuantized::Quantized(qe) => qe.as_linear(&last),
-            },
-        }
+        self.apply_lm_head(&last)
     }
 
     /// Embed a slice of token IDs.
     pub fn embed_tokens(&mut self, ids: &[i32]) -> Result<Array, Exception> {
         let arr = Array::from_slice(ids, &[1, ids.len() as i32]);
         self.text_model.embed_tokens.forward(&arr)
+    }
+
+    /// Run all layers, capture hidden states at specified layer indices, return
+    /// last-position logits AND concatenated captures [B, T, num_captures * hidden].
+    /// `layer_ids` must be valid 0-based layer indices. Captures the hidden state
+    /// AFTER the block forward for that layer (before the final norm).
+    /// Only projects the last sequence position through lm_head to avoid [B, T, vocab] OOM.
+    pub fn forward_last_logits_with_hidden_capture(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Vec<HybridCache>,
+        capture_layer_ids: &[usize],
+    ) -> Result<(Array, Array), Exception> {
+        if capture_layer_ids.is_empty() {
+            return Ok((self.forward_last_logits(inputs, cache)?, Array::zeros::<f32>(&[0])?));
+        }
+        if let Some(&layer_id) = capture_layer_ids
+            .iter()
+            .find(|&&layer_id| layer_id >= self.text_model.layers.len())
+        {
+            return Err(Exception::custom(format!(
+                "capture layer index {layer_id} out of range for {} layers",
+                self.text_model.layers.len()
+            )));
+        }
+
+        let mut h = self.text_model.embed_tokens.forward(inputs)?;
+        let t = h.shape()[1];
+        let mask = if t > 1 {
+            Some(mlx_rs_core::utils::AttentionMask::Causal)
+        } else {
+            None
+        };
+
+        if cache.is_empty() {
+            for layer_type in &self.text_model.layer_types {
+                if layer_type == "full_attention" {
+                    cache.push(HybridCache::KV(KVCache::new()));
+                } else {
+                    cache.push(HybridCache::Recurrent(RecurrentState::new()));
+                }
+            }
+        }
+
+        let mut captures = Vec::with_capacity(capture_layer_ids.len());
+        for (layer_idx, (layer, c)) in self
+            .text_model
+            .layers
+            .iter_mut()
+            .zip(cache.iter_mut())
+            .enumerate()
+        {
+            h = layer.forward(&h, mask.as_ref(), c)?;
+            if capture_layer_ids.iter().any(|&id| id == layer_idx) {
+                captures.push(h.clone());
+            }
+        }
+
+        h = self.text_model.norm.forward(&h)?;
+        let logits = self.apply_lm_head(&h.index((.., -1i32, ..)))?;
+        let capture_refs = captures.iter().collect::<Vec<_>>();
+        let captures = concatenate_axis(&capture_refs, 2)?;
+        Ok((logits, captures))
+    }
+
+    /// Apply lm_head (or embed_tokens.T if no lm_head) to arbitrary hidden states.
+    /// `h` can be any shape ending in hidden_size — result replaces last dim with vocab_size.
+    pub fn apply_lm_head(&mut self, h: &Array) -> Result<Array, Exception> {
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(h),
+            None => match &mut self.text_model.embed_tokens {
+                MaybeQuantized::Original(e) => e.as_linear(h),
+                MaybeQuantized::Quantized(qe) => qe.as_linear(h),
+            },
+        }
+    }
+
+    /// Extract the lm_head weight matrix [vocab_size, hidden_size] as a contiguous BF16 Array.
+    /// For tied weights (no separate lm_head), this dequantizes the embedding weight.
+    /// Used to project draft model hidden states through the target's vocabulary projection.
+    pub fn get_lm_head_weight(&mut self) -> Result<Array, Exception> {
+        let weight = match self.lm_head.as_mut() {
+            Some(MaybeQuantized::Original(l)) => l.weight.as_ref().clone(),
+            Some(MaybeQuantized::Quantized(ql)) => dequantize(
+                &ql.inner.weight,
+                &ql.scales,
+                &ql.biases,
+                ql.group_size,
+                ql.bits,
+                None::<&str>,
+            )?,
+            None => match &mut self.text_model.embed_tokens {
+                MaybeQuantized::Original(e) => e.weight.as_ref().clone(),
+                MaybeQuantized::Quantized(qe) => dequantize(
+                    &qe.inner.weight,
+                    &qe.scales,
+                    &qe.biases,
+                    qe.group_size,
+                    qe.bits,
+                    None::<&str>,
+                )?,
+            },
+        };
+        weight.as_dtype(Dtype::Bfloat16)?.contiguous()
     }
 
     #[allow(non_snake_case)]

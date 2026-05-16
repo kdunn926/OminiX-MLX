@@ -51,6 +51,7 @@ members = [
     "qwen3-tts-mlx",
     "qwen3.5-35B-mlx",
     "qwen3.6-mlx",
+    "dflash-mlx",
     "deepseek-ocr2-mlx",
     "qwen3-vl-mlx",
     "gemma4-mlx",
@@ -67,9 +68,12 @@ mlx-internal-macros = { version = "1.0", path = "mlx-rs/mlx-internal-macros" }
 mlx-rs = { version = "1.0", path = "mlx-rs" }
 mlx-lm-utils = { version = "1.0", path = "mlx-rs/mlx-lm-utils" }
 mlx-rs-core = { version = "1.0", path = "mlx-rs-core" }
+dflash-mlx = { version = "0.1", path = "dflash-mlx" }
 
 # external dependencies
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 float_eq = "1"
 pretty_assertions = "1.4.0"
 dyn-clone = "1"

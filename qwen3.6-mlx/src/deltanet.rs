@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use mlx_rs::{
     array,
     error::Exception,
@@ -19,6 +21,9 @@ use crate::cache::RecurrentState;
 /// the 48-head, 128-dim state configuration. Benchmarks on 257 tokens:
 /// interval 4 → 2.46s, 8 → 2.38s, 16 → 2.65s, none → 2.86s.
 const EVAL_INTERVAL: i32 = 8;
+const EXACT_SMALL_PROJ_AB_PAD_M: i32 = 16;
+const EXACT_SMALL_PROJ_QKV_PAD_M: i32 = 6;
+const EXACT_SMALL_PROJ_Z_PAD_M: i32 = 10;
 
 /// Gated DeltaNet — linear attention with a fixed-size recurrent state.
 ///
@@ -53,6 +58,28 @@ fn l2_normalize(x: &Array, eps: f32) -> Result<Array, Exception> {
     x.divide(&norm)
 }
 
+fn exact_small_proj_with_pad_m(
+    linear: &mut MaybeQuantized<nn::Linear>,
+    x: &Array,
+    pad_m: i32,
+) -> Result<Array, Exception> {
+    if x.shape().len() == 3 {
+        let batch_size = x.shape()[0];
+        let seq_len = x.shape()[1];
+        let hidden_dim = x.shape()[2];
+        if seq_len < pad_m {
+            let pad = zeros_dtype(
+                &[batch_size, pad_m - seq_len, hidden_dim],
+                x.dtype(),
+            )?;
+            let padded = concatenate_axis(&[x, &pad], 1)?;
+            let out = linear.forward(&padded)?;
+            return Ok(out.index((.., ..seq_len, ..)));
+        }
+    }
+    linear.forward(x)
+}
+
 impl GatedDeltaNet {
     /// Process a single token through the DeltaNet layer (decode step).
     #[allow(non_snake_case)]
@@ -66,10 +93,10 @@ impl GatedDeltaNet {
         // x: [B, 1, hidden]
 
         // 1. Project
-        let qkv = self.in_proj_qkv.forward(x)?; // [B, 1, conv_dim]
-        let z = self.in_proj_z.forward(x)?; // [B, 1, value_dim]
-        let a = self.in_proj_a.forward(x)?; // [B, 1, num_v_heads]
-        let b = self.in_proj_b.forward(x)?; // [B, 1, num_v_heads]
+        let qkv = exact_small_proj_with_pad_m(&mut self.in_proj_qkv, x, EXACT_SMALL_PROJ_QKV_PAD_M)?; // [B, 1, conv_dim]
+        let z = exact_small_proj_with_pad_m(&mut self.in_proj_z, x, EXACT_SMALL_PROJ_Z_PAD_M)?; // [B, 1, value_dim]
+        let a = exact_small_proj_with_pad_m(&mut self.in_proj_a, x, EXACT_SMALL_PROJ_AB_PAD_M)?; // [B, 1, num_v_heads]
+        let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?; // [B, 1, num_v_heads]
 
         // 2. Causal Conv1d update
         // qkv: [B, 1, conv_dim] → [B, conv_dim, 1]
@@ -125,7 +152,7 @@ impl GatedDeltaNet {
         let flat = gated.reshape(&[B, 1, self.value_dim])?;
 
         // 11. Output projection
-        self.out_proj.forward(&flat)
+        self.out_proj.forward(&flat)?.as_dtype(x.dtype())
     }
 
     /// Process a full sequence through the DeltaNet layer (prefill).
@@ -144,10 +171,10 @@ impl GatedDeltaNet {
         let L = shape[1];
 
         // 1. Project full sequence (parallel)
-        let qkv = self.in_proj_qkv.forward(x)?; // [B, L, conv_dim]
-        let z = self.in_proj_z.forward(x)?; // [B, L, value_dim]
-        let a = self.in_proj_a.forward(x)?; // [B, L, num_v_heads]
-        let b = self.in_proj_b.forward(x)?; // [B, L, num_v_heads]
+        let qkv = exact_small_proj_with_pad_m(&mut self.in_proj_qkv, x, EXACT_SMALL_PROJ_QKV_PAD_M)?; // [B, L, conv_dim]
+        let z = exact_small_proj_with_pad_m(&mut self.in_proj_z, x, EXACT_SMALL_PROJ_Z_PAD_M)?; // [B, L, value_dim]
+        let a = exact_small_proj_with_pad_m(&mut self.in_proj_a, x, EXACT_SMALL_PROJ_AB_PAD_M)?; // [B, L, num_v_heads]
+        let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?; // [B, L, num_v_heads]
 
         // 2. Causal Conv1d on full sequence (parallel)
         let qkv_cf = qkv.transpose_axes(&[0, 2, 1])?; // [B, conv_dim, L]
@@ -259,7 +286,127 @@ impl GatedDeltaNet {
         let gated = normed.multiply(z_gate)?;
         let flat = gated.reshape(&[B, L, self.value_dim])?;
 
-        self.out_proj.forward(&flat)
+        self.out_proj.forward(&flat)?.as_dtype(x.dtype())
+    }
+
+    pub fn debug_prefill_tensors(
+        &mut self,
+        x: &Array,
+        cache: &mut RecurrentState,
+    ) -> Result<HashMap<String, Array>, Exception> {
+        let shape = x.shape();
+        let batch_size = shape[0];
+        let seq_len = shape[1];
+
+        let qkv = exact_small_proj_with_pad_m(&mut self.in_proj_qkv, x, EXACT_SMALL_PROJ_QKV_PAD_M)?;
+        let z = exact_small_proj_with_pad_m(&mut self.in_proj_z, x, EXACT_SMALL_PROJ_Z_PAD_M)?;
+        let a = exact_small_proj_with_pad_m(&mut self.in_proj_a, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
+        let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
+
+        let qkv_cf = qkv.transpose_axes(&[0, 2, 1])?;
+        let qkv_after_conv = self.conv1d_prefill(&qkv_cf, cache, batch_size, seq_len)?;
+
+        let q_flat = qkv_after_conv.index((.., .., ..self.key_dim));
+        let k_flat = qkv_after_conv.index((.., .., self.key_dim..self.key_dim * 2));
+        let v_flat = qkv_after_conv.index((.., .., self.key_dim * 2..));
+
+        let q_heads = q_flat.reshape(&[batch_size, seq_len, self.num_k_heads, self.key_head_dim])?;
+        let k_heads = k_flat.reshape(&[batch_size, seq_len, self.num_k_heads, self.key_head_dim])?;
+        let v_heads = v_flat.reshape(&[batch_size, seq_len, self.num_v_heads, self.value_head_dim])?;
+        let z_heads = z.reshape(&[batch_size, seq_len, self.num_v_heads, self.value_head_dim])?;
+
+        let scale = 1.0 / (self.key_head_dim as f32).sqrt();
+        let q_norm = l2_normalize(&q_heads, 1e-6)?.multiply(array!(scale))?;
+        let k_norm = l2_normalize(&k_heads, 1e-6)?;
+
+        let ratio = self.num_v_heads / self.num_k_heads;
+        let q = self.repeat_interleave_heads(&q_norm, ratio)?;
+        let k = self.repeat_interleave_heads(&k_norm, ratio)?;
+
+        let beta = nn::sigmoid(&b)?;
+        let g = self.compute_decay_batched(&a)?;
+
+        let num_v_heads = self.num_v_heads;
+        let k_dim = self.key_head_dim;
+        let v_dim = self.value_head_dim;
+
+        let q_bhlk = q
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k_bhlk = k
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let v_bhlv = v_heads
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let g_bhl = g
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1])?;
+        let beta_bhl = beta
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .transpose_axes(&[0, 2, 1])?;
+
+        let state_in = match cache.state.take() {
+            Some(s) => s,
+            None => zeros_dtype(&[batch_size, num_v_heads, k_dim, v_dim], mlx_rs::Dtype::Float32)?,
+        };
+        let decay = g_bhl.exp()?;
+        let decay_5d = decay.reshape(&[batch_size, num_v_heads, seq_len, 1, 1])?;
+        let k_col_all = k_bhlk.reshape(&[batch_size, num_v_heads, seq_len, k_dim, 1])?;
+        let q_col_all = q_bhlk.reshape(&[batch_size, num_v_heads, seq_len, k_dim, 1])?;
+        let v_col_all = v_bhlv.reshape(&[batch_size, num_v_heads, seq_len, v_dim, 1])?;
+        let beta_col_all = beta_bhl.reshape(&[batch_size, num_v_heads, seq_len, 1, 1])?;
+        let k_row_all = k_col_all.transpose_axes(&[0, 1, 2, 4, 3])?;
+        let mut state_t = state_in.transpose_axes(&[0, 1, 3, 2])?;
+        let mut outputs = Vec::with_capacity(seq_len as usize);
+        for t in 0..seq_len {
+            let decay_t = decay_5d.index((.., .., t, .., ..));
+            let k_t = k_col_all.index((.., .., t, .., ..));
+            let v_col = v_col_all.index((.., .., t, .., ..));
+            let beta_t = beta_col_all.index((.., .., t, .., ..));
+            let q_t = q_col_all.index((.., .., t, .., ..));
+            let k_row = k_row_all.index((.., .., t, .., ..));
+            state_t = state_t.multiply(&decay_t)?;
+            let kv_mem = state_t.matmul(&k_t)?;
+            let delta = v_col.subtract(&kv_mem)?.multiply(&beta_t)?;
+            state_t = state_t.add(delta.matmul(&k_row)?)?;
+            outputs.push(state_t.matmul(&q_t)?);
+        }
+        let stacked = mlx_rs::ops::stack_axis(&outputs, 2)?;
+        let output_bhlv = stacked.reshape(&[batch_size, num_v_heads, seq_len, v_dim])?;
+        let new_state = state_t.transpose_axes(&[0, 1, 3, 2])?;
+        cache.state = Some(new_state.clone());
+        cache.step += seq_len;
+
+        let output = output_bhlv.transpose_axes(&[0, 2, 1, 3])?;
+        let normed = self.norm.forward(&output)?;
+        let z_gate = nn::silu(&z_heads)?;
+        let gated = normed.multiply(&z_gate)?;
+        let flat = gated.reshape(&[batch_size, seq_len, self.value_dim])?;
+        let out_proj = self.out_proj.forward(&flat)?.as_dtype(x.dtype())?;
+
+        Ok(HashMap::from([
+            ("qkv".to_string(), qkv),
+            ("z".to_string(), z),
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("qkv_after_conv".to_string(), qkv_after_conv),
+            ("q_heads".to_string(), q_heads),
+            ("k_heads".to_string(), k_heads),
+            ("v_heads".to_string(), v_heads),
+            ("q_norm".to_string(), q_norm),
+            ("k_norm".to_string(), k_norm),
+            ("q_repeat".to_string(), q),
+            ("k_repeat".to_string(), k),
+            ("beta".to_string(), beta),
+            ("g".to_string(), g),
+            ("output_bhlv".to_string(), output_bhlv),
+            ("output".to_string(), output),
+            ("normed".to_string(), normed),
+            ("z_gate".to_string(), z_gate),
+            ("gated".to_string(), gated),
+            ("out_proj".to_string(), out_proj),
+        ]))
     }
 
     /// Causal conv1d for a single timestep (decode).
@@ -309,12 +456,19 @@ impl GatedDeltaNet {
     ) -> Result<Array, Exception> {
         let kernel_size = self.conv_kernel_size;
 
-        // Pad left with zeros: [B, conv_dim, kernel_size-1 + L]
-        let zero_pad = zeros_dtype(&[B, self.conv_dim, kernel_size - 1], qkv_cf.dtype())?;
-        let padded = concatenate_axis(&[&zero_pad, qkv_cf], -1)?;
+        // Use existing conv_state as left context when available (e.g. DFlash verify
+        // pass continues from the prompt-prefill conv state). Fall back to zeros for
+        // a fresh sequence (normal prefill with no prior context).
+        let left_pad = match cache.conv_state.take() {
+            Some(state) => state,
+            None => zeros_dtype(&[B, self.conv_dim, kernel_size - 1], qkv_cf.dtype())?,
+        };
+        let padded = concatenate_axis(&[&left_pad, qkv_cf], -1)?;
 
-        // Save conv state: last kernel_size-1 elements of raw qkv
-        cache.conv_state = Some(qkv_cf.index((.., .., -(kernel_size - 1)..)));
+        // Save conv state: always the last kernel_size-1 elements of the padded
+        // sequence (not raw qkv_cf) so that subsequent calls receive exactly
+        // kernel_size-1 left-context elements even when L < kernel_size-1.
+        cache.conv_state = Some(padded.index((.., .., -(kernel_size - 1)..)));
 
         // Apply depthwise conv using kernel tap loop (kernel_size=4 iterations)
         let w = self
