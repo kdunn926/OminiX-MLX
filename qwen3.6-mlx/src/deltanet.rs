@@ -56,10 +56,34 @@ pub struct GatedDeltaNet {
 }
 
 /// L2 normalize the last dimension of an array.
+#[allow(dead_code)]
 fn l2_normalize(x: &Array, eps: f32) -> Result<Array, Exception> {
     let norm_sq = x.square()?.sum_axis(-1, true)?;
     let norm = norm_sq.add(array!(eps))?.sqrt()?;
     x.divide(&norm)
+}
+
+/// RMS-norm without a learned weight, matching Python's
+/// `mx.fast.rms_norm(x, None, eps)`. Bypasses the safe Rust wrapper
+/// (which requires a weight) by passing a null `mlx_array` directly.
+fn rms_norm_no_weight(x: &Array, eps: f32) -> Result<Array, Exception> {
+    use mlx_rs::Stream;
+    let stream = Stream::default();
+    let mut res = unsafe { mlx_sys::mlx_array_new() };
+    let status = unsafe {
+        mlx_sys::mlx_fast_rms_norm(
+            &mut res,
+            x.as_ptr(),
+            mlx_sys::mlx_array_ { ctx: std::ptr::null_mut() },
+            eps,
+            stream.as_ptr(),
+        )
+    };
+    if status != 0 {
+        unsafe { mlx_sys::mlx_array_free(res) };
+        return Err(Exception::custom("mlx_fast_rms_norm failed"));
+    }
+    Ok(unsafe { Array::from_ptr(res) })
 }
 
 fn exact_small_proj_with_pad_m(
@@ -120,13 +144,15 @@ impl GatedDeltaNet {
         // Reshape z: [B, 1, num_v_heads, value_head_dim]
         let z = z.reshape(&[B, 1, self.num_v_heads, self.value_head_dim])?;
 
-        // 4. L2 normalize Q, K
-        let q = l2_normalize(&q, 1e-6)?;
-        let k = l2_normalize(&k, 1e-6)?;
-
-        // 5. Scale Q
-        let scale = 1.0 / (self.key_head_dim as f32).sqrt();
-        let q = q.multiply(array!(scale))?;
+        // 4-5. Normalize + scale Q/K. Match Python's mlx_lm.models.qwen3_5:
+        //   inv_scale = head_k_dim ** -0.5
+        //   q = (inv_scale ** 2) * rms_norm(q, None, 1e-6)
+        //   k =  inv_scale       * rms_norm(k, None, 1e-6)
+        // (Was: l2_normalize + scale; eps placement differed by N, causing
+        // ~3.9% relmax drift on k_norm at small magnitudes.)
+        let inv_scale = 1.0 / (self.key_head_dim as f32).sqrt();
+        let q = rms_norm_no_weight(&q, 1e-6)?.multiply(array!(inv_scale * inv_scale))?;
+        let k = rms_norm_no_weight(&k, 1e-6)?.multiply(array!(inv_scale))?;
 
         // 6. Expand Q, K from num_k_heads to num_v_heads via repeat_interleave
         let ratio = self.num_v_heads / self.num_k_heads;
@@ -194,13 +220,15 @@ impl GatedDeltaNet {
         let v = v_flat.reshape(&[B, L, self.num_v_heads, self.value_head_dim])?;
         let z = z.reshape(&[B, L, self.num_v_heads, self.value_head_dim])?;
 
-        // 4. L2 normalize Q, K
-        let q = l2_normalize(&q, 1e-6)?;
-        let k = l2_normalize(&k, 1e-6)?;
-
-        // 5. Scale Q
-        let scale = 1.0 / (self.key_head_dim as f32).sqrt();
-        let q = q.multiply(array!(scale))?;
+        // 4-5. Normalize + scale Q/K. Match Python's mlx_lm.models.qwen3_5:
+        //   inv_scale = head_k_dim ** -0.5
+        //   q = (inv_scale ** 2) * rms_norm(q, None, 1e-6)
+        //   k =  inv_scale       * rms_norm(k, None, 1e-6)
+        // (Was: l2_normalize + scale; eps placement differed by N, causing
+        // ~3.9% relmax drift on k_norm at small magnitudes.)
+        let inv_scale = 1.0 / (self.key_head_dim as f32).sqrt();
+        let q = rms_norm_no_weight(&q, 1e-6)?.multiply(array!(inv_scale * inv_scale))?;
+        let k = rms_norm_no_weight(&k, 1e-6)?.multiply(array!(inv_scale))?;
 
         // 6. Expand Q, K from num_k_heads to num_v_heads
         let ratio = self.num_v_heads / self.num_k_heads;
@@ -319,9 +347,10 @@ impl GatedDeltaNet {
         let v_heads = v_flat.reshape(&[batch_size, seq_len, self.num_v_heads, self.value_head_dim])?;
         let z_heads = z.reshape(&[batch_size, seq_len, self.num_v_heads, self.value_head_dim])?;
 
-        let scale = 1.0 / (self.key_head_dim as f32).sqrt();
-        let q_norm = l2_normalize(&q_heads, 1e-6)?.multiply(array!(scale))?;
-        let k_norm = l2_normalize(&k_heads, 1e-6)?;
+        let inv_scale = 1.0 / (self.key_head_dim as f32).sqrt();
+        let q_norm = rms_norm_no_weight(&q_heads, 1e-6)?
+            .multiply(array!(inv_scale * inv_scale))?;
+        let k_norm = rms_norm_no_weight(&k_heads, 1e-6)?.multiply(array!(inv_scale))?;
 
         let ratio = self.num_v_heads / self.num_k_heads;
         let q = self.repeat_interleave_heads(&q_norm, ratio)?;
