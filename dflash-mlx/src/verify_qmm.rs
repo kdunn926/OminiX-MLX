@@ -1085,6 +1085,9 @@ pub fn verify_qmm_m4_ksplit_np(
 /// Unified dispatch: route based on M to the right verify-qmm kernel.
 ///
 /// - M ∈ [1, 4]: `verify_qmm_m4_ksplit_np` (zero-pads to 4 internally)
+/// - M == 16, K >= 8192 (and K%256==0): `verify_qmm_m16_mma2big_pipe`
+///   (matches Python `_auto_variant`, verify_qmm.py lines 21-23, which
+///   prefers the pipe variant when K >= 8192)
 /// - M == 16: `verify_qmm_m16_mma2big`
 /// - otherwise: returns an error (caller should fall back to stock qmm).
 ///
@@ -1101,7 +1104,9 @@ pub fn verify_qmm_dispatch(
     let m = x.shape().first().copied().unwrap_or(0);
     let k = x.shape().get(1).copied().unwrap_or(0);
     let n = w_packed.shape().first().copied().unwrap_or(0);
-    if m == 16 && mma2big_eligible(m, k, n, bits) {
+    if m == 16 && mma2big_pipe_eligible(m, k, n, bits) {
+        verify_qmm_m16_mma2big_pipe(x, w_packed, scales, biases, group_size, bits)
+    } else if m == 16 && mma2big_eligible(m, k, n, bits) {
         verify_qmm_m16_mma2big(x, w_packed, scales, biases, group_size, bits)
     } else if m >= 1 && m <= 4 && m4_ksplit_np_eligible(m, k, n, bits) {
         verify_qmm_m4_ksplit_np(x, w_packed, scales, biases, group_size, bits)
