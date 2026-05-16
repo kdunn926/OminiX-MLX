@@ -22,8 +22,10 @@
 //!   - GraphBank compiled-graph cache
 //!   - DeepSeek / GLM / MiMo / Nemotron support
 
+pub mod graph_bank;
 pub mod session;
 
+pub use graph_bank::{CompiledGraph, GraphBank, GraphBankStats, GraphKey};
 pub use session::{MtplxSession, SessionMetrics, SpeculativeConfig};
 
 /// Errors surfaced by `mtplx-mlx`.
