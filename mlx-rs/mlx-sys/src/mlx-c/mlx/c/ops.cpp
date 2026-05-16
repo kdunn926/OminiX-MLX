@@ -491,6 +491,15 @@ mlx_atleast_3d(mlx_array* res, const mlx_array a, const mlx_stream s) {
   }
   return 0;
 }
+extern "C" int mlx_bartlett(mlx_array* res, int M, const mlx_stream s) {
+  try {
+    mlx_array_set_(*res, mlx::core::bartlett(M, mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_bitwise_and(
     mlx_array* res,
     const mlx_array a,
@@ -544,6 +553,15 @@ extern "C" int mlx_bitwise_xor(
         *res,
         mlx::core::bitwise_xor(
             mlx_array_get_(a), mlx_array_get_(b), mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" int mlx_blackman(mlx_array* res, int M, const mlx_stream s) {
+  try {
+    mlx_array_set_(*res, mlx::core::blackman(M, mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -1062,6 +1080,7 @@ extern "C" int mlx_dequantize(
     mlx_optional_int group_size,
     mlx_optional_int bits,
     const char* mode,
+    const mlx_array global_scale /* may be null */,
     mlx_optional_dtype dtype,
     const mlx_stream s) {
   try {
@@ -1077,6 +1096,8 @@ extern "C" int mlx_dequantize(
             (bits.has_value ? std::make_optional<int>(bits.value)
                             : std::nullopt),
             std::string(mode),
+            (global_scale.ctx ? std::make_optional(mlx_array_get_(global_scale))
+                              : std::nullopt),
             (dtype.has_value ? std::make_optional<mlx::core::Dtype>(
                                    mlx_dtype_to_cpp(dtype.value))
                              : std::nullopt),
@@ -1533,6 +1554,24 @@ extern "C" int mlx_hadamard_transform(
             (scale.has_value ? std::make_optional<float>(scale.value)
                              : std::nullopt),
             mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" int mlx_hamming(mlx_array* res, int M, const mlx_stream s) {
+  try {
+    mlx_array_set_(*res, mlx::core::hamming(M, mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" int mlx_hanning(mlx_array* res, int M, const mlx_stream s) {
+  try {
+    mlx_array_set_(*res, mlx::core::hanning(M, mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -2487,6 +2526,8 @@ extern "C" int mlx_qqmm(
     mlx_optional_int group_size,
     mlx_optional_int bits,
     const char* mode,
+    const mlx_array global_scale_x /* may be null */,
+    const mlx_array global_scale_w /* may be null */,
     const mlx_stream s) {
   try {
     mlx_array_set_(
@@ -2501,6 +2542,12 @@ extern "C" int mlx_qqmm(
             (bits.has_value ? std::make_optional<int>(bits.value)
                             : std::nullopt),
             std::string(mode),
+            (global_scale_x.ctx
+                 ? std::make_optional(mlx_array_get_(global_scale_x))
+                 : std::nullopt),
+            (global_scale_w.ctx
+                 ? std::make_optional(mlx_array_get_(global_scale_w))
+                 : std::nullopt),
             mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());
@@ -2514,6 +2561,7 @@ extern "C" int mlx_quantize(
     mlx_optional_int group_size,
     mlx_optional_int bits,
     const char* mode,
+    const mlx_array global_scale /* may be null */,
     const mlx_stream s) {
   try {
     mlx_vector_array_set_(
@@ -2525,6 +2573,8 @@ extern "C" int mlx_quantize(
             (bits.has_value ? std::make_optional<int>(bits.value)
                             : std::nullopt),
             std::string(mode),
+            (global_scale.ctx ? std::make_optional(mlx_array_get_(global_scale))
+                              : std::nullopt),
             mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());
@@ -3164,6 +3214,114 @@ extern "C" int mlx_slice_update_dynamic(
             mlx_array_get_(update),
             mlx_array_get_(start),
             std::vector<int>(axes, axes + axes_num),
+            mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" int mlx_slice_update_add(
+    mlx_array* res,
+    const mlx_array src,
+    const mlx_array update,
+    const int* start,
+    size_t start_num,
+    const int* stop,
+    size_t stop_num,
+    const int* strides,
+    size_t strides_num,
+    const mlx_stream s) {
+  try {
+    mlx_array_set_(
+        *res,
+        mlx::core::slice_update_add(
+            mlx_array_get_(src),
+            mlx_array_get_(update),
+            mlx::core::Shape(start, start + start_num),
+            mlx::core::Shape(stop, stop + stop_num),
+            mlx::core::Shape(strides, strides + strides_num),
+            mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" int mlx_slice_update_max(
+    mlx_array* res,
+    const mlx_array src,
+    const mlx_array update,
+    const int* start,
+    size_t start_num,
+    const int* stop,
+    size_t stop_num,
+    const int* strides,
+    size_t strides_num,
+    const mlx_stream s) {
+  try {
+    mlx_array_set_(
+        *res,
+        mlx::core::slice_update_max(
+            mlx_array_get_(src),
+            mlx_array_get_(update),
+            mlx::core::Shape(start, start + start_num),
+            mlx::core::Shape(stop, stop + stop_num),
+            mlx::core::Shape(strides, strides + strides_num),
+            mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" int mlx_slice_update_min(
+    mlx_array* res,
+    const mlx_array src,
+    const mlx_array update,
+    const int* start,
+    size_t start_num,
+    const int* stop,
+    size_t stop_num,
+    const int* strides,
+    size_t strides_num,
+    const mlx_stream s) {
+  try {
+    mlx_array_set_(
+        *res,
+        mlx::core::slice_update_min(
+            mlx_array_get_(src),
+            mlx_array_get_(update),
+            mlx::core::Shape(start, start + start_num),
+            mlx::core::Shape(stop, stop + stop_num),
+            mlx::core::Shape(strides, strides + strides_num),
+            mlx_stream_get_(s)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+extern "C" int mlx_slice_update_prod(
+    mlx_array* res,
+    const mlx_array src,
+    const mlx_array update,
+    const int* start,
+    size_t start_num,
+    const int* stop,
+    size_t stop_num,
+    const int* strides,
+    size_t strides_num,
+    const mlx_stream s) {
+  try {
+    mlx_array_set_(
+        *res,
+        mlx::core::slice_update_prod(
+            mlx_array_get_(src),
+            mlx_array_get_(update),
+            mlx::core::Shape(start, start + start_num),
+            mlx::core::Shape(stop, stop + stop_num),
+            mlx::core::Shape(strides, strides + strides_num),
             mlx_stream_get_(s)));
   } catch (std::exception& e) {
     mlx_error(e.what());

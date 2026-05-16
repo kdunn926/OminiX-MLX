@@ -1,37 +1,3 @@
-def mlx_metal_device_info(f, implementation):
-    if implementation:
-        print(
-            """
-extern "C" mlx_metal_device_info_t mlx_metal_device_info(void) {
-  auto info = mlx::core::metal::device_info();
-
-  mlx_metal_device_info_t c_info;
-  std::strncpy(
-      c_info.architecture,
-      std::get<std::string>(info["architecture"]).c_str(),
-      256);
-  c_info.max_buffer_length = std::get<size_t>(info["max_buffer_length"]);
-  c_info.max_recommended_working_set_size =
-      std::get<size_t>(info["max_recommended_working_set_size"]);
-  c_info.memory_size = std::get<size_t>(info["memory_size"]);
-  return c_info;
-}
-        """
-        )
-    else:
-        print(
-            """
-typedef struct mlx_metal_device_info_t_ {
-  char architecture[256];
-  size_t max_buffer_length;
-  size_t max_recommended_working_set_size;
-  size_t memory_size;
-} mlx_metal_device_info_t;
-mlx_metal_device_info_t mlx_metal_device_info(void);
-        """
-        )
-
-
 def __implement_mlx_fast_custom_kernel(backend, backend_specific_code, implementation):
     if implementation:
         code_config = """
@@ -426,3 +392,117 @@ mlx_fast_metal_kernel mlx_fast_metal_kernel_new(
     bool atomic_outputs);
         """
     __implement_mlx_fast_custom_kernel("metal", custom_code, implementation)
+
+
+def mlx_load_gguf(f, implementation):
+    if not implementation:
+        print(
+            """
+int mlx_load_gguf(mlx_io_gguf* gguf, const char* file, const mlx_stream s);
+        """
+        )
+    else:
+        print(
+            """\
+extern "C" int mlx_load_gguf(mlx_io_gguf* gguf, const char* file, const mlx_stream s) {
+  try {
+    auto cpp_gguf = mlx::core::load_gguf(file, mlx_stream_get_(s));
+    mlx_io_gguf_set_(*gguf, std::move(cpp_gguf));
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}"""
+        )
+
+
+def mlx_save_gguf(f, implementation):
+    if not implementation:
+        print(
+            """\
+int mlx_save_gguf(const char* file, mlx_io_gguf gguf);"""
+        )
+    else:
+        print(
+            """\
+extern "C" int mlx_save_gguf(const char* file, mlx_io_gguf gguf) {
+  try {
+    auto cpp_gguf = mlx_io_gguf_get_(gguf);
+        mlx::core::save_gguf(file, cpp_gguf.first, cpp_gguf.second);
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}"""
+        )
+
+
+def mlx_export_to_dot(f, implementation):
+    if not implementation:
+        print(
+            """\
+typedef struct mlx_node_namer_ {
+  void* ctx;
+} mlx_node_namer;
+
+mlx_node_namer mlx_node_namer_new();
+int mlx_node_namer_free(mlx_node_namer namer);
+int mlx_node_namer_set_name(
+    mlx_node_namer namer,
+    const mlx_array arr,
+    const char* name);
+int mlx_node_namer_get_name(
+    const char** name,
+    mlx_node_namer namer,
+    const mlx_array arr);
+"""
+        )
+    else:
+        print(
+            """\
+extern "C" mlx_node_namer mlx_node_namer_new() {
+  try {
+    return mlx_node_namer_new_(mlx::core::NodeNamer());
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+  }
+  return {nullptr};
+}
+extern "C" int mlx_node_namer_free(mlx_node_namer namer) {
+  try {
+    mlx_node_namer_free_(namer);
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
+extern "C" int mlx_node_namer_set_name(
+    mlx_node_namer namer,
+    const mlx_array arr,
+    const char* name) {
+  try {
+    mlx_node_namer_get_(namer).set_name(mlx_array_get_(arr), name);
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}
+extern "C" int mlx_node_namer_get_name(
+    const char** name,
+    mlx_node_namer namer,
+    const mlx_array arr) {
+  try {
+    *name = mlx_node_namer_get_(namer).get_name(mlx_array_get_(arr)).c_str();
+    return 0;
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+}"""
+        )
+        pass
+    return True
