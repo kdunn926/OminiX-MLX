@@ -14,8 +14,9 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use dflash_mlx::{
-    DFlashDraftAdapter, DFlashDraftModel, DFlashSession, DraftCheckpointInfo, MockDraftAdapter,
-    Qwen36TargetAdapter, SessionMetrics, SpeculativeCycleConfig,
+    discover_draft_for_target, DFlashDraftAdapter, DFlashDraftModel, DFlashSession,
+    DraftCheckpointInfo, MockDraftAdapter, Qwen36TargetAdapter, SessionMetrics,
+    SpeculativeCycleConfig,
 };
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
 
@@ -71,7 +72,7 @@ fn main() -> Result<()> {
         ar_stats.prefill_s, ar_stats.decode_tok_s, ar_stats.total_tokens
     );
 
-    match resolve_draft_mode(args.draft.as_deref()) {
+    match resolve_draft_mode(&args.target, args.draft.as_deref()) {
         DraftMode::Missing(note) => {
             println!("{note}");
         }
@@ -248,11 +249,10 @@ enum DraftMode {
     Real(PathBuf),
 }
 
-fn resolve_draft_mode(cli_draft: Option<&Path>) -> DraftMode {
-    let default_path = Path::new("models/Qwen3.6-35B-A3B-DFlash");
+fn resolve_draft_mode(target: &Path, cli_draft: Option<&Path>) -> DraftMode {
     let draft_path = cli_draft
         .map(PathBuf::from)
-        .or_else(|| default_path.exists().then(|| default_path.to_path_buf()));
+        .or_else(|| discover_draft_for_target(target));
 
     match draft_path {
         Some(path) => match DraftCheckpointInfo::load(&path) {
@@ -267,9 +267,10 @@ fn resolve_draft_mode(cli_draft: Option<&Path>) -> DraftMode {
                 path.display()
             )),
         },
-        None => DraftMode::Missing(
-            "No draft model found. Download z-lab/Qwen3.6-35B-A3B-DFlash into models/ and re-run, or pass --draft /path/to/draft.".to_string(),
-        ),
+        None => DraftMode::Missing(format!(
+            "No DFlash draft found alongside target at {}. Expected a sibling '<target>-DFlash' dir, a 'dflash_draft_path' key in the target config, or --draft /path/to/draft.",
+            target.display()
+        )),
     }
 }
 

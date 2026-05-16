@@ -17,6 +17,7 @@ pub use engine::spec_epoch::{
 pub use kernels::{gated_delta_with_tape, tape_replay};
 pub use model::{DFlashDraftLayer, DFlashDraftModel, DFlashDraftModelArgs};
 pub use rollback::RecurrentRollbackCache;
+pub use runtime::loading::discover_draft_for_target;
 
 #[cfg(test)]
 pub(crate) fn mlx_test_guard() -> std::sync::MutexGuard<'static, ()> {
