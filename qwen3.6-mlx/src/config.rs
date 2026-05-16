@@ -119,6 +119,12 @@ pub struct ModelArgs {
     pub mtp_num_hidden_layers: Option<i32>,
     #[serde(default)]
     pub mtp_use_dedicated_embeddings: Option<bool>,
+
+    /// Optional MTP-specific quantization (group_size / bits may differ from
+    /// the main trunk). Present in MTPLX-Optimized-Speed checkpoints as
+    /// `mtplx_mtp_quantization` in config.json.
+    #[serde(default, rename = "mtplx_mtp_quantization")]
+    pub mtplx_mtp_quantization: Option<QuantizationConfig>,
 }
 
 impl ModelArgs {
@@ -142,6 +148,14 @@ impl ModelArgs {
         self.mtp_use_dedicated_embeddings
             .or(self.text_config.mtp_use_dedicated_embeddings)
             .unwrap_or(false)
+    }
+
+    /// MTP-specific quantization config; falls back to the main quantization
+    /// if no override is set.
+    pub fn mtp_quantization(&self) -> Option<&QuantizationConfig> {
+        self.mtplx_mtp_quantization
+            .as_ref()
+            .or_else(|| self.quantization())
     }
 }
 
