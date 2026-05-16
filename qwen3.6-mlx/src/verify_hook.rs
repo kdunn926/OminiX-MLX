@@ -116,12 +116,16 @@ pub fn quantized_linear_forward(
     if q.scales.as_ref().dtype() != x.dtype() || q.biases.as_ref().dtype() != x.dtype() {
         return linear.forward(x);
     }
-    // M=16 kernel only. Padding M<16 up to 16 was tried and is a net
-    // regression in practice: with adaptive block sizing pinning block_len
-    // at 4, 4x wasted FLOPs from the pad can't be recouped by the M=16
-    // kernel's throughput advantage. Small-M cases need a small-M kernel
-    // (port of Python's `m4_ksplit_np`) — tracked as a follow-up.
-    if m != 16 || k % 32 != 0 || n % 32 != 0 || q.bits != 4 {
+    // Two kernels are wired via `verify_qmm_dispatch`:
+    //   - M == 16 → mma2big (needs n % 32 == 0)
+    //   - M ∈ [1, 4] → m4_ksplit_np (needs n % 4 == 0; zero-pads internally)
+    // Both require bits == 4 and K % 32 == 0. Anything else falls back.
+    if q.bits != 4 || k % 32 != 0 {
+        return linear.forward(x);
+    }
+    let eligible_m16 = m == 16 && n % 32 == 0;
+    let eligible_m_small = m >= 1 && m <= 4 && n % 4 == 0;
+    if !(eligible_m16 || eligible_m_small) {
         return linear.forward(x);
     }
 

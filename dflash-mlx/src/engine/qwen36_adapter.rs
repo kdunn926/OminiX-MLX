@@ -21,7 +21,7 @@ use crate::engine::spec_epoch::{DraftBlock, DraftModel, TargetModel};
 /// idempotent after the first call.
 fn install_verify_qmm_hook() {
     let _ = qwen3_6_mlx::verify_hook::QUANTIZED_VERIFY_QMM_HOOK
-        .set(crate::verify_qmm::verify_qmm_m16_mma2big);
+        .set(crate::verify_qmm::verify_qmm_dispatch);
 }
 
 #[derive(Debug, Clone, Deserialize)]
