@@ -1274,7 +1274,12 @@ impl Model {
         };
         let mask_ref = mask_arr.as_ref();
 
-        let is_prefill = t > 1;
+        // Per-layer eval was originally needed during long-prompt prefill on
+        // MoE to bound peak Metal memory. For short multi-token forwards
+        // (DFlash verify blocks of 4-16 tokens) it's catastrophic — 47
+        // synchronous barriers per cycle on a 26B model. Only force eval
+        // when t is large enough to justify the cost (~ a prefill chunk).
+        let is_long_prefill = t > 64;
         let mut captures = Vec::with_capacity(target_layer_ids.len());
 
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
@@ -1291,7 +1296,7 @@ impl Model {
                 captures.push(hidden_states.clone());
             }
 
-            if is_prefill && self.model.has_moe {
+            if is_long_prefill && self.model.has_moe {
                 eval([&hidden_states])?;
             }
         }

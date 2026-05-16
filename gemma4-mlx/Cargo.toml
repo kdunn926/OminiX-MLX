@@ -30,3 +30,10 @@ path = "examples/repro_chat.rs"
 name = "test_e4b_coherence"
 path = "examples/test_e4b_coherence.rs"
 
+[[example]]
+name = "ar_bench"
+path = "examples/ar_bench.rs"
+
+[dev-dependencies]
+anyhow = "1"
+
