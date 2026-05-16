@@ -22,8 +22,13 @@
 //!   - GraphBank compiled-graph cache
 //!   - DeepSeek / GLM / MiMo / Nemotron support
 
+pub mod acceptance;
 pub mod session;
 
+pub use acceptance::{
+    accept_greedy, accept_speculative, default_rng, seed_default_rng, AcceptanceMode,
+    AcceptanceResult,
+};
 pub use session::{MtplxSession, SessionMetrics, SpeculativeConfig};
 
 /// Errors surfaced by `mtplx-mlx`.

@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
-use mtplx_mlx::{MtplxSession, SpeculativeConfig};
+use mtplx_mlx::{AcceptanceMode, MtplxSession, SpeculativeConfig};
 use qwen3_6_mlx::{load_model, load_tokenizer};
 
 const DEFAULT_PROMPT: &str = "The theory of general relativity";
@@ -24,6 +24,9 @@ struct Args {
     prompt: String,
     max_tokens: usize,
     temp: f32,
+    /// `Some(true)` → force speculative; `Some(false)` → force greedy;
+    /// `None` → auto-pick based on temp.
+    speculative: Option<bool>,
 }
 
 fn main() -> Result<()> {
@@ -38,10 +41,26 @@ fn main() -> Result<()> {
     eprintln!("Loading target from {}...", args.target.display());
     let model = load_model(&args.target).map_err(|e| anyhow!("{e}"))?;
 
+    let acceptance = match args.speculative {
+        Some(true) => AcceptanceMode::Speculative,
+        Some(false) => AcceptanceMode::Greedy,
+        None => {
+            if args.temp > 0.0 {
+                AcceptanceMode::Speculative
+            } else {
+                AcceptanceMode::Greedy
+            }
+        }
+    };
+    eprintln!(
+        "[mtplx] acceptance={:?} temp={}",
+        acceptance, args.temp
+    );
     let cfg = SpeculativeConfig {
         block_len: 4,
         max_tokens: args.max_tokens,
         temp: args.temp,
+        acceptance,
     };
     let mut session = MtplxSession::new(model, cfg);
 
@@ -113,6 +132,7 @@ fn parse_args() -> Result<Args> {
     let mut prompt = DEFAULT_PROMPT.to_string();
     let mut max_tokens = 100usize;
     let mut temp = 0.0f32;
+    let mut speculative: Option<bool> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -141,6 +161,8 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("invalid --temp value")?
             }
+            "--speculative" => speculative = Some(true),
+            "--greedy" => speculative = Some(false),
             "--help" | "-h" => {
                 println!(
                     "Usage: cargo run --release -p mtplx-mlx --example bench_mtplx -- --target /path/to/Qwen3.6-35B-A3B-4bit [--prompt \"...\"] [--max-tokens 100] [--temp 0.0]"
@@ -156,5 +178,6 @@ fn parse_args() -> Result<Args> {
         prompt,
         max_tokens,
         temp,
+        speculative,
     })
 }
