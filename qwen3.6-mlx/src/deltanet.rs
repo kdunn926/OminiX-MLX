@@ -503,21 +503,25 @@ impl GatedDeltaNet {
         // kernel_size-1 left-context elements even when L < kernel_size-1.
         cache.conv_state = Some(padded.index((.., .., -(kernel_size - 1)..)));
 
-        // Apply depthwise conv using kernel tap loop (kernel_size=4 iterations)
-        let w = self
-            .conv1d_weight
-            .as_ref()
-            .reshape(&[self.conv_dim, kernel_size])?;
-        let mut result = zeros_dtype(&[B, self.conv_dim, L], qkv_cf.dtype())?;
-        for tap in 0..kernel_size {
-            let window = padded.index((.., .., tap..tap + L));
-            let wk = w.index((.., tap..tap + 1)); // [conv_dim, 1]
-            result = result.add(window.multiply(&wk)?)?;
-        }
-        let result = nn::silu(result)?;
-
-        // [B, conv_dim, L] → [B, L, conv_dim]
-        result.transpose_axes(&[0, 2, 1])
+        // Depthwise conv via fused MLX conv1d, matching Python's
+        // nn.Conv1d(groups=conv_dim). The manual kernel-tap loop produced
+        // ~0.6% relmax drift vs Python because the per-tap multiply/sum
+        // accumulation order differs from the fused kernel's reduction.
+        //
+        // MLX conv1d expects input `[N, H, C_in]` and weight
+        // `[C_out, H, C_in/groups]`. Our padded buffer is `[B, conv_dim, padded_L]`
+        // and the stored weight is `[conv_dim, 1, kernel_size]`; transpose both
+        // to the conv1d-native layout, then no post-conv transpose is needed
+        // since the output already lands in `[B, L, conv_dim]`.
+        let _ = L; // silence unused: L is implied by `padded` shape now
+        let conv_input = padded.transpose_axes(&[0, 2, 1])?; // [B, padded_L, conv_dim]
+        // Stored conv1d weight is already in MLX-native layout
+        // [C_out, kernel_size, C_in/groups] = [conv_dim, kernel_size, 1] —
+        // matches Python's `nn.Conv1d.weight.shape`. No transpose needed.
+        let w = self.conv1d_weight.as_ref();
+        let result =
+            mlx_rs::ops::conv1d(&conv_input, w, None, None, None, self.conv_dim)?;
+        nn::silu(result)
     }
 
     /// Single recurrent step of the delta rule.
