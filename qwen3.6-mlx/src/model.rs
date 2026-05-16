@@ -384,14 +384,14 @@ fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
     }
 }
 
-fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array, Error> {
+pub(crate) fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array, Error> {
     weights
         .get(key)
         .cloned()
         .ok_or_else(|| Error::WeightNotFound(key.to_string()))
 }
 
-fn make_quantized_linear(
+pub(crate) fn make_quantized_linear(
     weights: &HashMap<String, Array>,
     prefix: &str,
     group_size: i32,
@@ -442,7 +442,7 @@ fn make_quantized_embedding(
     Ok(qe)
 }
 
-fn load_rms_norm(
+pub(crate) fn load_rms_norm(
     weights: &HashMap<String, Array>,
     key: &str,
     eps: f32,
@@ -453,7 +453,7 @@ fn load_rms_norm(
     })
 }
 
-fn make_quantized_switch_linear(
+pub(crate) fn make_quantized_switch_linear(
     weights: &HashMap<String, Array>,
     prefix: &str,
     group_size: i32,
@@ -529,136 +529,15 @@ fn build_model_from_weights(
     for i in 0..tc.num_hidden_layers {
         let layer_prefix = format!("{}.layers.{}", prefix, i);
         let layer_type = &tc.layer_types[i as usize];
-
-        let attention = if layer_type == "full_attention" {
-            AttentionLayer::FullAttention(load_gated_attention(
-                weights,
-                &layer_prefix,
-                tc,
-                group_size,
-                bits,
-            )?)
-        } else {
-            AttentionLayer::LinearAttention(load_gated_deltanet(
-                weights,
-                &layer_prefix,
-                tc,
-                group_size,
-                bits,
-            )?)
-        };
-
-        let ffn = if tc.is_moe() {
-            let num_experts = tc
-                .num_experts
-                .ok_or_else(|| Error::Model("MoE config missing num_experts".to_string()))?;
-            let top_k = tc.num_experts_per_tok.ok_or_else(|| {
-                Error::Model("MoE config missing num_experts_per_tok".to_string())
-            })?;
-
-            let gate = MaybeQuantized::Quantized(make_quantized_linear(
-                weights,
-                &format!("{}.mlp.gate", layer_prefix),
-                group_size,
-                8,
-            )?);
-
-            let switch_mlp = SwitchGLU {
-                gate_proj: make_quantized_switch_linear(
-                    weights,
-                    &format!("{}.mlp.switch_mlp.gate_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?,
-                up_proj: make_quantized_switch_linear(
-                    weights,
-                    &format!("{}.mlp.switch_mlp.up_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?,
-                down_proj: make_quantized_switch_linear(
-                    weights,
-                    &format!("{}.mlp.switch_mlp.down_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?,
-            };
-
-            let shared_expert = SharedExpert {
-                gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    weights,
-                    &format!("{}.mlp.shared_expert.gate_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-                up_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    weights,
-                    &format!("{}.mlp.shared_expert.up_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-                down_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    weights,
-                    &format!("{}.mlp.shared_expert.down_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-            };
-
-            let shared_expert_gate = MaybeQuantized::Quantized(make_quantized_linear(
-                weights,
-                &format!("{}.mlp.shared_expert_gate", layer_prefix),
-                group_size,
-                8,
-            )?);
-
-            FfnBlock::Moe(MoeBlock {
-                num_experts,
-                top_k,
-                gate,
-                switch_mlp,
-                shared_expert,
-                shared_expert_gate,
-            })
-        } else {
-            FfnBlock::Dense(DenseMlp {
-                gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    weights,
-                    &format!("{}.mlp.gate_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-                up_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    weights,
-                    &format!("{}.mlp.up_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-                down_proj: MaybeQuantized::Quantized(make_quantized_linear(
-                    weights,
-                    &format!("{}.mlp.down_proj", layer_prefix),
-                    group_size,
-                    bits,
-                )?),
-            })
-        };
-
-        let block = TransformerBlock {
-            attention,
-            ffn,
-            input_layernorm: load_rms_norm(
-                weights,
-                &format!("{}.input_layernorm.weight", layer_prefix),
-                tc.rms_norm_eps,
-            )?,
-            post_attention_layernorm: load_rms_norm(
-                weights,
-                &format!("{}.post_attention_layernorm.weight", layer_prefix),
-                tc.rms_norm_eps,
-            )?,
-        };
-
-        layers.push(block);
+        let force_full_attn = layer_type == "full_attention";
+        layers.push(load_transformer_block(
+            weights,
+            &layer_prefix,
+            tc,
+            group_size,
+            bits,
+            force_full_attn,
+        )?);
     }
 
     let embed_tokens = MaybeQuantized::Quantized(make_quantized_embedding(
@@ -943,7 +822,156 @@ pub fn load_vl_model(model_dir: impl AsRef<Path>) -> Result<VlModel, Error> {
     })
 }
 
-fn load_gated_attention(
+/// Load a transformer block at `layer_prefix`. If `force_full_attention` is
+/// `true`, builds a `FullAttention` block regardless of the layer's slot in
+/// `tc.layer_types` — useful for MTP heads whose single block is always
+/// full-attention.
+pub(crate) fn load_transformer_block(
+    weights: &HashMap<String, Array>,
+    layer_prefix: &str,
+    tc: &TextConfig,
+    group_size: i32,
+    bits: i32,
+    force_full_attention: bool,
+) -> Result<TransformerBlock, Error> {
+    let attention = if force_full_attention {
+        AttentionLayer::FullAttention(load_gated_attention(
+            weights,
+            layer_prefix,
+            tc,
+            group_size,
+            bits,
+        )?)
+    } else {
+        AttentionLayer::LinearAttention(load_gated_deltanet(
+            weights,
+            layer_prefix,
+            tc,
+            group_size,
+            bits,
+        )?)
+    };
+    let ffn = load_ffn_block(weights, layer_prefix, tc, group_size, bits)?;
+    Ok(TransformerBlock {
+        attention,
+        ffn,
+        input_layernorm: load_rms_norm(
+            weights,
+            &format!("{}.input_layernorm.weight", layer_prefix),
+            tc.rms_norm_eps,
+        )?,
+        post_attention_layernorm: load_rms_norm(
+            weights,
+            &format!("{}.post_attention_layernorm.weight", layer_prefix),
+            tc.rms_norm_eps,
+        )?,
+    })
+}
+
+pub(crate) fn load_ffn_block(
+    weights: &HashMap<String, Array>,
+    layer_prefix: &str,
+    tc: &TextConfig,
+    group_size: i32,
+    bits: i32,
+) -> Result<FfnBlock, Error> {
+    if tc.is_moe() {
+        let num_experts = tc
+            .num_experts
+            .ok_or_else(|| Error::Model("MoE config missing num_experts".to_string()))?;
+        let top_k = tc
+            .num_experts_per_tok
+            .ok_or_else(|| Error::Model("MoE config missing num_experts_per_tok".to_string()))?;
+
+        let gate = MaybeQuantized::Quantized(make_quantized_linear(
+            weights,
+            &format!("{}.mlp.gate", layer_prefix),
+            group_size,
+            8,
+        )?);
+
+        let switch_mlp = SwitchGLU {
+            gate_proj: make_quantized_switch_linear(
+                weights,
+                &format!("{}.mlp.switch_mlp.gate_proj", layer_prefix),
+                group_size,
+                bits,
+            )?,
+            up_proj: make_quantized_switch_linear(
+                weights,
+                &format!("{}.mlp.switch_mlp.up_proj", layer_prefix),
+                group_size,
+                bits,
+            )?,
+            down_proj: make_quantized_switch_linear(
+                weights,
+                &format!("{}.mlp.switch_mlp.down_proj", layer_prefix),
+                group_size,
+                bits,
+            )?,
+        };
+
+        let shared_expert = SharedExpert {
+            gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                weights,
+                &format!("{}.mlp.shared_expert.gate_proj", layer_prefix),
+                group_size,
+                bits,
+            )?),
+            up_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                weights,
+                &format!("{}.mlp.shared_expert.up_proj", layer_prefix),
+                group_size,
+                bits,
+            )?),
+            down_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                weights,
+                &format!("{}.mlp.shared_expert.down_proj", layer_prefix),
+                group_size,
+                bits,
+            )?),
+        };
+
+        let shared_expert_gate = MaybeQuantized::Quantized(make_quantized_linear(
+            weights,
+            &format!("{}.mlp.shared_expert_gate", layer_prefix),
+            group_size,
+            8,
+        )?);
+
+        Ok(FfnBlock::Moe(MoeBlock {
+            num_experts,
+            top_k,
+            gate,
+            switch_mlp,
+            shared_expert,
+            shared_expert_gate,
+        }))
+    } else {
+        Ok(FfnBlock::Dense(DenseMlp {
+            gate_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                weights,
+                &format!("{}.mlp.gate_proj", layer_prefix),
+                group_size,
+                bits,
+            )?),
+            up_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                weights,
+                &format!("{}.mlp.up_proj", layer_prefix),
+                group_size,
+                bits,
+            )?),
+            down_proj: MaybeQuantized::Quantized(make_quantized_linear(
+                weights,
+                &format!("{}.mlp.down_proj", layer_prefix),
+                group_size,
+                bits,
+            )?),
+        }))
+    }
+}
+
+pub(crate) fn load_gated_attention(
     weights: &HashMap<String, Array>,
     layer_prefix: &str,
     tc: &TextConfig,
