@@ -443,17 +443,66 @@ target or draft forward computations. Specifically:
 4. **Rollback bookkeeping** — DeltaNet recurrent state + KV cache
    snapshot/restore on rejection.
 
-### Next-step plan — multi-cycle execution trace
+### Resolution — adaptive block sizing was silently neutered
 
-Run Python and Rust DFlash on the same prompt with deterministic
-sampling. Per cycle, dump:
+Comparing Python `CycleCompleteEvent` stream against Rust's
+`trace_dflash_verify` per-cycle output revealed the smoking gun on
+cycle 5:
 
-- `drafted_tokens` (what the draft model proposed)
-- `verify_logits` (target's forward on the drafted block)
-- `accepted_tokens` (acceptance-logic output)
-- `committed_tokens` (the suffix actually appended)
-- `staged_token` (next cycle's seed)
-- per-cycle target/draft cache fingerprints
+- Python's `block_len` dropped from 16 → 4 starting cycle 5 (the
+  adaptive policy kicked in after the 4-cycle window saw poor
+  acceptance).
+- Rust's `block_len` stayed at 16 for the entire run.
 
-Find the first cycle where the streams diverge and trace why.
+Root cause: `dflash-mlx/examples/{bench_dflash, trace_dflash_verify}.rs`
+were constructing `SpeculativeCycleConfig` with
+`min_block_tokens: block_size` (= 16, same as `block_len`). With both
+bounds set to 16, `AdaptiveBlockPolicy::current_block_len()` returns
+`block_len.max(min_block_tokens)` = 16 even in reduced mode — the
+adaptive reduction code path was dead.
+
+The fix is a one-line removal — let `..Default::default()` provide the
+correct `min_block_tokens=4`. Effects on Qwen3.6-35B-A3B-4bit on the
+benchmark prompt:
+
+| metric                | before | after |
+|-----------------------|-------:|------:|
+| acceptance (a/d)      |   0.12 |  0.43 |
+| avg_block_len         |   14.6 |  3.12 |
+| DFlash decode tok/s   |   25.0 |  38.0 |
+| verify tokens per gen |   5.05 |  ~1.4 |
+| accepted / generated  |  0.625 | 0.55  |
+
+Rust's per-cycle trajectory now mirrors Python's: one or two full
+(block_len=16) cycles at the start, then steady-state block_len=4 for
+the rest of generation, ending with a short tail.
+
+### Lesson learned
+
+The entire prior parity investigation was looking in the wrong place.
+Numerical drift across layers, MoE routing, q/k normalization, conv1d
+kernel choice — every per-op fix was a real correctness improvement
+but **none of them moved acceptance** because acceptance was being
+crushed by a config typo that disabled the adaptive policy. A
+multi-cycle behavior comparison (rather than per-op numerical diffs)
+would have found this on day one.
+
+For future similar investigations: **diff the cycle-level behavior
+first**, before chasing per-op BF16 floor.
+
+### Open work post-fix
+
+1. **AR is still faster than DFlash on this specific config**
+   (Qwen3.6-35B-A3B-4bit + matched mlx 0.31.2 runtime — AR is 70 tok/s,
+   DFlash is 38 tok/s). On this MoE-sparse model with already-fast AR
+   decode, DFlash may not be a net throughput win at all. Worth
+   measuring on (a) longer prompts where target prefill amortizes
+   better, (b) dense Qwen3.6-27B where AR is slower.
+2. **OminiX-API integration** of DFlash (Phase 3 from the original
+   plan) — now that the path actually works as designed, it can be
+   wired in as a real backend.
+3. **Acceptance-ratio metric reporting** is currently `accepted /
+   drafted` in Rust vs `accepted / generated` in Python. Worth
+   standardizing in the Rust metrics so cross-language comparisons
+   aren't misleading.
 
