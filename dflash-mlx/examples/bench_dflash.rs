@@ -114,9 +114,14 @@ fn main() -> Result<()> {
             let mask_emb = model.embed_tokens(&[mask_token_id as i32])?;
             let target = Qwen36TargetAdapter::with_dflash(model, args.temp, target_layer_ids);
             let draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
+            // NOTE: min_block_tokens must be strictly less than block_len for
+            // adaptive sizing to engage. Setting them equal (as the prior config
+            // did with block_size=16 for both) neutered the adaptive policy —
+            // current_block_len() returns block_len.max(min_block_tokens) =
+            // block_len in every cycle. Python's reference uses 4 as the
+            // reduced size, matching `SpeculativeCycleConfig::default()`.
             let spec_config = SpeculativeCycleConfig {
                 block_len: block_size,
-                min_block_tokens: block_size,
                 ..Default::default()
             };
             let mut session = DFlashSession::new(target, draft, spec_config);

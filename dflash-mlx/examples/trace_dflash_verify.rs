@@ -149,7 +149,6 @@ fn main() -> Result<()> {
     };
     let spec_config = SpeculativeCycleConfig {
         block_len: block_size,
-        min_block_tokens: block_size,
         ..Default::default()
     };
     let mut session = DFlashSession::new(target, draft, spec_config);
