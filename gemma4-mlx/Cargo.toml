@@ -34,6 +34,18 @@ path = "examples/test_e4b_coherence.rs"
 name = "ar_bench"
 path = "examples/ar_bench.rs"
 
+[[example]]
+name = "assistant_smoke"
+path = "examples/assistant_smoke.rs"
+
+[[example]]
+name = "pair_smoke"
+path = "examples/pair_smoke.rs"
+
+[[example]]
+name = "mtplx_chat"
+path = "examples/mtplx_chat.rs"
+
 [dev-dependencies]
 anyhow = "1"
 

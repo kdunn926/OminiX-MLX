@@ -16,6 +16,7 @@ use mlx_rs::{
         self,
         indexing::{take_along_axis, take_axis, IndexOp, NewAxis},
     },
+    quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype,
 };
@@ -63,6 +64,24 @@ pub struct Gemma4Config {
     pub eoi_token_id: Option<u32>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// Present when the checkpoint ships pre-quantized
+    /// `(.weight U32, .scales BF16, .biases BF16)` triplets. The loader
+    /// uses this to build `MaybeQuantized::Quantized` modules so inference
+    /// can run native `quantized_matmul` instead of dequantizing to BF16.
+    #[serde(default)]
+    pub quantization: Option<QuantizationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuantizationConfig {
+    pub bits: i32,
+    pub group_size: i32,
+    #[serde(default = "default_quant_mode")]
+    pub mode: String,
+}
+
+fn default_quant_mode() -> String {
+    "affine".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,7 +175,7 @@ pub enum GemmaActivation {
 }
 
 impl GemmaActivation {
-    fn from_name(name: &str) -> Result<Self, Error> {
+    pub fn from_name(name: &str) -> Result<Self, Error> {
         match name {
             "gelu_pytorch_tanh" => Ok(Self::GeluPytorchTanh),
             "silu" | "swish" => Ok(Self::Silu),
@@ -166,7 +185,7 @@ impl GemmaActivation {
         }
     }
 
-    fn apply(self, x: &Array) -> Result<Array, Exception> {
+    pub fn apply(self, x: &Array) -> Result<Array, Exception> {
         match self {
             Self::GeluPytorchTanh => nn::gelu_approximate(x),
             Self::Silu => nn::silu(x),
@@ -204,13 +223,13 @@ enum RotaryLayout {
 }
 
 #[derive(Debug, Clone)]
-enum GemmaRope {
+pub enum GemmaRope {
     Standard(nn::Rope),
     Proportional(ProportionalRope),
 }
 
 impl GemmaRope {
-    fn apply(&mut self, x: &Array, offset: i32) -> Result<Array, Exception> {
+    pub fn apply(&mut self, x: &Array, offset: i32) -> Result<Array, Exception> {
         match self {
             Self::Standard(rope) => {
                 rope.forward(nn::RopeInputBuilder::new(x).offset(offset).build()?)
@@ -259,13 +278,13 @@ impl GemmaRope {
 }
 
 #[derive(Debug, Clone)]
-struct ProportionalRope {
+pub struct ProportionalRope {
     inv_freq: Array,
     head_dim: i32,
 }
 
 impl ProportionalRope {
-    fn new(head_dim: i32, theta: f32, partial_rotary_factor: f32) -> Self {
+    pub fn new(head_dim: i32, theta: f32, partial_rotary_factor: f32) -> Self {
         let half_dim = head_dim / 2;
         let rope_angles = ((partial_rotary_factor * head_dim as f32) / 2.0).floor() as i32;
         let rope_angles = rope_angles.clamp(0, half_dim);
@@ -283,7 +302,7 @@ impl ProportionalRope {
         }
     }
 
-    fn apply(&self, x: &Array, offset: i32) -> Result<Array, Exception> {
+    pub fn apply(&self, x: &Array, offset: i32) -> Result<Array, Exception> {
         self.apply_with_layout(x, offset, RotaryLayout::BatchHeadsSeqDim)
     }
 
@@ -380,13 +399,13 @@ pub struct Attention {
     pub is_kv_shared: bool,
 
     #[param]
-    pub q_proj: nn::Linear,
+    pub q_proj: MaybeQuantized<nn::Linear>,
     #[param]
-    pub k_proj: Option<nn::Linear>,
+    pub k_proj: Option<MaybeQuantized<nn::Linear>>,
     #[param]
-    pub v_proj: Option<nn::Linear>,
+    pub v_proj: Option<MaybeQuantized<nn::Linear>>,
     #[param]
-    pub o_proj: nn::Linear,
+    pub o_proj: MaybeQuantized<nn::Linear>,
     #[param]
     pub q_norm: nn::RmsNorm,
     #[param]
@@ -523,11 +542,11 @@ where
 #[derive(Debug, Clone, ModuleParameters)]
 pub struct DenseMlp {
     #[param]
-    pub gate_proj: nn::Linear,
+    pub gate_proj: MaybeQuantized<nn::Linear>,
     #[param]
-    pub up_proj: nn::Linear,
+    pub up_proj: MaybeQuantized<nn::Linear>,
     #[param]
-    pub down_proj: nn::Linear,
+    pub down_proj: MaybeQuantized<nn::Linear>,
 
     pub activation: GemmaActivation,
 }
@@ -562,7 +581,7 @@ pub struct Router {
     pub scalar_root_size: f32,
 
     #[param]
-    pub proj: nn::Linear,
+    pub proj: MaybeQuantized<nn::Linear>,
     #[param]
     pub scale: Param<Array>,
     #[param]
@@ -698,9 +717,9 @@ pub struct DecoderLayer {
 
     // Per-layer embeddings (PLE) — present when hidden_size_per_layer_input > 0
     #[param]
-    pub per_layer_input_gate: Option<nn::Linear>,
+    pub per_layer_input_gate: Option<MaybeQuantized<nn::Linear>>,
     #[param]
-    pub per_layer_projection: Option<nn::Linear>,
+    pub per_layer_projection: Option<MaybeQuantized<nn::Linear>>,
     #[param]
     pub post_per_layer_input_norm: Option<nn::RmsNorm>,
 
@@ -837,7 +856,7 @@ pub struct LanguageModel {
     pub hidden_size_per_layer_input: i32,
 
     #[param]
-    pub embed_tokens: nn::Embedding,
+    pub embed_tokens: MaybeQuantized<nn::Embedding>,
     #[param]
     pub layers: Vec<DecoderLayer>,
     #[param]
@@ -845,9 +864,9 @@ pub struct LanguageModel {
 
     // Per-layer embeddings (PLE)
     #[param]
-    pub embed_tokens_per_layer: Option<nn::Embedding>,
+    pub embed_tokens_per_layer: Option<MaybeQuantized<nn::Embedding>>,
     #[param]
-    pub per_layer_model_projection: Option<nn::Linear>,
+    pub per_layer_model_projection: Option<MaybeQuantized<nn::Linear>>,
     #[param]
     pub per_layer_projection_norm: Option<nn::RmsNorm>,
 
@@ -1118,7 +1137,10 @@ pub struct Model {
     #[param]
     pub model: LanguageModel,
     #[param]
-    pub lm_head: Option<nn::Linear>,
+    pub lm_head: Option<MaybeQuantized<nn::Linear>>,
+    /// Present when weights ship pre-quantized — needed at runtime by helpers
+    /// like `get_lm_head_weight()` that dequantize on demand.
+    pub quantization: Option<QuantizationConfig>,
 }
 
 impl<C> Module<ModelInput<'_, C>> for Model
@@ -1132,7 +1154,7 @@ where
         let out = self.model.forward(input)?;
         let mut logits = match self.lm_head.as_mut() {
             Some(lm_head) => lm_head.forward(&out)?,
-            None => self.model.embed_tokens.as_linear(&out)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &out)?,
         };
         if let Some(softcap) = self.args.final_logit_softcapping {
             let cap = array!(softcap);
@@ -1162,7 +1184,7 @@ impl Model {
         let last = out.index((.., -1, ..));
         let mut logits = match self.lm_head.as_mut() {
             Some(lm_head) => lm_head.forward(&last)?,
-            None => self.model.embed_tokens.as_linear(&last)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &last)?,
         };
         if let Some(softcap) = self.args.final_logit_softcapping {
             let cap = array!(softcap);
@@ -1184,7 +1206,7 @@ impl Model {
         let last = out.index((.., -1, ..));
         let mut logits = match self.lm_head.as_mut() {
             Some(lm_head) => lm_head.forward(&last)?,
-            None => self.model.embed_tokens.as_linear(&last)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &last)?,
         };
         if let Some(softcap) = self.args.final_logit_softcapping {
             let cap = array!(softcap);
@@ -1212,9 +1234,9 @@ impl Model {
     /// hidden output back to vocab logits.
     pub fn get_lm_head_weight(&self) -> Result<Array, Exception> {
         if let Some(lm_head) = self.lm_head.as_ref() {
-            return Ok(lm_head.weight.as_ref().clone());
+            return mq_linear_dequant_weight(lm_head, self.quantization.as_ref());
         }
-        Ok(self.model.embed_tokens.weight.as_ref().clone())
+        mq_embedding_dequant_weight(&self.model.embed_tokens, self.quantization.as_ref())
     }
 
     /// Forward pass that captures hidden states after each requested layer index
@@ -1352,7 +1374,7 @@ impl Model {
         };
         let mut logits = match self.lm_head.as_mut() {
             Some(lm_head) => lm_head.forward(&lm_in)?,
-            None => self.model.embed_tokens.as_linear(&lm_in)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &lm_in)?,
         };
         if let Some(softcap) = self.args.final_logit_softcapping {
             let cap = array!(softcap);
@@ -1462,7 +1484,7 @@ fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
     Ok(all_weights)
 }
 
-fn load_all_weights_unfiltered(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
+pub fn load_all_weights_unfiltered(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
     let weights_index = model_dir.join("model.safetensors.index.json");
     let single_file = model_dir.join("model.safetensors");
 
@@ -1511,6 +1533,130 @@ fn make_linear(weight: Array) -> nn::Linear {
     nn::Linear {
         weight: Param::new(weight),
         bias: Param::new(None::<Array>),
+    }
+}
+
+/// Build a `MaybeQuantized<nn::Linear>` from weights. If the `(prefix.weight,
+/// prefix.scales, prefix.biases)` triplet is present, returns a
+/// `Quantized` variant for native `quantized_matmul`. Otherwise returns the
+/// `Original` BF16 path.
+fn make_mq_linear(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    quant: Option<&QuantizationConfig>,
+) -> Result<MaybeQuantized<nn::Linear>, Error> {
+    let weight = get_weight(weights, &format!("{prefix}.weight"))?;
+    if let Some(q) = quant {
+        if let (Some(scales), Some(biases)) = (
+            get_weight_optional(weights, &format!("{prefix}.scales")),
+            get_weight_optional(weights, &format!("{prefix}.biases")),
+        ) {
+            let inner = make_linear(weight);
+            let mut ql = nn::QuantizedLinear {
+                group_size: q.group_size,
+                bits: q.bits,
+                scales: Param::new(scales),
+                biases: Param::new(biases),
+                inner,
+            };
+            mlx_rs::module::ModuleParameters::freeze_parameters(&mut ql, true);
+            return Ok(MaybeQuantized::Quantized(ql));
+        }
+    }
+    Ok(MaybeQuantized::Original(make_linear(weight)))
+}
+
+fn make_mq_linear_optional(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    quant: Option<&QuantizationConfig>,
+) -> Option<MaybeQuantized<nn::Linear>> {
+    if get_weight_optional(weights, &format!("{prefix}.weight")).is_none() {
+        return None;
+    }
+    make_mq_linear(weights, prefix, quant).ok()
+}
+
+fn make_mq_embedding(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    quant: Option<&QuantizationConfig>,
+) -> Result<MaybeQuantized<nn::Embedding>, Error> {
+    let weight = get_weight(weights, &format!("{prefix}.weight"))?;
+    if let Some(q) = quant {
+        if let (Some(scales), Some(biases)) = (
+            get_weight_optional(weights, &format!("{prefix}.scales")),
+            get_weight_optional(weights, &format!("{prefix}.biases")),
+        ) {
+            let inner = nn::Embedding {
+                weight: Param::new(weight),
+            };
+            let mut qe = nn::QuantizedEmbedding {
+                group_size: q.group_size,
+                bits: q.bits,
+                scales: Param::new(scales),
+                biases: Param::new(biases),
+                inner,
+            };
+            mlx_rs::module::ModuleParameters::freeze_parameters(&mut qe, true);
+            return Ok(MaybeQuantized::Quantized(qe));
+        }
+    }
+    Ok(MaybeQuantized::Original(nn::Embedding {
+        weight: Param::new(weight),
+    }))
+}
+
+/// Apply either an embedding or its quantized counterpart as a linear
+/// projection (tied lm_head fallback).
+fn mq_embedding_as_linear(
+    embed: &mut MaybeQuantized<nn::Embedding>,
+    x: &Array,
+) -> Result<Array, Exception> {
+    match embed {
+        MaybeQuantized::Original(e) => e.as_linear(x),
+        MaybeQuantized::Quantized(qe) => qe.as_linear(x),
+    }
+}
+
+/// Return the LM head weight as a dequantized BF16 tensor `[vocab, hidden]`.
+fn mq_embedding_dequant_weight(
+    embed: &MaybeQuantized<nn::Embedding>,
+    quant: Option<&QuantizationConfig>,
+) -> Result<Array, Exception> {
+    match embed {
+        MaybeQuantized::Original(e) => Ok(e.weight.as_ref().clone()),
+        MaybeQuantized::Quantized(qe) => {
+            let q = quant.expect("quantized embedding requires QuantizationConfig");
+            ops::dequantize(
+                &*qe.inner.weight,
+                &*qe.scales,
+                &*qe.biases,
+                q.group_size,
+                q.bits,
+                None::<&str>,
+            )
+        }
+    }
+}
+
+fn mq_linear_dequant_weight(
+    lin: &MaybeQuantized<nn::Linear>,
+    quant: Option<&QuantizationConfig>,
+) -> Result<Array, Exception> {
+    match lin {
+        MaybeQuantized::Original(l) => Ok(l.weight.as_ref().clone()),
+        MaybeQuantized::Quantized(ql) => {
+            let q = quant.expect("quantized linear requires QuantizationConfig");
+            ops::dequantize(
+                &*ql.inner.weight,
+                &*ql.scales,
+                &*ql.biases,
+                q.group_size,
+                q.bits,
+                None::<&str>,
+            )
+        }
     }
 }
 
@@ -1591,7 +1737,7 @@ fn load_model_inner(model_dir: &Path, config: Gemma4Config, args: Gemma4TextConf
     Ok(model)
 }
 
-fn build_model_from_weights(
+pub fn build_model_from_weights(
     config: &Gemma4Config,
     args: Gemma4TextConfig,
     weights: &HashMap<String, Array>,
@@ -1636,6 +1782,13 @@ fn build_model_from_weights(
             args.global_head_dim = args.head_dim;
         }
     }
+
+    // Native quantized loading: if config.quantization is set, the loader
+    // builds MaybeQuantized::Quantized for every (.weight, .scales, .biases)
+    // triplet so inference uses native quantized_matmul. Otherwise everything
+    // stays as plain nn::Linear via MaybeQuantized::Original — backwards
+    // compatible with the original BF16 path.
+    let quant = config.quantization.clone();
 
     // Compute KV sharing: which layers share KV from earlier layers
     let num_layers = args.num_hidden_layers as usize;
@@ -1709,32 +1862,27 @@ fn build_model_from_weights(
                 None
             },
             is_kv_shared,
-            q_proj: make_linear(get_weight(
-                &weights,
-                &format!("{layer_prefix}.self_attn.q_proj.weight"),
-            )?),
+            q_proj: make_mq_linear(weights, &format!("{layer_prefix}.self_attn.q_proj"), quant.as_ref())?,
             // KV-shared layers don't have k/v projection weights
             k_proj: if is_kv_shared {
                 None
             } else {
-                Some(make_linear(get_weight(
-                    &weights,
-                    &format!("{layer_prefix}.self_attn.k_proj.weight"),
-                )?))
+                Some(make_mq_linear(
+                    weights,
+                    &format!("{layer_prefix}.self_attn.k_proj"),
+                    quant.as_ref(),
+                )?)
             },
             v_proj: if is_kv_shared {
                 None
             } else {
-                get_weight_optional(
-                    &weights,
-                    &format!("{layer_prefix}.self_attn.v_proj.weight"),
+                make_mq_linear_optional(
+                    weights,
+                    &format!("{layer_prefix}.self_attn.v_proj"),
+                    quant.as_ref(),
                 )
-                .map(make_linear)
             },
-            o_proj: make_linear(get_weight(
-                &weights,
-                &format!("{layer_prefix}.self_attn.o_proj.weight"),
-            )?),
+            o_proj: make_mq_linear(weights, &format!("{layer_prefix}.self_attn.o_proj"), quant.as_ref())?,
             q_norm: make_rms_norm(
                 get_weight(&weights, &format!("{layer_prefix}.self_attn.q_norm.weight"))?,
                 args.rms_norm_eps,
@@ -1756,18 +1904,9 @@ fn build_model_from_weights(
         };
 
         let mlp = DenseMlp {
-            gate_proj: make_linear(get_weight(
-                &weights,
-                &format!("{layer_prefix}.mlp.gate_proj.weight"),
-            )?),
-            up_proj: make_linear(get_weight(
-                &weights,
-                &format!("{layer_prefix}.mlp.up_proj.weight"),
-            )?),
-            down_proj: make_linear(get_weight(
-                &weights,
-                &format!("{layer_prefix}.mlp.down_proj.weight"),
-            )?),
+            gate_proj: make_mq_linear(weights, &format!("{layer_prefix}.mlp.gate_proj"), quant.as_ref())?,
+            up_proj: make_mq_linear(weights, &format!("{layer_prefix}.mlp.up_proj"), quant.as_ref())?,
+            down_proj: make_mq_linear(weights, &format!("{layer_prefix}.mlp.down_proj"), quant.as_ref())?,
             activation,
         };
 
@@ -1776,10 +1915,7 @@ fn build_model_from_weights(
                 hidden_size: args.hidden_size,
                 top_k_experts: args.top_k_experts,
                 scalar_root_size: (args.hidden_size as f32).sqrt().recip(),
-                proj: make_linear(get_weight(
-                    &weights,
-                    &format!("{layer_prefix}.router.proj.weight"),
-                )?),
+                proj: make_mq_linear(weights, &format!("{layer_prefix}.router.proj"), quant.as_ref())?,
                 scale: Param::new(get_weight(
                     &weights,
                     &format!("{layer_prefix}.router.scale"),
@@ -1836,18 +1972,20 @@ fn build_model_from_weights(
 
         // PLE per-layer weights
         let per_layer_input_gate = if args.hidden_size_per_layer_input > 0 {
-            Some(make_linear(get_weight(
-                &weights,
-                &format!("{layer_prefix}.per_layer_input_gate.weight"),
-            )?))
+            Some(make_mq_linear(
+                weights,
+                &format!("{layer_prefix}.per_layer_input_gate"),
+                quant.as_ref(),
+            )?)
         } else {
             None
         };
         let per_layer_projection = if args.hidden_size_per_layer_input > 0 {
-            Some(make_linear(get_weight(
-                &weights,
-                &format!("{layer_prefix}.per_layer_projection.weight"),
-            )?))
+            Some(make_mq_linear(
+                weights,
+                &format!("{layer_prefix}.per_layer_projection"),
+                quant.as_ref(),
+            )?)
         } else {
             None
         };
@@ -1911,20 +2049,20 @@ fn build_model_from_weights(
 
     // PLE model-level weights
     let embed_tokens_per_layer = if args.hidden_size_per_layer_input > 0 {
-        Some(nn::Embedding {
-            weight: Param::new(get_weight(
-                &weights,
-                "model.language_model.embed_tokens_per_layer.weight",
-            )?),
-        })
+        Some(make_mq_embedding(
+            weights,
+            "model.language_model.embed_tokens_per_layer",
+            quant.as_ref(),
+        )?)
     } else {
         None
     };
     let per_layer_model_projection = if args.hidden_size_per_layer_input > 0 {
-        Some(make_linear(get_weight(
-            &weights,
-            "model.language_model.per_layer_model_projection.weight",
-        )?))
+        Some(make_mq_linear(
+            weights,
+            "model.language_model.per_layer_model_projection",
+            quant.as_ref(),
+        )?)
     } else {
         None
     };
@@ -1944,12 +2082,11 @@ fn build_model_from_weights(
         vocab_size: args.vocab_size,
         num_hidden_layers: args.num_hidden_layers,
         hidden_size_per_layer_input: args.hidden_size_per_layer_input,
-        embed_tokens: nn::Embedding {
-            weight: Param::new(get_weight(
-                &weights,
-                "model.language_model.embed_tokens.weight",
-            )?),
-        },
+        embed_tokens: make_mq_embedding(
+            weights,
+            "model.language_model.embed_tokens",
+            quant.as_ref(),
+        )?,
         layers,
         norm: make_rms_norm(
             get_weight(&weights, "model.language_model.norm.weight")?,
@@ -1973,15 +2110,11 @@ fn build_model_from_weights(
         },
     };
 
-    let lm_head = get_first_weight(
-        &weights,
-        &[
-            "lm_head.weight",
-            "model.lm_head.weight",
-            "model.language_model.lm_head.weight",
-        ],
-    )
-    .map(make_linear);
+    let lm_head = ["lm_head", "model.lm_head", "model.language_model.lm_head"]
+        .iter()
+        .find(|p| get_weight_optional(weights, &format!("{p}.weight")).is_some())
+        .map(|p| make_mq_linear(weights, p, quant.as_ref()))
+        .transpose()?;
     if lm_head.is_none() && !args.tie_word_embeddings && !config.tie_word_embeddings {
         return Err(Error::Model(
             "Gemma4 lm_head weights are missing and embeddings are not tied".to_string(),
@@ -1992,6 +2125,7 @@ fn build_model_from_weights(
         args,
         model: language_model,
         lm_head,
+        quantization: quant,
     };
     model.eval()?;
     Ok(model)

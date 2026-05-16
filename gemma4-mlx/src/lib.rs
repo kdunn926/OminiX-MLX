@@ -1,8 +1,10 @@
 //! Gemma 4 text-only inference on Apple Silicon with MLX.
 
+pub mod assistant;
 pub mod chat;
 pub mod vision;
 pub mod model;
+pub mod mtplx_target;
 
 pub use mlx_rs_core::{
     cache::{ConcatKeyValueCache, KVCache, KeyValueCache},
