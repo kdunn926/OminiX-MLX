@@ -249,13 +249,20 @@ impl Module<&Array> for MoeBlock {
     type Error = Exception;
 
     fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
-        // 1. Route to top-k experts
+        // 1. Route to top-k experts. Mirror Python's
+        //   inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        // exactly so the within-top-k ordering matches Python's. The previous
+        // form (argpartition of negated gates, take leading k) yields the same
+        // expert SET but in REVERSE order, which made the final BF16
+        // score-weighted sum order-dependent and produced ~1% relmax drift
+        // per MoE layer vs Python.
         let gates = self.gate.forward(x)?;
         let gates = ops::softmax_axis(&gates, -1, true)?;
 
-        let neg_gates = gates.negative()?;
-        let partitioned_inds = ops::argpartition_axis(&neg_gates, self.top_k - 1, -1)?;
-        let top_k_indices = partitioned_inds.index((.., .., ..self.top_k));
+        let n_experts = self.num_experts;
+        let kth = n_experts - self.top_k; // numpy `-k` -> `N-k`
+        let partitioned_inds = ops::argpartition_axis(&gates, kth, -1)?;
+        let top_k_indices = partitioned_inds.index((.., .., kth..n_experts));
 
         let top_k_scores = take_along_axis(&gates, &top_k_indices, -1)?;
 
