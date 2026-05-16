@@ -383,23 +383,34 @@ pub struct WeightMap {
 fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
     let weights_index = model_dir.join("model.safetensors.index.json");
 
+    let mut all_weights: HashMap<String, Array> = HashMap::new();
     if weights_index.exists() {
         let json = std::fs::read_to_string(weights_index)?;
         let weight_map: WeightMap = serde_json::from_str(&json)?;
         let weight_files: HashSet<&String> = weight_map.weight_map.values().collect();
-
-        let mut all_weights: HashMap<String, Array> = HashMap::new();
         for weight_file in weight_files {
             let path = model_dir.join(weight_file);
             let loaded = Array::load_safetensors(&path)?;
             all_weights.extend(loaded);
         }
-        Ok(all_weights)
     } else {
         let path = model_dir.join("model.safetensors");
         let loaded = Array::load_safetensors(&path)?;
-        Ok(loaded)
+        all_weights.extend(loaded);
     }
+
+    // Optional MTP sidecar. MTPLX-Optimized-Speed checkpoints ship MTP
+    // weights in a separate `mtp.safetensors` file referenced from
+    // `mlx_lm_extra_tensors.mtp_file` in config.json. If the file exists at
+    // the conventional path, merge its tensors into the same flat weight map
+    // so the existing `mtp::load_mtp_head` flat-key probes pick them up.
+    let mtp_sidecar = model_dir.join("mtp.safetensors");
+    if mtp_sidecar.exists() {
+        let loaded = Array::load_safetensors(&mtp_sidecar)?;
+        all_weights.extend(loaded);
+    }
+
+    Ok(all_weights)
 }
 
 pub(crate) fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array, Error> {
