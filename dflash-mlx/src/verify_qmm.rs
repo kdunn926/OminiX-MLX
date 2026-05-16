@@ -13,10 +13,11 @@
 //     - The simplest variant; one Metal kernel, no K-splitting or pipelining.
 //     - Python: `_build_kernel_mma2big`, lines ~448-547.
 //
-//   mma2big_pipe (TODO)
+//   mma2big_pipe (PORTED)
 //     - Same shape gates as `mma2big`, but triggered when K >= 8192 or N <= 8192.
-//     - Splits K into `K_PARTS` (default 8) for better SMEM pipelining; reduces
-//       partials on host. Python: `_build_kernel_mma2big_pipe`.
+//     - Splits K into `K_PARTS` (fixed 8 to match Python `_auto_variant`) for
+//       double-buffered SMEM pipelining; partials reduced on host via sum(axis=0).
+//     - Python: `_build_kernel_mma2big_pipe`, lines 652-764 of `verify_qmm.py`.
 //
 //   m16_combo_ktmpl (TODO)
 //     - bits == 4, K % 256 == 0, N % 16 == 0, and (K >= 8192 or N <= 5120).
@@ -378,6 +379,340 @@ pub fn verify_qmm_m16_mma2big(
 
         Ok(Array::from_ptr(y_ptr))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Metal source — mma2big_pipe (4-bit, M=16, BN=32, BK=32, K-split + pipeline)
+//
+// Ported verbatim from Python `_build_kernel_mma2big_pipe`, lines 652-764 of
+// `verify_qmm.py`. Compared to `mma2big`:
+//   - K is split into K_PARTS=8 segments; each (tg_n, tg_k_part) computes a
+//     partial [M=16, N] tile in float32.
+//   - B_tile is double-buffered (`B_tile[2][BK*BN]`) and staged one BK ahead.
+//   - Output is fp32 partials shaped [K_PARTS, M, N]; host reduces via
+//     `partials.sum(axis=0).astype(x.dtype)` to match Python (line 1001).
+// Only substitution is `GS` (group_size); K_PARTS=8 is baked into source.
+// ---------------------------------------------------------------------------
+
+const MMA2BIG_PIPE_K_PARTS: i32 = 8;
+
+fn build_mma2big_pipe_source(group_size: i32) -> String {
+    format!(
+        r#"
+        using namespace metal;
+        constexpr int BM = 16;
+        constexpr int BN = 32;
+        constexpr int BK = 32;
+        constexpr int BK_SUB = 8;
+        constexpr int GS = {gs};
+
+        uint tid       = thread_position_in_threadgroup.x;
+        uint sg_id     = tid / 32;
+        uint tg_n      = threadgroup_position_in_grid.y;
+        uint tg_k_part = threadgroup_position_in_grid.z;
+
+        int K = int(K_size);
+        int N = int(N_size);
+        int KP = int(K_parts);
+        int K_by_8  = K / 8;
+        int K_by_gs = K / GS;
+        int n0 = int(tg_n) * BN;
+        int k_slice = K / KP;
+        int k_begin = k_slice * int(tg_k_part);
+        int k_end   = k_begin + k_slice;
+
+        threadgroup T B_tile[2][BK * BN];
+
+        simdgroup_matrix<T, 8, 8> a_top, a_bot, b_L, b_R;
+        simdgroup_matrix<float, 8, 8> c_tL = simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_matrix<float, 8, 8> c_tR = simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_matrix<float, 8, 8> c_bL = simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_matrix<float, 8, 8> c_bR = simdgroup_matrix<float, 8, 8>(0.0f);
+
+        int t_a = int(tid);
+        int t_b = int(tid) + 64;
+        int dq_k_a = t_a / BN, dq_n_a = t_a % BN;
+        int dq_k_b = t_b / BN, dq_n_b = t_b % BN;
+        int sg_n_off = int(sg_id) * 16;
+
+        #define STAGE_B(slot, k0_stage) {{                                              \
+            {{                                                                          \
+                int n_global = n0 + dq_n_a;                                             \
+                int k_base = (k0_stage) + dq_k_a * 8;                                   \
+                uint32_t packed = w_q[n_global * K_by_8 + (k_base >> 3)];               \
+                float s = float(scales[n_global * K_by_gs + (k_base / GS)]);            \
+                float b = float(biases[n_global * K_by_gs + (k_base / GS)]);            \
+                _Pragma("unroll")                                                       \
+                for (int ki = 0; ki < 8; ++ki) {{                                       \
+                    uint32_t nib = (packed >> (ki * 4)) & 0xFu;                         \
+                    B_tile[slot][(dq_k_a * 8 + ki) * BN + dq_n_a] = T(float(nib) * s + b); \
+                }}                                                                      \
+            }}                                                                          \
+            {{                                                                          \
+                int n_global = n0 + dq_n_b;                                             \
+                int k_base = (k0_stage) + dq_k_b * 8;                                   \
+                uint32_t packed = w_q[n_global * K_by_8 + (k_base >> 3)];               \
+                float s = float(scales[n_global * K_by_gs + (k_base / GS)]);            \
+                float b = float(biases[n_global * K_by_gs + (k_base / GS)]);            \
+                _Pragma("unroll")                                                       \
+                for (int ki = 0; ki < 8; ++ki) {{                                       \
+                    uint32_t nib = (packed >> (ki * 4)) & 0xFu;                         \
+                    B_tile[slot][(dq_k_b * 8 + ki) * BN + dq_n_b] = T(float(nib) * s + b); \
+                }}                                                                      \
+            }}                                                                          \
+        }}
+
+        STAGE_B(0, k_begin);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        int read_slot = 0;
+        for (int k0 = k_begin; k0 < k_end; k0 += BK) {{
+            int write_slot = 1 - read_slot;
+            int k0_next = k0 + BK;
+
+            if (k0_next < k_end) {{
+                STAGE_B(write_slot, k0_next);
+            }}
+
+            for (int ks = 0; ks < BK / BK_SUB; ++ks) {{
+                simdgroup_load(a_top, x + k0 + ks * BK_SUB,                  K);
+                simdgroup_load(a_bot, x + 8 * K + k0 + ks * BK_SUB,          K);
+                simdgroup_load(b_L, B_tile[read_slot] + ks * BK_SUB * BN + sg_n_off,         BN);
+                simdgroup_load(b_R, B_tile[read_slot] + ks * BK_SUB * BN + sg_n_off + 8,     BN);
+                simdgroup_multiply_accumulate(c_tL, a_top, b_L, c_tL);
+                simdgroup_multiply_accumulate(c_tR, a_top, b_R, c_tR);
+                simdgroup_multiply_accumulate(c_bL, a_bot, b_L, c_bL);
+                simdgroup_multiply_accumulate(c_bR, a_bot, b_R, c_bR);
+            }}
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            read_slot = write_slot;
+        }}
+
+        int part_off = int(tg_k_part) * BM * N;
+        simdgroup_store(c_tL, partials + part_off + n0 + sg_n_off,                     N);
+        simdgroup_store(c_tR, partials + part_off + n0 + sg_n_off + 8,                 N);
+        simdgroup_store(c_bL, partials + part_off + 8 * N + n0 + sg_n_off,             N);
+        simdgroup_store(c_bR, partials + part_off + 8 * N + n0 + sg_n_off + 8,         N);
+
+        #undef STAGE_B
+    "#,
+        gs = group_size,
+    )
+}
+
+fn create_mma2big_pipe_kernel(group_size: i32, dtype: Dtype) -> KernelState {
+    let source = build_mma2big_pipe_source(group_size);
+    let name = format!("verify_mma2big_pipe_gs{}_{}", group_size, dtype_tag(dtype));
+
+    unsafe {
+        let input_names = mlx_sys::mlx_vector_string_new();
+        for input in [
+            "x", "w_q", "scales", "biases", "M_size", "K_size", "N_size", "K_parts",
+        ] {
+            let c = CString::new(input).unwrap();
+            mlx_sys::mlx_vector_string_append_value(input_names, c.as_ptr());
+        }
+
+        let output_names = mlx_sys::mlx_vector_string_new();
+        let out_c = CString::new("partials").unwrap();
+        mlx_sys::mlx_vector_string_append_value(output_names, out_c.as_ptr());
+
+        let source_c = CString::new(source).unwrap();
+        let header_c = CString::new("").unwrap();
+        let name_c = CString::new(name).unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name_c.as_ptr(),
+            input_names,
+            output_names,
+            source_c.as_ptr(),
+            header_c.as_ptr(),
+            true,
+            false,
+        );
+
+        KernelState {
+            kernel,
+            input_names,
+            output_names,
+        }
+    }
+}
+
+/// Pipe-variant cache: keyed by (group_size, dtype). K_PARTS is fixed at 8 in
+/// kernel source to match Python `_auto_variant` (verify_qmm.py line 21-23).
+fn mma2big_pipe_kernel_cache() -> &'static Mutex<HashMap<(i32, Dtype), KernelState>> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<HashMap<(i32, Dtype), KernelState>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Eligibility for `mma2big_pipe`. Same as `mma2big` plus K must be divisible
+/// by `32 * K_PARTS` (=256) and K >= 8192. Mirrors the gate at
+/// `verify_qmm.py` line 982-983 combined with the `_auto_variant` heuristic
+/// at lines 21-24.
+pub fn mma2big_pipe_eligible(m: i32, k: i32, n: i32, bits: i32) -> bool {
+    mma2big_eligible(m, k, n, bits)
+        && k >= 8192
+        && k % (32 * MMA2BIG_PIPE_K_PARTS) == 0
+}
+
+/// Run the `mma2big_pipe` verify quantized matmul kernel.
+///
+/// Layout matches `verify_qmm_m16_mma2big`: `x` is `[16, K]`, `w_packed` is
+/// `[N, K/8]` uint32, scales/biases are `[N, K/group_size]`. Output `[16, N]`
+/// in `dtype`.
+///
+/// Internally produces `[K_PARTS=8, 16, N]` fp32 partials and reduces with
+/// `sum(axis=0).astype(dtype)` to match Python (verify_qmm.py line 1001).
+pub fn verify_qmm_m16_mma2big_pipe(
+    x: &Array,
+    w_packed: &Array,
+    scales: &Array,
+    biases: &Array,
+    group_size: i32,
+    bits: i32,
+) -> Result<Array, Exception> {
+    if bits != 4 {
+        return Err(Exception::custom(format!(
+            "verify_qmm_m16_mma2big_pipe: only bits==4 supported, got {bits}"
+        )));
+    }
+    let x_shape = x.shape();
+    let w_shape = w_packed.shape();
+    if x_shape.len() != 2 || w_shape.len() != 2 {
+        return Err(Exception::custom(format!(
+            "verify_qmm_m16_mma2big_pipe expects 2-D x and w_packed, got x={x_shape:?} w={w_shape:?}"
+        )));
+    }
+    let m = x_shape[0];
+    let k = x_shape[1];
+    let n = w_shape[0];
+    let k_by_8 = w_shape[1];
+    if k_by_8 * 8 != k {
+        return Err(Exception::custom(format!(
+            "verify_qmm_m16_mma2big_pipe: w_packed inner dim {k_by_8} != K/8 (K={k})"
+        )));
+    }
+    if !mma2big_pipe_eligible(m, k, n, bits) {
+        return Err(Exception::custom(format!(
+            "verify_qmm_m16_mma2big_pipe: ineligible shape m={m} k={k} n={n} (need m<=16, k%256==0, k>=8192, n%32==0, bits==4)"
+        )));
+    }
+    if m != 16 {
+        return Err(Exception::custom(format!(
+            "verify_qmm_m16_mma2big_pipe: kernel requires x to be padded to M=16 rows, got M={m}"
+        )));
+    }
+    if k % group_size != 0 {
+        return Err(Exception::custom(format!(
+            "verify_qmm_m16_mma2big_pipe: K ({k}) not divisible by group_size ({group_size})"
+        )));
+    }
+
+    let dtype = x.dtype();
+    if dtype != Dtype::Bfloat16 && dtype != Dtype::Float16 {
+        return Err(Exception::custom(format!(
+            "verify_qmm_m16_mma2big_pipe: x dtype must be bf16 or fp16, got {:?}",
+            dtype
+        )));
+    }
+    if scales.dtype() != dtype || biases.dtype() != dtype {
+        return Err(Exception::custom(format!(
+            "verify_qmm_m16_mma2big_pipe: scales/biases dtype must match x ({:?}), got scales={:?} biases={:?}",
+            dtype,
+            scales.dtype(),
+            biases.dtype()
+        )));
+    }
+
+    let k_parts = MMA2BIG_PIPE_K_PARTS;
+    let dtype_u32: u32 = dtype.into();
+    let f32_u32: u32 = Dtype::Float32.into();
+
+    {
+        let mut cache = mma2big_pipe_kernel_cache().lock().unwrap();
+        cache
+            .entry((group_size, dtype))
+            .or_insert_with(|| create_mma2big_pipe_kernel(group_size, dtype));
+    }
+
+    let m_scalar = Array::from_int(m);
+    let k_scalar = Array::from_int(k);
+    let n_scalar = Array::from_int(n);
+    let kp_scalar = Array::from_int(k_parts);
+
+    let partials = unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let t_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            t_name.as_ptr(),
+            dtype_u32,
+        );
+
+        // Grid: (64, N/32, K_PARTS); threadgroup: (64, 1, 1). verify_qmm.py:996-997.
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, 64, n / 32, k_parts);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+
+        // Output: [K_PARTS, 16, N] in fp32 (verify_qmm.py:998-999).
+        let partials_shape = vec![k_parts, 16i32, n];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            partials_shape.as_ptr(),
+            partials_shape.len(),
+            f32_u32,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, x.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, w_packed.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, scales.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, biases.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, m_scalar.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, k_scalar.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, n_scalar.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, kp_scalar.as_ptr());
+
+        let kernel_ptr = {
+            let cache = mma2big_pipe_kernel_cache().lock().unwrap();
+            cache.get(&(group_size, dtype)).unwrap().kernel
+        };
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs,
+            kernel_ptr,
+            inputs,
+            config,
+            stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom(
+                "verify_qmm_m16_mma2big_pipe Metal kernel execution failed",
+            ));
+        }
+
+        let mut p_ptr = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut p_ptr, outputs, 0);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Array::from_ptr(p_ptr)
+    };
+
+    // Host-side reduction: partials.sum(axis=0).astype(dtype). verify_qmm.py:1001.
+    let summed = partials.sum_axis(0, false)?;
+    summed.as_dtype(dtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -973,6 +1308,75 @@ mod tests {
             ok,
             "verify_qmm m4_ksplit_np M=2 vs quantized_matmul: max abs diff {max_abs}, max rel diff {max_rel}"
         );
+    }
+
+    #[test]
+    fn mma2big_pipe_matches_quantized_matmul_bf16_k8192() {
+        let _guard = crate::mlx_test_guard();
+
+        // M=16, K=8192, N=32, group_size=64, bits=4. K_PARTS=8 → k_slice=1024.
+        let m: i32 = 16;
+        let k: i32 = 8192;
+        let n: i32 = 32;
+        let group_size: i32 = 64;
+        let bits: i32 = 4;
+
+        let key_w = mlx_rs::random::key(6).unwrap();
+        let key_x = mlx_rs::random::key(7).unwrap();
+        let w_bf16 = mlx_rs::random::normal::<f32>(&[n, k][..], None, None, &key_w)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let (w_packed, scales, biases) =
+            quantize(&w_bf16, Some(group_size), Some(bits), None).unwrap();
+
+        let x_bf16 = mlx_rs::random::normal::<f32>(&[m, k][..], None, None, &key_x)
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+
+        let y_ref = quantized_matmul(
+            &x_bf16,
+            &w_packed,
+            &scales,
+            &biases,
+            Some(true),
+            Some(group_size),
+            Some(bits),
+            None,
+        )
+        .unwrap();
+
+        let y_kern = verify_qmm_m16_mma2big_pipe(
+            &x_bf16, &w_packed, &scales, &biases, group_size, bits,
+        )
+        .unwrap();
+
+        assert_eq!(y_kern.shape(), &[16, n]);
+        // K=8192 amplifies bf16 accumulation drift between simdgroup MMA
+        // (fp32 accum) and quantized_matmul's reference. Result magnitudes
+        // are O(sqrt(K)) ≈ 90 with N(0,1) inputs, so an absolute diff of ~1
+        // is ~1% — within expected bf16 GEMM noise. Use atol=1.5 + rtol=0.05.
+        let (ok, max_abs, max_rel) = allclose_bf16(&y_kern, &y_ref, 1.5, 0.05);
+        assert!(
+            ok,
+            "verify_qmm mma2big_pipe vs quantized_matmul: max abs diff {max_abs}, max rel diff {max_rel} (atol=1.5, rtol=0.05)"
+        );
+    }
+
+    #[test]
+    fn mma2big_pipe_eligible_gating() {
+        // K=8192, K%256==0 → eligible
+        assert!(mma2big_pipe_eligible(16, 8192, 32, 4));
+        assert!(mma2big_pipe_eligible(16, 16384, 64, 4));
+        // K<8192 → not eligible (caller uses mma2big instead)
+        assert!(!mma2big_pipe_eligible(16, 4096, 32, 4));
+        // K%256 != 0 (e.g. K=8192-32=8160; 8160 % 256 = 224)
+        assert!(!mma2big_pipe_eligible(16, 8160, 32, 4));
+        // bits != 4
+        assert!(!mma2big_pipe_eligible(16, 8192, 32, 8));
+        // n%32 != 0
+        assert!(!mma2big_pipe_eligible(16, 8192, 16, 4));
     }
 
     #[test]
