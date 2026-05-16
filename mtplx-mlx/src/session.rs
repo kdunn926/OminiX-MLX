@@ -20,6 +20,7 @@ use std::time::Instant;
 use mlx_rs::{argmax_axis, Array};
 use qwen3_6_mlx::{HybridCache, Model};
 
+use crate::acceptance::{accept_speculative, default_rng, AcceptanceMode};
 use crate::MtpError;
 
 /// Speculative loop configuration.
@@ -31,8 +32,12 @@ pub struct SpeculativeConfig {
     pub block_len: usize,
     /// Hard ceiling on tokens produced (excludes prompt).
     pub max_tokens: usize,
-    /// Sampling temperature; only T=0 (greedy) is wired up today.
+    /// Sampling temperature. For `AcceptanceMode::Greedy` only T=0 is
+    /// sensible; for `AcceptanceMode::Speculative` any T>0 is valid.
     pub temp: f32,
+    /// Acceptance strategy for verifying drafted tokens. Defaults to
+    /// greedy for backwards compatibility.
+    pub acceptance: AcceptanceMode,
 }
 
 impl Default for SpeculativeConfig {
@@ -41,6 +46,7 @@ impl Default for SpeculativeConfig {
             block_len: 4,
             max_tokens: 200,
             temp: 0.0,
+            acceptance: AcceptanceMode::Greedy,
         }
     }
 }
@@ -212,25 +218,68 @@ impl MtplxSession {
                 .expect("mtp_cycle entered without an active MTP head");
             mtp.forward(&hidden, &prev_emb)?
         };
-        let mtp_logits = self.model.apply_lm_head(&mtp_hidden)?;
+        let mtp_logits_3d = self.model.apply_lm_head(&mtp_hidden)?;
+        // Squeeze [1,1,V] → [1,V] for parity with verify_logits.
+        let mtp_logits = {
+            let s = mtp_logits_3d.shape();
+            if s.len() == 3 {
+                let v = s[s.len() - 1];
+                mtp_logits_3d.reshape(&[1, v])?
+            } else {
+                mtp_logits_3d
+            }
+        };
         let drafted = argmax_id(&mtp_logits)?;
 
         // Step 4: verify the draft by running target on ar_next.
         let verify_in = Array::from_slice(&[ar_next], &[1, 1]);
         let verify_logits = self.model.forward_last_logits(&verify_in, cache)?;
-        let target_after_ar = argmax_id(&verify_logits)?;
 
-        if target_after_ar == drafted {
-            // Accept the draft: we commit `ar_next` as the in-between
-            // token and `drafted` as the next anchor.
-            Ok((vec![ar_next], drafted))
-        } else {
-            // Reject: we still commit `ar_next` (free — its cache is
-            // populated) and use the target's verified continuation
-            // `target_after_ar` as the next anchor. No work wasted; the
-            // draft path just didn't pay off.
-            Ok((vec![ar_next], target_after_ar))
-        }
+        // Route through the configured acceptance strategy. Both modes
+        // commit `ar_next` for free (cache populated, argmax confirmed)
+        // and then decide what to anchor the *next* cycle on.
+        //
+        // K=1 semantics:
+        //   * Accept: commit `drafted` as an extra token, next_anchor =
+        //     target's verified continuation (greedy: argmax; spec: free
+        //     bonus sampled from target distribution).
+        //   * Reject: drop the draft, next_anchor = correction (greedy:
+        //     target's argmax; spec: residual `(p-q)+` sample).
+        let (extra, next_anchor) = match self.cfg.acceptance {
+            AcceptanceMode::Greedy => {
+                let target_after_ar = argmax_id(&verify_logits)?;
+                if target_after_ar == drafted {
+                    // Accept: ar_next is the extra, drafted becomes
+                    // the next anchor (caller pushes both).
+                    (vec![ar_next], drafted)
+                } else {
+                    (vec![ar_next], target_after_ar)
+                }
+            }
+            AcceptanceMode::Speculative => {
+                let temp = self.cfg.temp.max(1e-4);
+                let res = accept_speculative(
+                    &verify_logits,
+                    &mtp_logits,
+                    &[drafted as u32],
+                    temp,
+                    default_rng,
+                )?;
+                if res.all_accepted {
+                    // Accept: ar_next is the extra, drafted is the
+                    // committed draft → anchor for next cycle. The
+                    // Leviathan-Chen bonus is dropped here because
+                    // anchoring on it would skip a verification step
+                    // (the bonus has no KV-cache entry yet).
+                    let _bonus = res.correction;
+                    (vec![ar_next], drafted)
+                } else {
+                    (vec![ar_next], res.correction as i32)
+                }
+            }
+        };
+
+        Ok((extra, next_anchor))
     }
 }
 
