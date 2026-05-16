@@ -234,6 +234,11 @@ impl TargetModel for Qwen36TargetAdapter {
         self.verify_step = self.step;
         self.verify_hidden_snapshot = self.target_hidden_accumulated.clone();
 
+        // Scope-mark this forward as a verify pass so the verify_qmm Metal
+        // kernel hook in qwen3.6-mlx can dispatch (and only then). Cleared
+        // on Drop — AR/draft forwards remain untouched.
+        let _verify_guard = qwen3_6_mlx::verify_hook::VerifyScope::enter();
+
         let logits = if !self.target_layer_ids.is_empty() {
             let (logits, captures) = self.forward_with_hidden_capture(drafted_tokens)?;
             self.append_target_hidden(captures)?;
