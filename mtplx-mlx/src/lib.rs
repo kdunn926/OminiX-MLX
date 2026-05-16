@@ -23,12 +23,14 @@
 //!   - DeepSeek / GLM / MiMo / Nemotron support
 
 pub mod acceptance;
+pub mod graph_bank;
 pub mod session;
 
 pub use acceptance::{
     accept_greedy, accept_speculative, default_rng, seed_default_rng, AcceptanceMode,
     AcceptanceResult,
 };
+pub use graph_bank::{CompiledGraph, GraphBank, GraphBankStats, GraphKey};
 pub use session::{MtplxSession, SessionMetrics, SpeculativeConfig};
 
 /// Errors surfaced by `mtplx-mlx`.

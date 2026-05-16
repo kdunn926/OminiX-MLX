@@ -55,10 +55,12 @@ use crate::{
 };
 
 pub mod compile;
+pub mod compile_dyn;
 mod grad;
 mod keyed_value_and_grad;
 mod value_and_grad;
 
+pub use compile_dyn::CompiledFn;
 pub use grad::*;
 pub use keyed_value_and_grad::*;
 pub use value_and_grad::*;

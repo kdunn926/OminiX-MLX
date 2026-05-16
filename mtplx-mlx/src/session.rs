@@ -21,6 +21,7 @@ use mlx_rs::{argmax_axis, Array};
 use qwen3_6_mlx::{HybridCache, Model};
 
 use crate::acceptance::{accept_speculative, default_rng, AcceptanceMode};
+use crate::graph_bank::{GraphBank, GraphKey};
 use crate::MtpError;
 
 /// Speculative loop configuration.
@@ -78,6 +79,11 @@ pub struct MtplxSession {
     /// `true` when the loaded MTP head has real weights (not a stub).
     /// We cache it because checking again requires a `&mut Model`.
     mtp_active: bool,
+    /// Shape-keyed cache of compiled callables. Currently used in
+    /// observation-only mode: we record hit/miss stats per verify
+    /// without yet routing the forward through a `CompiledFn`. Real
+    /// dispatch is a TODO — see `mtp_cycle`.
+    graph_bank: GraphBank,
 }
 
 impl MtplxSession {
@@ -91,11 +97,17 @@ impl MtplxSession {
             model,
             cfg,
             mtp_active,
+            graph_bank: GraphBank::new(),
         }
     }
 
     pub fn has_mtp_head(&self) -> bool {
         self.mtp_active
+    }
+
+    /// Snapshot of compiled-graph cache statistics.
+    pub fn graph_bank_stats(&self) -> crate::graph_bank::GraphBankStats {
+        self.graph_bank.stats()
     }
 
     /// Generate up to `cfg.max_tokens` tokens for the given prompt token
@@ -233,6 +245,19 @@ impl MtplxSession {
 
         // Step 4: verify the draft by running target on ar_next.
         let verify_in = Array::from_slice(&[ar_next], &[1, 1]);
+        // Record a hit/miss against the graph cache keyed on the verify
+        // input's shape. This is observation-only today: real dispatch
+        // through `GraphBank::invoke` requires capturing `&mut self.model`
+        // and `&mut cache` in a `'static + Send` closure, which doesn't
+        // type-check cleanly without rearchitecting the forward path
+        // (likely behind an `Arc<Mutex<...>>` or by exposing a pure
+        // `&[Array] -> Vec<Array>` entry point from `qwen3_6_mlx::Model`).
+        // TODO(graph-bank): wire the actual compiled forward here.
+        let verify_key = GraphKey::new(
+            "verify_forward",
+            GraphKey::shape_sig_for(&[&verify_in]),
+        );
+        self.graph_bank.observe(&verify_key);
         let verify_logits = self.model.forward_last_logits(&verify_in, cache)?;
 
         // Route through the configured acceptance strategy. Both modes
