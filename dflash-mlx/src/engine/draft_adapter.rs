@@ -1,5 +1,6 @@
 use mlx_rs::{error::Exception, ops::{broadcast_to, concatenate_axis, indexing::IndexOp}, Array, Dtype};
 
+use crate::cache::ProjectedContextCache;
 use crate::engine::spec_epoch::{DraftBlock, DraftModel};
 use crate::model::DFlashDraftModel;
 
@@ -9,16 +10,23 @@ pub struct DFlashDraftAdapter {
     staged_embedding: Option<Array>,
     mask_token_embedding: Array,
     lm_head_weight: Array,
+    /// Per-layer ProjectedContextCache. Holds post-fc/hidden_norm/k_proj/k_norm/RoPE
+    /// k_ctx and v_ctx for all already-committed target positions, so each
+    /// draft cycle only has to project & RoPE the new committed delta
+    /// (typically 4 tokens), not the entire accumulated context.
+    caches: Vec<ProjectedContextCache>,
 }
 
 impl DFlashDraftAdapter {
     pub fn new(model: DFlashDraftModel, mask_token_embedding: Array, lm_head_weight: Array) -> Self {
+        let num_layers = model.layers.len();
         Self {
             model,
             target_hidden: None,
             staged_embedding: None,
             mask_token_embedding,
             lm_head_weight,
+            caches: (0..num_layers).map(|_| ProjectedContextCache::new()).collect(),
         }
     }
 
@@ -33,6 +41,9 @@ impl DFlashDraftAdapter {
 
 impl DraftModel for DFlashDraftAdapter {
     fn prefill(&mut self, _prompt: &Array) -> Result<Array, Exception> {
+        for cache in &mut self.caches {
+            cache.reset();
+        }
         let vocab = self.lm_head_weight.shape()[0];
         Array::zeros::<f32>(&[1, vocab])
     }
@@ -42,8 +53,33 @@ impl DraftModel for DFlashDraftAdapter {
             Exception::custom("DFlashDraftAdapter: target_hidden not set before draft_block")
         })?;
 
-        // ctx_offset = RoPE position of the first draft/noise token.
-        let ctx_offset = target_hidden.shape()[1] as usize;
+        let total_ctx_len = target_hidden.shape()[1] as usize;
+        let cached_len = self
+            .caches
+            .first()
+            .map(|c| c.offset())
+            .unwrap_or(0);
+        // Caches grow monotonically with each committed cycle. Target rollback
+        // can shrink target_hidden — when that happens, restart cache from
+        // scratch on this cycle so we never advertise more cached positions
+        // than the target actually committed.
+        if cached_len > total_ctx_len {
+            for cache in &mut self.caches {
+                cache.reset();
+            }
+        }
+        let cached_len = self.caches.first().map(|c| c.offset()).unwrap_or(0);
+        let raw_delta = if total_ctx_len > cached_len {
+            target_hidden.index((
+                ..,
+                cached_len as i32..total_ctx_len as i32,
+                ..,
+            ))
+        } else {
+            // No new committed positions to cache — pass an empty delta.
+            target_hidden.index((.., 0..0, ..))
+        };
+
         let hidden_size = self.mask_token_embedding.shape()[2];
 
         // DFlash alignment: noise = [staged_emb, mask × (block_len-1)] = block_len tokens total.
@@ -62,7 +98,9 @@ impl DraftModel for DFlashDraftAdapter {
         )?;
         let noise_emb = concatenate_axis(&[&staged_emb, &mask_tail], 1)?;
 
-        let draft_hidden = self.model.forward(&noise_emb, target_hidden, ctx_offset)?;
+        let draft_hidden =
+            self.model
+                .forward_with_caches(&noise_emb, &raw_delta, &mut self.caches)?;
 
         let lm_head_t = self.lm_head_weight.t();
 

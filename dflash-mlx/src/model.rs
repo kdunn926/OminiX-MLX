@@ -11,6 +11,7 @@ use mlx_rs::{
 use mlx_rs_core::fused_swiglu;
 use serde::Deserialize;
 
+use crate::cache::ProjectedContextCache;
 use crate::engine::gqa_sdpa::grouped_gqa_sdpa;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -389,6 +390,83 @@ impl DFlashDraftAttention {
             .reshape(&[b, q_len, self.n_heads * self.head_dim])?;
         self.o_proj.forward(&attn)
     }
+
+    /// Cached variant of `forward` for cross-attention to a long target
+    /// context. The `target_delta` argument is the **new committed
+    /// positions only** (post fc+hidden_norm projection); their k/v is
+    /// computed once, RoPE'd at the right offset, and appended to `cache`.
+    /// Attention uses `concat(cache.keys, noise_keys)` so prior committed
+    /// positions are reused without re-projection.
+    pub fn forward_with_cache(
+        &mut self,
+        noise: &Array,
+        target_delta: &Array,
+        cache: &mut ProjectedContextCache,
+    ) -> Result<Array, Exception> {
+        let b = noise.shape()[0];
+        let q_len = noise.shape()[1];
+        let delta_len = target_delta.shape()[1];
+
+        // Q from noise.
+        let queries = self
+            .q_proj
+            .forward(noise)?
+            .reshape(&[b, q_len, self.n_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let queries = self.q_norm.forward(&queries)?;
+
+        // Append the delta to the cache (if non-empty). RoPE offset for the
+        // delta is the cache's current offset (= number of positions cached
+        // before this append).
+        if delta_len > 0 {
+            let cache_offset = cache.offset() as i32;
+            let new_keys = self
+                .k_proj
+                .forward(target_delta)?
+                .reshape(&[b, delta_len, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let new_keys = self.k_norm.forward(&new_keys)?;
+            let new_keys = self.rope.forward(&new_keys, cache_offset)?;
+            let new_values = self
+                .v_proj
+                .forward(target_delta)?
+                .reshape(&[b, delta_len, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            cache.append(new_keys, new_values, delta_len as usize)?;
+        }
+
+        let ctx_offset = cache.offset() as i32;
+
+        // Noise K/V.
+        let noise_keys = self
+            .k_proj
+            .forward(noise)?
+            .reshape(&[b, q_len, self.n_kv_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let noise_keys = self.k_norm.forward(&noise_keys)?;
+        let noise_values = self
+            .v_proj
+            .forward(noise)?
+            .reshape(&[b, q_len, self.n_kv_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        let q_t = self.rope.forward(&queries, ctx_offset)?;
+        let noise_keys_t = self.rope.forward(&noise_keys, ctx_offset)?;
+
+        let (keys, values) = match (cache.keys(), cache.values()) {
+            (Some(ck), Some(cv)) => (
+                concatenate_axis(&[ck, &noise_keys_t], 2)?,
+                concatenate_axis(&[cv, &noise_values], 2)?,
+            ),
+            _ => (noise_keys_t, noise_values),
+        };
+
+        let attn = grouped_gqa_sdpa(&q_t, &keys, &values, self.scale, None)?;
+        let attn = attn
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, q_len, self.n_heads * self.head_dim])?;
+        self.o_proj.forward(&attn)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +487,22 @@ impl DFlashDraftLayer {
         let residual = hidden_states.clone();
         let h = self.input_layernorm.forward(hidden_states)?;
         let h = self.self_attn.forward(&h, target_hidden, ctx_offset)?;
+        let h = h.add(residual)?;
+        let residual2 = h.clone();
+        let h = self.post_attention_layernorm.forward(&h)?;
+        let h = self.mlp.forward(&h)?;
+        h.add(residual2)
+    }
+
+    pub fn forward_with_cache(
+        &mut self,
+        hidden_states: &Array,
+        target_delta: &Array,
+        cache: &mut ProjectedContextCache,
+    ) -> Result<Array, Exception> {
+        let residual = hidden_states.clone();
+        let h = self.input_layernorm.forward(hidden_states)?;
+        let h = self.self_attn.forward_with_cache(&h, target_delta, cache)?;
         let h = h.add(residual)?;
         let residual2 = h.clone();
         let h = self.post_attention_layernorm.forward(&h)?;
@@ -456,6 +550,36 @@ impl DFlashDraftModel {
     ) -> Result<Array, Exception> {
         let target_h = self.project_target_hidden(target_hidden)?;
         self.forward_projected_context(noise_emb, &target_h, ctx_offset)
+    }
+
+    /// Cached forward: `raw_target_delta` is the **new** raw target hidden
+    /// (positions not yet cached). It is projected through `fc + hidden_norm`
+    /// here and then each attention layer extends its own `ProjectedContextCache`.
+    /// `caches.len()` must equal `self.layers.len()`.
+    pub fn forward_with_caches(
+        &mut self,
+        noise_emb: &Array,
+        raw_target_delta: &Array,
+        caches: &mut [ProjectedContextCache],
+    ) -> Result<Array, Exception> {
+        if caches.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "forward_with_caches: expected {} caches, got {}",
+                self.layers.len(),
+                caches.len()
+            )));
+        }
+        let delta_len = raw_target_delta.shape()[1];
+        let projected_delta = if delta_len > 0 {
+            self.project_target_hidden(raw_target_delta)?
+        } else {
+            raw_target_delta.as_dtype(Dtype::Bfloat16)?
+        };
+        let mut h = noise_emb.clone();
+        for (layer, cache) in self.layers.iter_mut().zip(caches.iter_mut()) {
+            h = layer.forward_with_cache(&h, &projected_delta, cache)?;
+        }
+        self.norm.forward(&h)
     }
 
     pub fn debug_first_layer(
