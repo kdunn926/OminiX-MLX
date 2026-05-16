@@ -15,8 +15,8 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use dflash_mlx::{
     discover_draft_for_target, DFlashDraftAdapter, DFlashDraftModel, DFlashSession,
-    DraftCheckpointInfo, MockDraftAdapter, Qwen36TargetAdapter, SessionMetrics,
-    SpeculativeCycleConfig,
+    DraftCheckpointInfo, Gemma4TargetAdapter, MockDraftAdapter, Qwen36TargetAdapter,
+    SessionMetrics, SpeculativeCycleConfig,
 };
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
 
@@ -56,6 +56,16 @@ fn main() -> Result<()> {
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     let prompt = mlx_rs::Array::from_slice(&prompt_ids, &[1, prompt_ids.len() as i32]);
     let eos_tokens = load_eos_tokens(&args.target)?;
+    let target_kind = detect_target_kind(&args.target)?;
+    eprintln!("Detected target model_type: {target_kind:?}");
+
+    if matches!(target_kind, TargetKind::Gemma4) {
+        return run_gemma4(
+            &args,
+            prompt_ids,
+            eos_tokens,
+        );
+    }
 
     eprintln!("Loading target model from {}...", args.target.display());
     let load_start = Instant::now();
@@ -277,6 +287,141 @@ fn resolve_draft_mode(target: &Path, cli_draft: Option<&Path>) -> DraftMode {
             target.display()
         )),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    Qwen36,
+    Gemma4,
+}
+
+fn detect_target_kind(model_dir: &Path) -> Result<TargetKind> {
+    let config_path = model_dir.join("config.json");
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?,
+    )?;
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if model_type == "gemma4" || model_type.starts_with("gemma4") {
+        Ok(TargetKind::Gemma4)
+    } else {
+        Ok(TargetKind::Qwen36)
+    }
+}
+
+/// Gemma4 (26B-A4B) bench routing path.
+///
+/// The DFlash draft for Gemma4 is `z-lab/gemma-4-26B-A4B-it-DFlash`, which is
+/// a gated repo and typically not present locally. This function therefore
+/// only requires Real/Mock/Missing routing to compile; runtime behavior for
+/// the Real branch is unverified until a draft is available.
+fn run_gemma4(
+    args: &Args,
+    prompt_ids: Vec<u32>,
+    eos_tokens: HashSet<u32>,
+) -> Result<()> {
+    eprintln!(
+        "Loading Gemma4 target model from {}...",
+        args.target.display()
+    );
+    let load_start = Instant::now();
+    let mut model = gemma4_mlx::load_model(&args.target)?;
+    eprintln!(
+        "Gemma4 target loaded in {:.1}s",
+        load_start.elapsed().as_secs_f64()
+    );
+
+    // Autoregressive baseline is not implemented for Gemma4 here — gemma4-mlx
+    // does not yet expose a standalone `Generate` iterator analogous to
+    // qwen3_6_mlx's. Skip AR baseline; users can compare against the existing
+    // chat_gemma4 example for AR throughput. The DFlash speedup ratio is
+    // therefore omitted.
+    let _ = (&mut model, &prompt_ids, &eos_tokens);
+
+    match resolve_draft_mode(&args.target, args.draft.as_deref()) {
+        DraftMode::Missing(note) => {
+            println!("{note}");
+            println!(
+                "Gemma4 DFlash draft is gated (z-lab/gemma-4-26B-A4B-it-DFlash); supply --draft \
+                 to a local copy to exercise the Real path."
+            );
+        }
+        DraftMode::Mock(note) => {
+            println!("{note}");
+            let vocab_size = model.args.vocab_size as u32;
+            // No target_layer_ids — mock draft does not consume hidden states.
+            let target = Gemma4TargetAdapter::with_dflash(model, args.temp, Vec::new());
+            let draft = MockDraftAdapter::new(vocab_size);
+            let mut session = DFlashSession::new(target, draft, SpeculativeCycleConfig::default());
+            let (dflash_stats, metrics) = run_dflash_session(
+                &mut session,
+                prompt_ids,
+                args.max_tokens,
+                args.temp,
+                &eos_tokens,
+            )?;
+            println!(
+                "DFlash(gemma4): prefill_s={:.3} decode_tok_s={:.2} acceptance_ratio={:.3} avg_block_len={:.2} total_tokens={}",
+                dflash_stats.prefill_s,
+                dflash_stats.decode_tok_s,
+                metrics.acceptance_ratio,
+                metrics.avg_block_len,
+                dflash_stats.total_tokens
+            );
+        }
+        DraftMode::Real(draft_path) => {
+            println!(
+                "Loading DFlash draft model from {} (gemma4 target)...",
+                draft_path.display()
+            );
+            let draft_model = DFlashDraftModel::load_from_path(&draft_path)?;
+            let block_size = draft_model.args.block_size();
+            let target_layer_ids = draft_model.args.target_layer_ids();
+            let mask_token_id = draft_model.args.mask_token_id();
+            // Gemma4 LM head: prefer the explicit `lm_head` weight when
+            // present, otherwise tie to `embed_tokens` (matches the Python
+            // reference's tied-embedding path).
+            //
+            // TODO: gemma4-mlx does not yet expose a `get_lm_head_weight`
+            // accessor analogous to Qwen36's. For the bench-routing
+            // milestone we approximate via the embedding-tied weight, which
+            // is what the Real DFlash draft would need anyway for the
+            // mask-token embedding lookup.
+            let mask_emb = model
+                .embed_tokens(&[mask_token_id as i32])
+                .map_err(|e| anyhow!(e.to_string()))?;
+            // Use the embed table as the LM head weight (tied-embedding
+            // assumption). This is consistent with gemma4 fallback path
+            // `embed_tokens.as_linear` at model.rs:1285.
+            let lm_head_weight = mask_emb.clone(); // placeholder; see TODO above
+            let target = Gemma4TargetAdapter::with_dflash(model, args.temp, target_layer_ids);
+            let draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
+            let spec_config = SpeculativeCycleConfig {
+                block_len: block_size,
+                ..Default::default()
+            };
+            let mut session = DFlashSession::new(target, draft, spec_config);
+            let (dflash_stats, metrics) = run_dflash_session(
+                &mut session,
+                prompt_ids,
+                args.max_tokens,
+                args.temp,
+                &eos_tokens,
+            )?;
+            println!(
+                "DFlash(gemma4): prefill_s={:.3} decode_tok_s={:.2} acceptance_ratio={:.3} avg_block_len={:.2} total_tokens={}",
+                dflash_stats.prefill_s,
+                dflash_stats.decode_tok_s,
+                metrics.acceptance_ratio,
+                metrics.avg_block_len,
+                dflash_stats.total_tokens
+            );
+        }
+    }
+    Ok(())
 }
 
 fn load_eos_tokens(model_dir: &Path) -> Result<HashSet<u32>> {
