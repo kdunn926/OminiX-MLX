@@ -23,7 +23,7 @@
 
 use mlx_rs::{error::Exception, ops::concatenate_axis, Array};
 
-use gemma4_mlx::{restore_cache, snapshot_cache, KVCache, Model};
+use gemma4_mlx::{KVCache, Model};
 use mlx_rs::{argmax_axis, ops::indexing::IndexOp};
 
 use crate::engine::spec_epoch::TargetModel;
@@ -119,13 +119,23 @@ impl TargetModel for Gemma4TargetAdapter {
         )?;
         self.append_target_hidden(captures)?;
         self.step = seq_len as usize;
-        Ok(logits)
+        // forward_with_hidden_capture returns per-position logits [B, T, V] so
+        // the verify path can index per drafted position. Prefill consumers
+        // (DFlashSession::run_generate's initial sample) want just the last
+        // position's logits for staged-token selection.
+        Ok(logits.index((.., -1, ..)))
     }
 
     fn verify(&mut self, drafted_tokens: &Array) -> Result<Array, Exception> {
-        // Snapshot cache + hidden accumulator + step before mutating, so
-        // `rollback_kv` can restore to pre-verify state.
-        self.verify_snapshot = Some(snapshot_cache(&self.cache));
+        // Trim-based rollback: instead of cloning the entire Vec<KVCache>
+        // before each verify (expensive on a 26B MoE model), we just record
+        // the verify span and snapshot the hidden accumulator. On rollback,
+        // `KVCache::trim(n_drop)` rewinds the offset in O(1) per layer; no
+        // re-replay of accepted tokens is needed because trim only drops
+        // positions past `n_keep` — those past-n_keep KV entries become
+        // overwritable garbage that the next verify cycle's
+        // `update_and_fetch` will reuse in place.
+        self.verify_snapshot = None; // trim path doesn't need a Vec snapshot
         self.verify_inputs = Some(drafted_tokens.clone());
         self.verify_step = self.step;
         self.verify_hidden_snapshot = self.target_hidden_accumulated.clone();
@@ -159,27 +169,44 @@ impl TargetModel for Gemma4TargetAdapter {
             )));
         }
 
-        // Restore cache, step, hidden accumulator to pre-verify state.
-        let snapshot = self.verify_snapshot.take().ok_or_else(|| {
-            Exception::custom("gemma4 target rollback requested without a verify snapshot")
-        })?;
-        restore_cache(&mut self.cache, snapshot);
-        self.step = self.verify_step;
-        self.target_hidden_accumulated = self.verify_hidden_snapshot.clone();
-
-        if n_keep > 0 {
-            let kept = verify_inputs.index((.., ..n_keep as i32));
-            let (_, captures) = self.model.forward_with_hidden_capture(
-                &kept,
-                &mut self.cache,
-                &self.target_layer_ids,
-            )?;
-            self.append_target_hidden(captures)?;
-            self.step += n_keep;
+        // Trim-based rollback: rewind each layer's KV cache by the number of
+        // verify positions NOT kept (`verify_len - n_keep`). Restore the
+        // hidden accumulator + step counter to pre-verify + n_keep state.
+        // No re-forward needed — the kept KV entries are already correct
+        // (they're the first n_keep positions of the just-completed verify
+        // forward); the rejected ones become overwritable garbage that the
+        // next verify cycle's `update_and_fetch` overwrites in place.
+        let n_drop = (verify_len - n_keep) as i32;
+        if n_drop > 0 {
+            for cache in self.cache.iter_mut() {
+                cache.trim(n_drop);
+            }
         }
+        self.step = self.verify_step + n_keep;
+
+        // Truncate the hidden accumulator to keep only the accepted portion
+        // of this verify pass. Pre-verify hidden + first n_keep verify
+        // captures.
+        let pre_verify_hidden = self.verify_hidden_snapshot.take();
+        self.target_hidden_accumulated = match (pre_verify_hidden, n_keep) {
+            (snap, 0) => snap,
+            (snap, n) => {
+                // Re-derive the kept-portion captures by slicing the live
+                // accumulator: it currently holds pre-verify + all verify
+                // captures (per `append_target_hidden` from verify()). Take
+                // the first (pre_verify_len + n_keep) positions.
+                let pre_len = snap
+                    .as_ref()
+                    .map(|h| h.shape()[1] as usize)
+                    .unwrap_or(0);
+                let total_keep = pre_len + n;
+                self.target_hidden_accumulated.as_ref().map(|acc| {
+                    acc.index((.., ..total_keep as i32, ..))
+                })
+            }
+        };
 
         self.verify_inputs = None;
-        self.verify_hidden_snapshot = None;
         Ok(())
     }
 

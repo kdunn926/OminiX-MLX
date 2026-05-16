@@ -178,6 +178,22 @@ impl KVCache {
         self.values.as_ref()
     }
 
+    /// Drop the last `n_drop` cached positions by rewinding `offset`. The
+    /// underlying preallocated buffer is unchanged; the next
+    /// `update_and_fetch` will overwrite the rolled-back slots in place.
+    ///
+    /// Used by DFlash-style speculative-decoding rollback: after the target
+    /// verifies a draft block, if N positions are accepted we trim the
+    /// remaining `verify_len - N` positions in O(1) instead of cloning the
+    /// pre-verify cache and re-running a forward pass.
+    pub fn trim(&mut self, n_drop: i32) {
+        if n_drop <= 0 {
+            return;
+        }
+        let dropped = n_drop.min(self.offset);
+        self.offset -= dropped;
+    }
+
     /// Materialize lazy computation graphs for cached arrays.
     pub fn eval(&self) -> Result<(), Exception> {
         let mut arrays: Vec<&Array> = Vec::new();
