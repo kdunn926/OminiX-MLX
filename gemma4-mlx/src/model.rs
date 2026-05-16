@@ -1239,6 +1239,21 @@ impl Model {
         mq_embedding_dequant_weight(&self.model.embed_tokens, self.quantization.as_ref())
     }
 
+    /// Project a pre-LM-head hidden state (post-final-norm) through the LM
+    /// head to get logits. Used by external verify loops that have already
+    /// captured the hidden state and just need the projection.
+    pub fn forward_via_hidden(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm) => lm.forward(hidden)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, hidden)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok(logits)
+    }
+
     /// Forward pass that captures hidden states after each requested layer index
     /// AND returns last-position logits.  Returns `(logits[B, vocab], captures[B, T, K*H])`
     /// where K = `target_layer_ids.len()` and captures are concatenated along the last axis

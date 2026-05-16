@@ -46,6 +46,10 @@ path = "examples/pair_smoke.rs"
 name = "mtplx_chat"
 path = "examples/mtplx_chat.rs"
 
+[[example]]
+name = "draft_verify_spike"
+path = "examples/draft_verify_spike.rs"
+
 [dev-dependencies]
 anyhow = "1"
 
