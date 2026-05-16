@@ -376,7 +376,84 @@ Remaining suspects inside layer-0 DeltaNet, between `in_proj_*` and layer output
 - `RMSNormGated` (output gate by `z`)
 - **`out_proj`** — quantized matmul, shape `4096 → 2048`. Strongest hypothesis because the previous mlx-0.30.1 qmm bug was also shape-specific, and we have not yet verified `out_proj` at this shape between Rust and Python.
 
-### Next-step plan
+### DeltaNet substep audit — completed
 
-Add a `debug_first_layer` analog to `LinearAttention` in `qwen3.6-mlx/src/deltanet.rs` that returns per-step intermediates (post-conv, post-l2-norm, decay, beta, post-recurrence, post-rmsnorm-gated, post-out_proj). Mirror in Python; diff on the same prefill state to find which sub-step diverges first.
+Used the existing `target_layer0_debug.rs` + a Python mirror
+(`scripts/python_layer0_debug.py`) to diff every layer-0 DeltaNet
+intermediate.
+
+Findings, in order along the forward pipeline:
+
+| Op | Status | Action |
+|---|---|---|
+| `embeddings`, `input_layernorm` | bit-exact | — |
+| `in_proj_qkv` / `z` / `a` / `b` | bit-exact (post mlx 0.31.2 bump) | runtime alignment |
+| `conv1d` (`qkv_after_conv`) | 0.6% drift | switched manual kernel-tap loop to fused `mlx_rs::ops::conv1d` — bit-exact |
+| q/k normalization | k_norm 3.9% drift | switched `l2_normalize + scale` to Python's `rms_norm(., None, 1e-6) + scale` — k_norm 0.2% |
+| recurrent scan (`output`) | 0.2% — within BF16 noise | — |
+| `out_proj` (quantized 4096→2048) | 0.37% | not actionable (kernel noise) |
+
+### MoE audit — completed
+
+Layer-1 MoE dump on bit-exact synthetic input (`layer0_input_norm`,
+which is bit-identical Rust vs Python) using
+`qwen3.6-mlx/examples/target_moe_dump.rs` ↔ `scripts/python_moe_dump.py`:
+
+- `gates_raw`, `gates` (post-softmax): bit-exact
+- top-k expert SETS per token: SET-MATCH on all 15 tokens
+- `moe_out`: 1.0% relmax — entirely from the expert matmuls
+  (`gate_proj` / `up_proj` / `down_proj` in `SwitchGLU` and the shared
+  expert), not from routing
+
+Aligned Rust's argpartition pattern with Python's literally
+(`argpartition(gates, kth=N-k)[..., N-k:]` instead of
+`argpartition(-gates, k-1)[..., :k]`) to eliminate a "different code,
+same output" footgun. Numerically neutral on this example.
+
+### Synthesis — per-op parity floor reached
+
+Every individual op we've probed is either bit-exact or has been
+*made* bit-exact by a targeted fix. The remaining drift is uniformly
+small (~0.4–1% per quantized matmul) and is BF16 kernel noise — not
+something OminiX can fix without changing precision. With ~25 DeltaNet
+layers × `out_proj` + 40 layers × MoE expert matmuls, this compounds
+to the ~3% `prefill_logits` relmax we measure end-to-end.
+
+**Despite all per-op fixes, DFlash acceptance has not budged from
+~0.12.** AR throughput improved 30 → 67 tok/s (2.2×) as a side-effect
+of the runtime bump + workaround removal — a substantial standalone
+perf win, but unrelated to the acceptance gap.
+
+### New leading hypothesis — DFlash session-level logic
+
+Per-op parity is solid. The acceptance gap (Rust ~0.12 vs Python ~0.5)
+must therefore live in DFlash's session/protocol layer, not in the
+target or draft forward computations. Specifically:
+
+1. **Staged-token / noise embedding alignment** — claimed resolved by
+   the original wip doc, never validated against acceptance.
+2. **Projected-context cache / target_hidden accumulation across
+   cycles** — Rust uses Strategy B full-recompute every cycle, Python
+   uses incremental `ContextOnlyDraftKVCache`. We confirmed earlier
+   the two are mathematically equivalent at infinite precision, but
+   the in-practice BF16 differences across many cycles have not been
+   measured.
+3. **Acceptance comparison logic** — how Rust decides which drafted
+   tokens to accept vs reject against the target's verification logits.
+4. **Rollback bookkeeping** — DeltaNet recurrent state + KV cache
+   snapshot/restore on rejection.
+
+### Next-step plan — multi-cycle execution trace
+
+Run Python and Rust DFlash on the same prompt with deterministic
+sampling. Per cycle, dump:
+
+- `drafted_tokens` (what the draft model proposed)
+- `verify_logits` (target's forward on the drafted block)
+- `accepted_tokens` (acceptance-logic output)
+- `committed_tokens` (the suffix actually appended)
+- `staged_token` (next cycle's seed)
+- per-cycle target/draft cache fingerprints
+
+Find the first cycle where the streams diverge and trace why.
 
