@@ -90,6 +90,11 @@ pub struct SessionMetrics {
     pub total_drafted: usize,
     pub acceptance_ratio: f32,
     pub avg_block_len: f32,
+    /// Number of cycles whose draft block came from the CopySpec
+    /// prompt-tail index instead of the draft model.
+    pub copyspec_hits: usize,
+    /// Total tokens proposed via CopySpec (sum over `copyspec_hits` cycles).
+    pub copyspec_tokens: usize,
 }
 
 /// Emitted event from run_generate iterator.
@@ -187,6 +192,14 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                     return Some(Err(Exception::custom("prompt_tokens must not be empty")));
                 }
 
+                // Build the CopySpec N-gram index over the prompt if one
+                // hasn't been provided explicitly. Free drafts for prompts
+                // that echo themselves (code, math reasoning, structured
+                // outputs, repetition).
+                if self.copyspec.is_none() {
+                    self.copyspec = Some(CopySpecIndex::new(&prompt));
+                }
+
                 let prompt_array = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
                 let target_logits = match self.target.prefill(&prompt_array) {
                     Ok(logits) => logits,
@@ -275,12 +288,38 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
             } else {
             }
 
-            let drafted = match self.draft.draft_block(&last_token_array, block_len) {
-                Ok(block) => block,
-                Err(err) => {
-                    finished = true;
-                    return Some(Err(err));
+            // CopySpec short-circuit: if the prompt-tail index has a hit
+            // for (committed tail + last_token), use those prompt tokens as
+            // the draft block and skip the draft model forward entirely.
+            // The target verifier still gates every proposed token.
+            let copyspec_hit = self
+                .copyspec
+                .as_ref()
+                .and_then(|c| c.draft_after(last_token, block_len - 1, None));
+            let drafted = match copyspec_hit {
+                Some(tokens) => {
+                    self.metrics.copyspec_hits += 1;
+                    self.metrics.copyspec_tokens += tokens.len();
+                    let n = tokens.len() as i32;
+                    match Array::zeros::<f32>(&[1, n, 1]) {
+                        Ok(zeros) => DraftBlock {
+                            tokens: Array::from_slice(&tokens, &[1, n]),
+                            // logits unused downstream (only `tokens`).
+                            logits: zeros,
+                        },
+                        Err(err) => {
+                            finished = true;
+                            return Some(Err(err));
+                        }
+                    }
                 }
+                None => match self.draft.draft_block(&last_token_array, block_len) {
+                    Ok(block) => block,
+                    Err(err) => {
+                        finished = true;
+                        return Some(Err(err));
+                    }
+                },
             };
 
             let drafted_tokens = drafted.tokens.index((0, ..));
@@ -379,6 +418,19 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                 }
             };
             pending.push_back(Ok(target_token));
+
+            // Extend the CopySpec index with everything that got committed
+            // this cycle: the n_accepted drafted tokens that survived
+            // verification + the target's correction/stage token.
+            if let Some(copyspec) = self.copyspec.as_mut() {
+                let mut committed: Vec<u32> = drafted_vec
+                    .iter()
+                    .take(n_accepted)
+                    .copied()
+                    .collect();
+                committed.push(target_token);
+                copyspec.append_committed(&committed);
+            }
 
             self.metrics.total_cycles += 1;
             self.metrics.total_accepted += n_accepted;
