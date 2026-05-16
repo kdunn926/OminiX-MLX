@@ -152,6 +152,24 @@ impl Model {
             .collect()
     }
 
+    /// Like `forward_last_logits` but also returns the last-position
+    /// post-norm hidden state. Used by MTP speculative drafting in
+    /// `mtplx-mlx`: the MTP head consumes `[B, 1, H]` of host hidden +
+    /// the embedded previously-committed token.
+    pub fn forward_last_hidden_and_logits(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<(Array, Array), Exception> {
+        let h = self.forward_hidden(inputs, cache)?;
+        let last = h.index((.., -1, ..));
+        // Keep a [B, 1, H] shape (not [B, H]) so the MTP head's RMSNorm
+        // and downstream attention see a 3D input matching the host.
+        let last_3d = last.index((.., mlx_rs::ops::indexing::NewAxis, ..));
+        let logits = self.apply_lm_head(&last)?;
+        Ok((last_3d, logits))
+    }
+
     /// Run the transformer and project only the last sequence position through
     /// the LM head. Avoids a `[B, T, vocab]` matmul during prefill.
     pub fn forward_last_logits(

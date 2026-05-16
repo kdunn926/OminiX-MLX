@@ -4,18 +4,15 @@
 //!   1. Prefill the target on the prompt (uses
 //!      `qwen3_6_mlx::Model::forward_last_logits`).
 //!   2. Per step:
-//!      a. If the MTP head is loaded, draft K tokens from the last
-//!         hidden state + previous-token embedding.
-//!         (Stub today: see below — we never enter this branch in
-//!          practice because the stock checkpoint strips MTP weights.)
+//!      a. If the MTP head is loaded AND not a stub (`is_stub()` checks
+//!         that real weights were materialized), draft 1 token from the
+//!         last hidden state + previous-token embedding, then verify it
+//!         with one target forward.
 //!      b. Else: emit a single autoregressive token (AR fallback).
-//!   3. Target-verify the K candidates in one forward; accept while
-//!      `draft[i] == argmax(target_logits[i])`.
 //!
-//! The target's `forward_last_logits` only returns the last-position
-//! logits, which is exactly what we want for the trailing argmax in the
-//! verify pass. For K > 1 candidate verification we'd want all positions
-//! — see TODO in `verify_block`.
+//! Today only K=1 is implemented (matching Qwen3.6's `mtp_num_hidden_layers=1`
+//! config) and only greedy acceptance at T=0. K>1 and probabilistic
+//! Leviathan-Chen acceptance are out of scope — see WIP.md.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -72,22 +69,27 @@ impl SessionMetrics {
 pub struct MtplxSession {
     model: Model,
     cfg: SpeculativeConfig,
-    has_mtp: bool,
+    /// `true` when the loaded MTP head has real weights (not a stub).
+    /// We cache it because checking again requires a `&mut Model`.
+    mtp_active: bool,
 }
 
 impl MtplxSession {
     /// Build a session around the given (already-loaded) Qwen3.6 target.
     pub fn new(mut model: Model, cfg: SpeculativeConfig) -> Self {
-        let has_mtp = model.mtp_head().is_some();
+        let mtp_active = model
+            .mtp_head()
+            .map(|h| !h.is_stub())
+            .unwrap_or(false);
         Self {
             model,
             cfg,
-            has_mtp,
+            mtp_active,
         }
     }
 
     pub fn has_mtp_head(&self) -> bool {
-        self.has_mtp
+        self.mtp_active
     }
 
     /// Generate up to `cfg.max_tokens` tokens for the given prompt token
@@ -124,11 +126,7 @@ impl MtplxSession {
         }
 
         while metrics.total_tokens < self.cfg.max_tokens {
-            if self.has_mtp {
-                // TODO: when MTP weights are actually loaded, draft K
-                // tokens here via `self.model.mtp_head().unwrap().forward`
-                // and verify them in a single target pass. We never
-                // reach this branch with the stock checkpoint.
+            if self.mtp_active {
                 metrics.mtp_cycles += 1;
                 let (accepted, next) =
                     self.mtp_cycle(next_id, &mut cache)?;
@@ -168,24 +166,66 @@ impl MtplxSession {
         Ok((produced, metrics))
     }
 
-    /// One MTP-drafted speculative cycle: draft K with the MTP head,
-    /// verify with the target, accept greedy prefix.
+    /// One MTP-drafted speculative cycle (K=1, greedy):
     ///
-    /// **Not implemented**: the stock Qwen3.6 checkpoint strips MTP
-    /// weights, so we never construct a real head. This stub returns
-    /// a single AR-decoded token so the outer loop still makes progress
-    /// if it's ever entered.
+    ///   1. Run target forward on `last_token`; capture its post-norm
+    ///      hidden state AND its argmax logit. The argmax is the
+    ///      "would-have-been-AR" next token — we'll commit it as the
+    ///      anchor for this cycle.
+    ///   2. Embed `last_token` via the host embed table.
+    ///   3. Call `mtp_head.forward(hidden, prev_emb)` → next-token
+    ///      logits → argmax = drafted token (one step ahead of the
+    ///      AR token).
+    ///   4. Verify: run the target on the AR-committed token; its
+    ///      argmax is the next "real" target token. If it matches
+    ///      the drafted token, we accept the draft (saved one decode
+    ///      step). Either way we return one or two committed tokens.
+    ///
+    /// Returns `(extra_accepted, next_after_accepted)` where
+    /// `extra_accepted` is the list of speculatively-accepted tokens
+    /// between the previous `next_id` and the new one. With K=1 this is
+    /// at most one element.
     fn mtp_cycle(
         &mut self,
         last_token: i32,
         cache: &mut Vec<HybridCache>,
     ) -> Result<(Vec<i32>, i32), MtpError> {
-        // TODO(mtplx): replace with real draft+verify once a checkpoint
-        // ships the MTP weights. See WIP.md.
+        // Step 1: target forward on `last_token`, keep both the last
+        // hidden state and the logits.
         let in_arr = Array::from_slice(&[last_token], &[1, 1]);
-        let logits = self.model.forward_last_logits(&in_arr, cache)?;
-        let next = argmax_id(&logits)?;
-        Ok((Vec::new(), next))
+        let (hidden, ar_logits) = self
+            .model
+            .forward_last_hidden_and_logits(&in_arr, cache)?;
+        let ar_next = argmax_id(&ar_logits)?;
+
+        // Step 2: embed the previously-committed token (host embed table).
+        // `embed_tokens` returns `[1, 1, H]`.
+        let prev_emb = self.model.embed_tokens(&[last_token])?;
+
+        // Step 3: MTP draft logits → next-after-AR drafted token.
+        let mtp = self
+            .model
+            .mtp_head()
+            .expect("mtp_cycle entered without an active MTP head");
+        let mtp_logits = mtp.forward(&hidden, &prev_emb)?;
+        let drafted = argmax_id(&mtp_logits)?;
+
+        // Step 4: verify the draft by running target on ar_next.
+        let verify_in = Array::from_slice(&[ar_next], &[1, 1]);
+        let verify_logits = self.model.forward_last_logits(&verify_in, cache)?;
+        let target_after_ar = argmax_id(&verify_logits)?;
+
+        if target_after_ar == drafted {
+            // Accept the draft: we commit `ar_next` as the in-between
+            // token and `drafted` as the next anchor.
+            Ok((vec![ar_next], drafted))
+        } else {
+            // Reject: we still commit `ar_next` (free — its cache is
+            // populated) and use the target's verified continuation
+            // `target_after_ar` as the next anchor. No work wasted; the
+            // draft path just didn't pay off.
+            Ok((vec![ar_next], target_after_ar))
+        }
     }
 }
 
