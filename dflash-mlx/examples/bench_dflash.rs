@@ -37,6 +37,11 @@ struct Args {
     target: PathBuf,
     draft: Option<PathBuf>,
     prompt: String,
+    /// When set, overrides `prompt` by loading + rendering an
+    /// OpenAI-style chat JSON via Gemma4ChatTemplate. Used by the DDTree
+    /// parameter sweep to feed long realistic prompts from
+    /// OminiX-API/tests/fixtures.
+    fixture: Option<PathBuf>,
     max_tokens: usize,
     temp: f32,
     cpu: bool,
@@ -60,10 +65,16 @@ fn main() -> Result<()> {
     }
 
     let tokenizer = load_tokenizer(&args.target)?;
+    let prompt_text = if let Some(fp) = args.fixture.as_ref() {
+        render_fixture_as_prompt(fp, &args.target)?
+    } else {
+        args.prompt.clone()
+    };
     let encoding = tokenizer
-        .encode(args.prompt.as_str(), false)
+        .encode(prompt_text.as_str(), false)
         .map_err(|e| anyhow!(e.to_string()))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    eprintln!("Prompt: {} tokens", prompt_ids.len());
     let prompt = mlx_rs::Array::from_slice(&prompt_ids, &[1, prompt_ids.len() as i32]);
     let eos_tokens = load_eos_tokens(&args.target)?;
     let target_kind = detect_target_kind(&args.target)?;
@@ -596,6 +607,92 @@ fn run_gemma4(
     Ok(())
 }
 
+/// Render an OpenAI-style chat JSON fixture into a Gemma4 chat-templated
+/// prompt string. Used by the DDTree parameter sweep to feed realistic
+/// long prompts from OminiX-API/tests/fixtures/.
+///
+/// Accepts the minimum schema: top-level `messages: [{role, content}, ...]`
+/// with role ∈ {system, user, assistant, tool}. Assistant tool_calls and
+/// tool.name fields are passed through when present; everything else is
+/// ignored. Falls back gracefully if the fixture only has user/assistant
+/// turns.
+fn render_fixture_as_prompt(fixture_path: &Path, model_dir: &Path) -> Result<String> {
+    use gemma4_mlx::{Gemma4ChatTemplate, Gemma4Message, Gemma4ToolCall};
+    use serde_json::Value;
+
+    let bytes = std::fs::read(fixture_path)
+        .with_context(|| format!("read fixture {}", fixture_path.display()))?;
+    let v: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse fixture {}", fixture_path.display()))?;
+    let msgs = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .ok_or_else(|| anyhow!("fixture has no messages array"))?;
+
+    fn text_of(content: &Value) -> String {
+        match content {
+            Value::String(s) => s.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        }
+    }
+
+    let mut messages: Vec<Gemma4Message> = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = m.get("content").map(text_of).unwrap_or_default();
+        match role {
+            "system" => messages.push(Gemma4Message::system(content)),
+            "user" => messages.push(Gemma4Message::user(content)),
+            "assistant" => {
+                let tool_calls: Vec<Gemma4ToolCall> = m
+                    .get("tool_calls")
+                    .and_then(|tc| tc.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|t| {
+                                let f = t.get("function")?;
+                                let name = f.get("name")?.as_str()?.to_string();
+                                let arguments = f
+                                    .get("arguments")
+                                    .cloned()
+                                    .unwrap_or(Value::Null);
+                                Some(Gemma4ToolCall { name, arguments })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if tool_calls.is_empty() {
+                    messages.push(Gemma4Message::assistant(content));
+                } else {
+                    messages.push(Gemma4Message::assistant_with_tool_calls(content, tool_calls));
+                }
+            }
+            "tool" => {
+                let name = m
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("tool")
+                    .to_string();
+                messages.push(Gemma4Message::tool(name, content));
+            }
+            _ => {
+                eprintln!("warn: skipping fixture message with unknown role {role:?}");
+            }
+        }
+    }
+
+    let template = Gemma4ChatTemplate::load(model_dir)
+        .map_err(|e| anyhow!("load chat template from {}: {e}", model_dir.display()))?;
+    template
+        .render_prompt(&messages, &[], true)
+        .map_err(|e| anyhow!("render_prompt: {e}"))
+}
+
 fn load_eos_tokens(model_dir: &Path) -> Result<HashSet<u32>> {
     let config_path = model_dir.join("config.json");
     let config: serde_json::Value = serde_json::from_str(
@@ -626,6 +723,7 @@ fn parse_args() -> Result<Args> {
     let mut target = PathBuf::from("models/Qwen3.6-35B-A3B-4bit");
     let mut draft = None;
     let mut prompt = DEFAULT_PROMPT.to_string();
+    let mut fixture: Option<PathBuf> = None;
     let mut max_tokens = 200usize;
     let mut temp = 0.7f32;
     let mut cpu = false;
@@ -652,6 +750,12 @@ fn parse_args() -> Result<Args> {
                 prompt = args
                     .next()
                     .ok_or_else(|| anyhow!("--prompt requires text"))?
+            }
+            "--fixture" => {
+                fixture = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--fixture requires a JSON path"))?,
+                ));
             }
             "--max-tokens" => {
                 max_tokens = args
@@ -698,6 +802,7 @@ fn parse_args() -> Result<Args> {
         target,
         draft,
         prompt,
+        fixture,
         max_tokens,
         temp,
         cpu,

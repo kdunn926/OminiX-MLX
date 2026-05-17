@@ -348,6 +348,188 @@ impl KeyValueCache for KVCache {
 }
 
 // ============================================================================
+// TurboQuantKVCache — 4-bit Lloyd-Max on Hadamard-rotated keys (spike)
+// ============================================================================
+
+/// KV cache where keys are stored in TurboQuant 4-bit form (Hadamard-
+/// rotated + per-vector sigma + Lloyd-Max N(0,1) codebook) and values
+/// are kept at the native bf16/f16 dtype. Each `update_and_fetch` runs
+/// the `tq_compress_4bit` Metal kernel on the new K block, appends the
+/// packed indices + per-vector sigma + mean to the cache, and returns
+/// the decompressed K (via `tq_decompress_4bit`) so attention sees
+/// a normal `[B, H, S, D]` BF16 tensor.
+///
+/// Memory: head_dim=256 sliding K shrinks from 512 bytes/vector (BF16)
+/// to 128 bytes packed + 4 bytes sigma + 4 bytes mean = 136 bytes
+/// ≈ 3.8× compression on K. V stays at native bf16.
+///
+/// Spike caveats (matches `turboquant.rs`):
+///   - V is NOT compressed.
+///   - No pre-RoPE quantization, no QJL, no calibrated codebooks.
+///   - Cached signs reuse the same seed across all cycles; for safety
+///     across a long process lifetime, use a unique seed per cache.
+#[derive(Debug, Clone)]
+pub struct TurboQuantKVCache {
+    /// Packed 4-bit key indices, shape `[B, H, n_tokens, D/8]` u32.
+    packed_keys: Option<Array>,
+    /// Per-vector sigma, shape `[B, H, n_tokens]` f32.
+    key_sigma: Option<Array>,
+    /// Per-vector mean, shape `[B, H, n_tokens]` f32.
+    key_mean: Option<Array>,
+    /// Native-dtype values, shape `[B, H, n_tokens, D]`.
+    values: Option<Array>,
+    offset: i32,
+    /// Sign tensor seed (deterministic across the lifetime of this cache).
+    seed: u64,
+}
+
+impl TurboQuantKVCache {
+    pub fn new() -> Self {
+        Self {
+            packed_keys: None,
+            key_sigma: None,
+            key_mean: None,
+            values: None,
+            offset: 0,
+            seed: 0x5EED_5EED,
+        }
+    }
+
+    pub fn with_seed(seed: u64) -> Self {
+        Self { seed, ..Self::new() }
+    }
+
+    /// Reconstruct the full keys tensor `[B, H, offset, D]` at the
+    /// caller-requested dtype by running `tq_decompress_4bit` over the
+    /// packed slots.
+    fn reconstruct_keys(&self, dtype: mlx_rs::Dtype, d: i32) -> Result<Array, Exception> {
+        use crate::turboquant::{cached_signs, CENTROIDS_4BIT};
+        let packed = self
+            .packed_keys
+            .as_ref()
+            .expect("packed_keys unset before reconstruct");
+        let sigma = self.key_sigma.as_ref().expect("sigma unset");
+        let mean = self.key_mean.as_ref().expect("mean unset");
+        let shape = packed.shape().to_vec(); // [B, H, n_total, D/8]
+        let b = shape[0];
+        let h = shape[1];
+        let n_total = shape[2];
+        let kept_n = self.offset;
+        if kept_n == 0 {
+            return Err(Exception::custom("reconstruct_keys on empty cache"));
+        }
+        // Slice to the offset window.
+        let packed_w = packed.index((Ellipsis, ..kept_n, ..));
+        let sigma_w = sigma.index((Ellipsis, ..kept_n));
+        let mean_w = mean.index((Ellipsis, ..kept_n));
+        let signs_vec = cached_signs(d, self.seed);
+        let signs = Array::from_slice(&signs_vec, &[d]);
+        let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+        let out_shape = vec![b, h, kept_n, d];
+        let _ = n_total;
+        crate::metal_kernels::tq_decompress_4bit(
+            &packed_w, &sigma_w, &mean_w, &signs, &centroids, &out_shape, dtype,
+        )
+    }
+}
+
+impl Default for TurboQuantKVCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyValueCache for TurboQuantKVCache {
+    fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        None
+    }
+
+    fn reset(&mut self) {
+        self.packed_keys = None;
+        self.key_sigma = None;
+        self.key_mean = None;
+        self.values = None;
+        self.offset = 0;
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+    ) -> Result<(Array, Array), Exception> {
+        use crate::turboquant::{cached_signs, BOUNDARIES_4BIT};
+        let k_shape = keys.shape();
+        let b = k_shape[0];
+        let h = k_shape[1];
+        let t_new = k_shape[2];
+        let d = k_shape[3];
+        let dtype = keys.dtype();
+
+        // Compress the new K block: input shape [B, H, T, D] → flat per
+        // vector. The kernel treats the leading dims as one big batch.
+        let signs_vec = cached_signs(d, self.seed);
+        let signs = Array::from_slice(&signs_vec, &[d]);
+        let boundaries = Array::from_slice(&BOUNDARIES_4BIT, &[15]);
+        let (packed_new, sigma_new, mean_new) =
+            crate::metal_kernels::tq_compress_4bit(&keys, &signs, &boundaries)?;
+        // Kernel outputs flatten the leading dims: packed [B*H*T, D/8],
+        // sigma/mean [B*H*T]. Reshape back to [B, H, T, ...] so the
+        // token-axis concatenate matches `values`'s layout.
+        let packed_new = packed_new.reshape(&[b, h, t_new, d / 8])?;
+        let sigma_new = sigma_new.reshape(&[b, h, t_new])?;
+        let mean_new = mean_new.reshape(&[b, h, t_new])?;
+
+        // Append along the token axis.
+        self.packed_keys = Some(match self.packed_keys.take() {
+            Some(prev) => concatenate_axis(&[prev, packed_new], 2)?,
+            None => packed_new,
+        });
+        self.key_sigma = Some(match self.key_sigma.take() {
+            Some(prev) => concatenate_axis(&[prev, sigma_new], 2)?,
+            None => sigma_new,
+        });
+        self.key_mean = Some(match self.key_mean.take() {
+            Some(prev) => concatenate_axis(&[prev, mean_new], 2)?,
+            None => mean_new,
+        });
+        self.values = Some(match self.values.take() {
+            Some(prev) => concatenate_axis(&[prev, values], 2)?,
+            None => values,
+        });
+        self.offset += t_new;
+
+        // Reconstruct K for the attention call.
+        let k_full = self.reconstruct_keys(dtype, d)?;
+        let v_full = self.values.as_ref().unwrap().clone();
+        Ok((k_full, v_full))
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        let values = self.values.as_ref()?.clone();
+        let d = values.shape()[3];
+        let dtype = values.dtype();
+        let k = self.reconstruct_keys(dtype, d).ok()?;
+        Some((k, values))
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        let mut arrays: Vec<&Array> = Vec::new();
+        if let Some(a) = &self.packed_keys { arrays.push(a); }
+        if let Some(a) = &self.key_sigma  { arrays.push(a); }
+        if let Some(a) = &self.key_mean   { arrays.push(a); }
+        if let Some(a) = &self.values     { arrays.push(a); }
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
 // QuantizedKVCache — K=q8, V=q4 mixed-precision KV cache
 // ============================================================================
 

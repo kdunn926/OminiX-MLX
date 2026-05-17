@@ -25,9 +25,12 @@ pub mod memory;
 pub mod metal_kernels;
 pub mod sampler;
 pub mod speculative;
+pub mod turboquant;
 pub mod utils;
 
-pub use cache::{ConcatKeyValueCache, KVCache, KeyValueCache, QuantizedKVCache};
+pub use cache::{
+    ConcatKeyValueCache, KVCache, KeyValueCache, QuantizedKVCache, TurboQuantKVCache,
+};
 pub use error::{Error, Result};
 pub use memory::{
     clear_cache, flush_cache_if_needed, get_device_info, get_memory_stats, reset_peak_memory,
@@ -35,7 +38,7 @@ pub use memory::{
 };
 pub use metal_kernels::{
     deltanet_recurrence, deltanet_tape_replay, deltanet_with_tape, fused_modulate, fused_swiglu,
-    kv_compact, per_position_rope,
+    kv_compact, per_position_rope, tq_compress_4bit, tq_decompress_4bit,
 };
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{

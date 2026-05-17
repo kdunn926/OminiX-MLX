@@ -22,7 +22,7 @@ use mlx_rs::{
 
 use gemma4_mlx::{
     load_tokenizer, mtplx_target::load_mtplx_target, Gemma4ChatTemplate, Gemma4Message, Generate,
-    KVCache, KeyValueCache, QuantizedKVCache,
+    KVCache, KeyValueCache, QuantizedKVCache, TurboQuantKVCache,
 };
 
 /// EOS token IDs from generation_config.json.
@@ -117,18 +117,35 @@ fn main() -> Result<()> {
     // bf16 KVCache. The generic `Generate` iterator and `Model::forward`
     // path both work with any `KeyValueCache + Default`, so this is a
     // type-level switch only.
-    let quantize_kv = std::env::var("QUANTIZE_KV").is_ok();
-    println!("quantize_kv: {quantize_kv}");
+    // Cache backend selector via env vars (mutually exclusive; first wins):
+    //   TURBO_KV=1     → TurboQuantKVCache (4-bit Lloyd-Max + Hadamard on K, BF16 V)
+    //   QUANTIZE_KV=1  → mlx_rs_core::QuantizedKVCache (Q8 K, Q4 V)
+    //   default        → KVCache (BF16 K, BF16 V)
+    let backend = if std::env::var("TURBO_KV").is_ok() {
+        "turboquant"
+    } else if std::env::var("QUANTIZE_KV").is_ok() {
+        "quantized"
+    } else {
+        "bf16"
+    };
+    println!("kv_backend : {backend}");
 
     let t_gen = std::time::Instant::now();
     let mut t_first: Option<std::time::Duration> = None;
     let mut emitted: Vec<i32> = Vec::with_capacity(max_new);
-    if quantize_kv {
-        let mut cache: Vec<QuantizedKVCache> = Vec::new();
-        run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
-    } else {
-        let mut cache: Vec<KVCache> = Vec::new();
-        run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
+    match backend {
+        "turboquant" => {
+            let mut cache: Vec<TurboQuantKVCache> = Vec::new();
+            run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
+        }
+        "quantized" => {
+            let mut cache: Vec<QuantizedKVCache> = Vec::new();
+            run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
+        }
+        _ => {
+            let mut cache: Vec<KVCache> = Vec::new();
+            run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
+        }
     }
     let total = t_gen.elapsed();
     let ttft = t_first.unwrap_or(total);

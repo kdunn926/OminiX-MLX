@@ -111,6 +111,458 @@ const PER_POSITION_ROPE_KERNEL_SOURCE: &str = r#"
 
 static PER_POSITION_ROPE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 
+// =============================================================================
+// TurboQuant key compression / decompression kernels
+// =============================================================================
+//
+// Port of github.com/onur-gokyildiz-bhi/tq-kv's CUDA tq_compress + matching
+// decompress, sized for Gemma4-class workloads (head_dim ≤ 512, kv_heads
+// up to 32). Each kernel processes one key vector per grid block.
+//
+// Compress pipeline (kernel `tq_compress_4bit`):
+//   1. Load key vector × sign mask into threadgroup memory.
+//   2. Per-token mean subtraction (parallel sum reduction).
+//   3. In-place Fast Walsh-Hadamard Transform (butterfly).
+//   4. Normalize by 1/sqrt(head_dim).
+//   5. Compute norm + sigma = norm / sqrt(head_dim).
+//   6. Quantize each coordinate by linear scan over 15 boundaries → 4-bit
+//      index in [0, 15]. Pack 8 indices per u32 word.
+//   7. Store (packed_indices [head_dim/8 u32], sigma f32, mean f32).
+//
+// Decompress pipeline (kernel `tq_decompress_4bit`):
+//   1. Unpack 4-bit index → centroid * sigma.
+//   2. Inverse Hadamard (= forward Hadamard, since it's self-inverse).
+//   3. Add mean back, undo sign flip.
+//   4. Cast to output dtype (BF16/F16/F32 via template T).
+//
+// Grid layout for both: x = batch * n_kv_heads * tokens, threads = 64.
+
+const TQ_COMPRESS_4BIT_KERNEL: &str = r#"
+    uint tid = thread_position_in_threadgroup.x;
+    uint vec_idx = threadgroup_position_in_grid.x;
+    if (vec_idx >= uint(n_vectors)) return;
+
+    threadgroup float s_data[512]; // head_dim ≤ 512
+    threadgroup float s_red[64];
+
+    // Pre-loaded constants:
+    //   boundaries[15] — Lloyd-Max boundaries for N(0,1)
+    //   signs[D]       — randomized Hadamard signs
+    //   keys_in[N*D]   — input keys, row-major
+    //   packed_out, sigma_out, mean_out — outputs
+
+    uint d_in = vec_idx * uint(D);
+
+    // Step 1: load key * sign.
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        s_data[i] = float(keys_in[d_in + i]) * signs[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: per-token mean removal.
+    float local_sum = 0.0f;
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        local_sum += s_data[i];
+    }
+    s_red[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) { s_red[tid] += s_red[tid + 32]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 16) { s_red[tid] += s_red[tid + 16]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 8)  { s_red[tid] += s_red[tid +  8]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 4)  { s_red[tid] += s_red[tid +  4]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 2)  { s_red[tid] += s_red[tid +  2]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { s_red[0] += s_red[1]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = s_red[0] / float(D);
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        s_data[i] -= mean;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: in-place Walsh-Hadamard butterfly.
+    for (uint step = 1u; step < uint(D); step <<= 1u) {
+        for (uint i = tid; i < uint(D) / 2u; i += uint(64)) {
+            uint j = (i / step) * (step * 2u) + (i % step);
+            uint k = j + step;
+            float a = s_data[j];
+            float b = s_data[k];
+            s_data[j] = a + b;
+            s_data[k] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Step 4: normalize by 1/sqrt(D).
+    float scale = metal::rsqrt(float(D));
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        s_data[i] *= scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 5: per-vector sigma = norm / sqrt(D).
+    float local_sq = 0.0f;
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        local_sq += s_data[i] * s_data[i];
+    }
+    s_red[tid] = local_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) { s_red[tid] += s_red[tid + 32]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 16) { s_red[tid] += s_red[tid + 16]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 8)  { s_red[tid] += s_red[tid +  8]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 4)  { s_red[tid] += s_red[tid +  4]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 2)  { s_red[tid] += s_red[tid +  2]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { s_red[0] += s_red[1]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float norm = metal::sqrt(s_red[0]);
+    float sigma = norm * metal::rsqrt(float(D));
+    float inv_sigma = (sigma > 1e-10f) ? (1.0f / sigma) : 0.0f;
+    if (tid == 0) {
+        sigma_out[vec_idx] = sigma;
+        mean_out[vec_idx]  = mean;
+    }
+
+    // Step 6: quantize + pack 8 indices into one u32.
+    // packed_out is [n_vectors, D/8] u32.
+    uint words_per_vec = uint(D) / 8u;
+    for (uint w = tid; w < words_per_vec; w += uint(64)) {
+        uint packed = 0u;
+        for (uint k = 0u; k < 8u; ++k) {
+            uint d = w * 8u + k;
+            float v = s_data[d] * inv_sigma;
+            // Linear scan over 15 boundaries — fully unrolled, hot in registers.
+            uint idx = 0u;
+            if (v > boundaries[0])  idx = 1u;
+            if (v > boundaries[1])  idx = 2u;
+            if (v > boundaries[2])  idx = 3u;
+            if (v > boundaries[3])  idx = 4u;
+            if (v > boundaries[4])  idx = 5u;
+            if (v > boundaries[5])  idx = 6u;
+            if (v > boundaries[6])  idx = 7u;
+            if (v > boundaries[7])  idx = 8u;
+            if (v > boundaries[8])  idx = 9u;
+            if (v > boundaries[9])  idx = 10u;
+            if (v > boundaries[10]) idx = 11u;
+            if (v > boundaries[11]) idx = 12u;
+            if (v > boundaries[12]) idx = 13u;
+            if (v > boundaries[13]) idx = 14u;
+            if (v > boundaries[14]) idx = 15u;
+            packed |= (idx & 0xFu) << (k * 4u);
+        }
+        packed_out[vec_idx * words_per_vec + w] = packed;
+    }
+"#;
+
+const TQ_DECOMPRESS_4BIT_KERNEL: &str = r#"
+    uint tid = thread_position_in_threadgroup.x;
+    uint vec_idx = threadgroup_position_in_grid.x;
+    if (vec_idx >= uint(n_vectors)) return;
+
+    threadgroup float s_data[512];
+
+    float sigma = sigma_in[vec_idx];
+    float mean  = mean_in[vec_idx];
+    uint words_per_vec = uint(D) / 8u;
+
+    // Step 1: unpack indices → centroid * sigma.
+    for (uint w = tid; w < words_per_vec; w += uint(64)) {
+        uint packed = packed_in[vec_idx * words_per_vec + w];
+        for (uint k = 0u; k < 8u; ++k) {
+            uint idx = (packed >> (k * 4u)) & 0xFu;
+            s_data[w * 8u + k] = centroids[idx] * sigma;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: inverse Hadamard (self-inverse modulo normalization).
+    for (uint step = 1u; step < uint(D); step <<= 1u) {
+        for (uint i = tid; i < uint(D) / 2u; i += uint(64)) {
+            uint j = (i / step) * (step * 2u) + (i % step);
+            uint k = j + step;
+            float a = s_data[j];
+            float b = s_data[k];
+            s_data[j] = a + b;
+            s_data[k] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = metal::rsqrt(float(D));
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        s_data[i] *= scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: add mean back, undo sign flip, write out as T.
+    uint d_out = vec_idx * uint(D);
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        float v = (s_data[i] + mean) * signs[i];
+        keys_out[d_out + i] = T(v);
+    }
+"#;
+
+static TQ_COMPRESS_4BIT_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
+static TQ_DECOMPRESS_4BIT_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_tq_compress_4bit_kernel() -> MetalKernel {
+    unsafe {
+        let keys_in = CString::new("keys_in").unwrap();
+        let signs = CString::new("signs").unwrap();
+        let boundaries = CString::new("boundaries").unwrap();
+        let packed_out = CString::new("packed_out").unwrap();
+        let sigma_out = CString::new("sigma_out").unwrap();
+        let mean_out = CString::new("mean_out").unwrap();
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, keys_in.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, signs.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, boundaries.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, packed_out.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(outputs, sigma_out.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(outputs, mean_out.as_ptr());
+        let source = CString::new(TQ_COMPRESS_4BIT_KERNEL).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("tq_compress_4bit").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+fn create_tq_decompress_4bit_kernel() -> MetalKernel {
+    unsafe {
+        let packed_in = CString::new("packed_in").unwrap();
+        let sigma_in = CString::new("sigma_in").unwrap();
+        let mean_in = CString::new("mean_in").unwrap();
+        let signs = CString::new("signs").unwrap();
+        let centroids = CString::new("centroids").unwrap();
+        let keys_out = CString::new("keys_out").unwrap();
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, packed_in.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, sigma_in.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, mean_in.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, signs.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, centroids.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, keys_out.as_ptr());
+        let source = CString::new(TQ_DECOMPRESS_4BIT_KERNEL).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("tq_decompress_4bit").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Compress an `[N, D]` (or any flattened `[*, D]`) BF16/F16/F32 keys
+/// tensor into TurboQuant 4-bit form. Returns
+/// `(packed [N, D/8] u32, sigma [N] f32, mean [N] f32)`.
+///
+/// `signs` is a `[D]` f32 tensor of +/- 1 values (use
+/// `turboquant::cached_signs(dim, seed)`).
+pub fn tq_compress_4bit(
+    keys: &Array,
+    signs: &Array,
+    boundaries: &Array,
+) -> Result<(Array, Array, Array), Exception> {
+    let shape = keys.shape();
+    if shape.len() < 2 {
+        return Err(Exception::custom(format!(
+            "tq_compress_4bit expects rank >= 2 input [..., D], got {:?}",
+            shape
+        )));
+    }
+    let d = *shape.last().unwrap();
+    if d % 8 != 0 {
+        return Err(Exception::custom(format!(
+            "tq_compress_4bit requires head_dim divisible by 8, got {d}"
+        )));
+    }
+    if d > 512 {
+        return Err(Exception::custom(format!(
+            "tq_compress_4bit shared-mem cap is 512 floats, got D={d}"
+        )));
+    }
+    let n_vectors: i32 = shape.iter().take(shape.len() - 1).product();
+    let packed_cols = d / 8;
+    let kernel = TQ_COMPRESS_4BIT_KERNEL_HANDLE.get_or_init(create_tq_compress_4bit_kernel);
+
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        let d_name = CString::new("D").unwrap();
+        let n_name = CString::new("n_vectors").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, d_name.as_ptr(), d,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, n_name.as_ptr(), n_vectors,
+        );
+        // Grid is in TOTAL threads (matches fused_swiglu pattern): we want
+        // `n_vectors` threadgroups × 64 threads = 64 * n_vectors threads.
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config, 64 * n_vectors.max(1), 1, 1,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+
+        // Outputs in declaration order: packed_out (u32), sigma_out (f32), mean_out (f32).
+        let packed_shape: [i32; 2] = [n_vectors, packed_cols];
+        let sigma_shape: [i32; 1] = [n_vectors];
+        let mean_shape: [i32; 1] = [n_vectors];
+        let u32_dtype: u32 = mlx_rs::Dtype::Uint32.into();
+        let f32_dtype: u32 = mlx_rs::Dtype::Float32.into();
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, packed_shape.as_ptr(), packed_shape.len(), u32_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, sigma_shape.as_ptr(), sigma_shape.len(), f32_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, mean_shape.as_ptr(), mean_shape.len(), f32_dtype,
+        );
+
+        // Ensure inputs are f32 — the kernel hardcodes float reads.
+        let keys_f32 = keys.as_dtype(mlx_rs::Dtype::Float32)?;
+        let signs_f32 = signs.as_dtype(mlx_rs::Dtype::Float32)?;
+        let boundaries_f32 = boundaries.as_dtype(mlx_rs::Dtype::Float32)?;
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, keys_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, signs_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, boundaries_f32.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("tq_compress_4bit kernel failed"));
+        }
+        let mut packed = mlx_sys::mlx_array_new();
+        let mut sigma = mlx_sys::mlx_array_new();
+        let mut mean = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut packed, outputs, 0);
+        mlx_sys::mlx_vector_array_get(&mut sigma, outputs, 1);
+        mlx_sys::mlx_vector_array_get(&mut mean, outputs, 2);
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+        Ok((
+            Array::from_ptr(packed),
+            Array::from_ptr(sigma),
+            Array::from_ptr(mean),
+        ))
+    }
+}
+
+/// Decompress a TurboQuant 4-bit key block into a `[N, D]` tensor of
+/// dtype `out_dtype` (BF16/F16/F32). Shape `out_shape` should match the
+/// original shape passed to `tq_compress_4bit`.
+pub fn tq_decompress_4bit(
+    packed: &Array,
+    sigma: &Array,
+    mean: &Array,
+    signs: &Array,
+    centroids: &Array,
+    out_shape: &[i32],
+    out_dtype: mlx_rs::Dtype,
+) -> Result<Array, Exception> {
+    if out_shape.len() < 2 {
+        return Err(Exception::custom(format!(
+            "tq_decompress_4bit out_shape must be rank >= 2, got {out_shape:?}",
+        )));
+    }
+    let d = *out_shape.last().unwrap();
+    if d % 8 != 0 || d > 512 {
+        return Err(Exception::custom(format!(
+            "tq_decompress_4bit: D must be ≤ 512 and div by 8, got {d}"
+        )));
+    }
+    let n_vectors: i32 = out_shape.iter().take(out_shape.len() - 1).product();
+    let kernel = TQ_DECOMPRESS_4BIT_KERNEL_HANDLE.get_or_init(create_tq_decompress_4bit_kernel);
+    let dtype: u32 = out_dtype.into();
+
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype,
+        );
+        let d_name = CString::new("D").unwrap();
+        let n_name = CString::new("n_vectors").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, d_name.as_ptr(), d,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config, n_name.as_ptr(), n_vectors,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config, 64 * n_vectors.max(1), 1, 1,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, out_shape.as_ptr(), out_shape.len(), dtype,
+        );
+
+        let signs_f32 = signs.as_dtype(mlx_rs::Dtype::Float32)?;
+        let centroids_f32 = centroids.as_dtype(mlx_rs::Dtype::Float32)?;
+        let sigma_f32 = sigma.as_dtype(mlx_rs::Dtype::Float32)?;
+        let mean_f32 = mean.as_dtype(mlx_rs::Dtype::Float32)?;
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, packed.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, sigma_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, mean_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, signs_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, centroids_f32.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("tq_decompress_4bit kernel failed"));
+        }
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+        Ok(Array::from_ptr(result))
+    }
+}
+
 fn create_per_position_rope_kernel() -> MetalKernel {
     unsafe {
         let in_name = CString::new("in_buf").unwrap();
