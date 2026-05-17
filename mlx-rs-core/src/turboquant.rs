@@ -239,6 +239,121 @@ mod tests {
     }
 
     #[test]
+    fn fused_sdpa_matches_reference() {
+        // Validates fused SDPA against a CPU reference implementation
+        // (softmax(Q·K_recon^T * scale) @ V) on a small GQA toy.
+        use crate::metal_kernels::{tq_compress_4bit, tq_decompress_4bit, tq_sdpa_4bit};
+        let d = 64i32;
+        let kv = 6i32;
+        let h_q = 4i32;
+        let h_kv = 2i32;
+        let kv_repeat = h_q / h_kv;
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        // Build K, V, Q.
+        let mut k_data = Vec::with_capacity((h_kv * kv * d) as usize);
+        for v in 0..(h_kv * kv) {
+            for i in 0..d {
+                k_data.push(((v as f32) * 0.11 + (i as f32) * 0.03).sin() * 0.7);
+            }
+        }
+        let mut v_data = Vec::with_capacity((h_kv * kv * d) as usize);
+        for v in 0..(h_kv * kv) {
+            for i in 0..d {
+                v_data.push(((v as f32) * 0.07 + (i as f32) * 0.05).cos() * 0.5);
+            }
+        }
+        let mut q_data = Vec::with_capacity((h_q * d) as usize);
+        for h in 0..h_q {
+            for i in 0..d {
+                q_data.push(((h as f32) * 0.13 + (i as f32) * 0.04).cos() * 0.6);
+            }
+        }
+
+        let k_arr = mlx_rs::Array::from_slice(&k_data, &[1, h_kv, kv, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let v_arr = mlx_rs::Array::from_slice(&v_data, &[1, h_kv, kv, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let q_arr = mlx_rs::Array::from_slice(&q_data, &[1, h_q, 1, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+
+        // Compress K.
+        let signs_vec = cached_signs(d, 42);
+        let signs = mlx_rs::Array::from_slice(&signs_vec, &[d]);
+        let boundaries = mlx_rs::Array::from_slice(&BOUNDARIES_4BIT, &[15]);
+        let centroids = mlx_rs::Array::from_slice(&CENTROIDS_4BIT, &[16]);
+        let (packed, sigma, mean) = tq_compress_4bit(&k_arr, &signs, &boundaries).unwrap();
+        let packed = packed.reshape(&[1, h_kv, kv, d / 8]).unwrap();
+        let sigma = sigma.reshape(&[1, h_kv, kv]).unwrap();
+        let mean = mean.reshape(&[1, h_kv, kv]).unwrap();
+
+        // Reference: decompress K, compute attention manually.
+        let k_recon = tq_decompress_4bit(
+            &packed, &sigma, &mean, &signs, &centroids,
+            &[1, h_kv, kv, d], mlx_rs::Dtype::Float32,
+        ).unwrap();
+        mlx_rs::transforms::eval([&k_recon, &v_arr, &q_arr]).unwrap();
+        let k_slice = k_recon.as_slice::<f32>();
+        let v_slice = v_arr.as_slice::<f32>();
+        let q_slice = q_arr.as_slice::<f32>();
+        let mut ref_out = vec![0f32; (h_q * d) as usize];
+        for hq in 0..h_q {
+            let hkv = hq / kv_repeat;
+            // Scores [kv].
+            let mut scores = vec![0f32; kv as usize];
+            for k in 0..kv {
+                let mut acc = 0f32;
+                for i in 0..d {
+                    acc += q_slice[(hq * d + i) as usize]
+                         * k_slice[((hkv * kv + k) * d + i) as usize];
+                }
+                scores[k as usize] = acc * scale;
+            }
+            // Softmax.
+            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0f32;
+            let mut exps = vec![0f32; kv as usize];
+            for k in 0..kv {
+                let e = (scores[k as usize] - mx).exp();
+                exps[k as usize] = e;
+                sum += e;
+            }
+            for e in exps.iter_mut() { *e /= sum; }
+            // V multiply.
+            for k in 0..kv {
+                for i in 0..d {
+                    ref_out[(hq * d + i) as usize] +=
+                        exps[k as usize] * v_slice[((hkv * kv + k) * d + i) as usize];
+                }
+            }
+        }
+
+        // Fused path.
+        let fused = tq_sdpa_4bit(
+            &q_arr, &packed, &sigma, &mean, &v_arr, &signs, &centroids,
+            None, scale, kv_repeat,
+        ).unwrap();
+        mlx_rs::transforms::eval([&fused]).unwrap();
+        let fused_slice = fused.as_slice::<f32>();
+        assert_eq!(fused_slice.len(), ref_out.len());
+
+        // Tolerance: 1% relative + 0.01 absolute.
+        let mut worst = 0f32;
+        let mut worst_pos = 0;
+        for i in 0..ref_out.len() {
+            let abs = (ref_out[i] - fused_slice[i]).abs();
+            if abs < 0.01 { continue; }
+            let rel = abs / ref_out[i].abs().max(1.0);
+            if rel > worst { worst = rel; worst_pos = i; }
+        }
+        assert!(
+            worst < 0.01,
+            "fused SDPA vs ref rel-error at {worst_pos} = {worst}; ref={} fused={}",
+            ref_out[worst_pos], fused_slice[worst_pos],
+        );
+    }
+
+    #[test]
     fn fused_qk_score_matches_dequantize_matmul() {
         // Validates the algebraic identity:
         //   tq_qk_score(Q, packed, sigma, mean, signs, centroids) ≈

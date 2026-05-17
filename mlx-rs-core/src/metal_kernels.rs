@@ -430,6 +430,359 @@ const TQ_QK_SCORE_KERNEL: &str = r#"
 
 static TQ_QK_SCORE_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
 
+// =============================================================================
+// Fully-fused TurboQuant SDPA kernel
+// =============================================================================
+//
+// One Metal dispatch that does QK score (from compressed K) + softmax +
+// V matmul. Replaces the prior 3-dispatch sequence used by
+// `try_fused_attention` so the K-decompress savings actually show up
+// on the decode wall-clock at short contexts.
+//
+// Layout: one threadgroup per (b, h_q). 64 threads collaborate:
+//   - Threads cooperate on Q pre-rotation (sign flip + WHT in shared mem).
+//   - Each thread strides over kv positions for the score loop, writing
+//     into a shared [KV] scratch buffer.
+//   - Cooperative reduce for softmax max / sum.
+//   - Each thread accumulates the V multiply for its D slice.
+//
+// Constraints:
+//   - q_len = 1 (decode hot path).
+//   - kv_len ≤ MAX_KV_BUF (4096 by default — bounded by threadgroup
+//     memory: 4096 * 4 bytes = 16 KB for the scores scratch).
+//   - head_dim ≤ 512 (matches the WHT shared-mem cap).
+//
+// Inputs:
+//   q          [B, Hq, 1, D]     T (BF16/F16/F32 templated)
+//   packed_k   [B, Hkv, KV, D/8] u32
+//   sigma_k    [B, Hkv, KV]      f32
+//   mean_k     [B, Hkv, KV]      f32
+//   v          [B, Hkv, KV, D]   T
+//   signs      [D]               f32
+//   centroids  [16]              f32
+//   mask       [KV] or empty     f32 (broadcast over all q heads)
+//
+// Output:
+//   out        [B, Hq, 1, D]     T
+const TQ_SDPA_4BIT_KERNEL: &str = r#"
+    uint tid = thread_position_in_threadgroup.x;
+    uint group = threadgroup_position_in_grid.x;
+    uint b   = group / uint(Hq);
+    uint h_q = group % uint(Hq);
+    if (b >= uint(B)) return;
+    uint h_kv = h_q / uint(kv_repeat);
+
+    threadgroup float s_q[512];
+    threadgroup float s_centroids[16];
+    threadgroup float s_scores[4096]; // hard-capped MAX_KV_BUF
+    threadgroup float s_red[64];
+    threadgroup float s_query_sum;
+    threadgroup float s_global_max;
+    threadgroup float s_total_sum;
+
+    // Centroid table → shared.
+    if (tid < 16u) s_centroids[tid] = centroids[tid];
+    // Load Q * signs.
+    uint q_offset = (b * uint(Hq) + h_q) * uint(D);
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        s_q[i] = float(q[q_offset + i]) * signs[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // query_sum_signed = sum(s_q).
+    float local_sum = 0.0f;
+    for (uint i = tid; i < uint(D); i += uint(64)) local_sum += s_q[i];
+    s_red[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) s_red[tid] += s_red[tid + 32];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 16) s_red[tid] += s_red[tid + 16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  8) s_red[tid] += s_red[tid +  8];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  4) s_red[tid] += s_red[tid +  4];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  2) s_red[tid] += s_red[tid +  2];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { s_red[0] += s_red[1]; s_query_sum = s_red[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float query_sum_signed = s_query_sum;
+
+    // In-place WHT.
+    for (uint step = 1u; step < uint(D); step <<= 1u) {
+        for (uint i = tid; i < uint(D) / 2u; i += uint(64)) {
+            uint j = (i / step) * (step * 2u) + (i % step);
+            uint k = j + step;
+            float a = s_q[j];
+            float b2 = s_q[k];
+            s_q[j] = a + b2;
+            s_q[k] = a - b2;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float wht_scale = metal::rsqrt(float(D));
+    for (uint i = tid; i < uint(D); i += uint(64)) s_q[i] *= wht_scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 1: score per kv position into s_scores, track local max.
+    uint packed_per_vec = uint(D) / 8u;
+    uint kv_stride_inner = packed_per_vec;
+    uint kv_stride_h     = uint(KV) * kv_stride_inner;
+    uint kv_stride_b     = uint(Hkv) * kv_stride_h;
+    uint meta_stride_h   = uint(KV);
+    uint meta_stride_b   = uint(Hkv) * meta_stride_h;
+    float local_max = -1e30f;
+    for (uint k = tid; k < uint(KV); k += uint(64)) {
+        uint base = b * kv_stride_b + h_kv * kv_stride_h + k * kv_stride_inner;
+        float dot = 0.0f;
+        for (uint w = 0u; w < packed_per_vec; ++w) {
+            uint packed = packed_k[base + w];
+            uint d0 = w * 8u;
+            dot += s_q[d0 + 0u] * s_centroids[(packed >>  0u) & 0xFu];
+            dot += s_q[d0 + 1u] * s_centroids[(packed >>  4u) & 0xFu];
+            dot += s_q[d0 + 2u] * s_centroids[(packed >>  8u) & 0xFu];
+            dot += s_q[d0 + 3u] * s_centroids[(packed >> 12u) & 0xFu];
+            dot += s_q[d0 + 4u] * s_centroids[(packed >> 16u) & 0xFu];
+            dot += s_q[d0 + 5u] * s_centroids[(packed >> 20u) & 0xFu];
+            dot += s_q[d0 + 6u] * s_centroids[(packed >> 24u) & 0xFu];
+            dot += s_q[d0 + 7u] * s_centroids[(packed >> 28u) & 0xFu];
+        }
+        uint meta = b * meta_stride_b + h_kv * meta_stride_h + k;
+        float sigma = sigma_k[meta];
+        float mean  = mean_k[meta];
+        // Q has been pre-scaled by `scale` on the host (Metal custom
+        // kernels don't take f32 template args). sigma and mean act
+        // linearly on Q so the scale flows through both terms.
+        float score = sigma * dot + mean * query_sum_signed;
+        if (has_mask != 0) score += mask[k];
+        s_scores[k] = score;
+        local_max = metal::max(local_max, score);
+    }
+    s_red[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) s_red[tid] = metal::max(s_red[tid], s_red[tid + 32]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 16) s_red[tid] = metal::max(s_red[tid], s_red[tid + 16]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  8) s_red[tid] = metal::max(s_red[tid], s_red[tid +  8]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  4) s_red[tid] = metal::max(s_red[tid], s_red[tid +  4]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  2) s_red[tid] = metal::max(s_red[tid], s_red[tid +  2]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { s_red[0] = metal::max(s_red[0], s_red[1]); s_global_max = s_red[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gmax = s_global_max;
+
+    // Phase 2: exp(score - max), sum.
+    float local_sum_exp = 0.0f;
+    for (uint k = tid; k < uint(KV); k += uint(64)) {
+        float e = metal::exp(s_scores[k] - gmax);
+        s_scores[k] = e;
+        local_sum_exp += e;
+    }
+    s_red[tid] = local_sum_exp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) s_red[tid] += s_red[tid + 32];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 16) s_red[tid] += s_red[tid + 16];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  8) s_red[tid] += s_red[tid +  8];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  4) s_red[tid] += s_red[tid +  4];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid <  2) s_red[tid] += s_red[tid +  2];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { s_red[0] += s_red[1]; s_total_sum = s_red[0]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_total = 1.0f / s_total_sum;
+
+    // Phase 3: V multiply. Per-dim accumulate over kv.
+    uint v_inner = uint(D);
+    uint v_h     = uint(KV) * v_inner;
+    uint v_b     = uint(Hkv) * v_h;
+    uint v_base  = b * v_b + h_kv * v_h;
+    uint out_offset = (b * uint(Hq) + h_q) * uint(D);
+    for (uint d = tid; d < uint(D); d += uint(64)) {
+        float acc = 0.0f;
+        for (uint k = 0u; k < uint(KV); ++k) {
+            acc += s_scores[k] * inv_total * float(v[v_base + k * v_inner + d]);
+        }
+        out[out_offset + d] = T(acc);
+    }
+"#;
+
+static TQ_SDPA_4BIT_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_tq_sdpa_4bit_kernel() -> MetalKernel {
+    unsafe {
+        let q = CString::new("q").unwrap();
+        let packed_k = CString::new("packed_k").unwrap();
+        let sigma_k = CString::new("sigma_k").unwrap();
+        let mean_k = CString::new("mean_k").unwrap();
+        let v = CString::new("v").unwrap();
+        let signs = CString::new("signs").unwrap();
+        let centroids = CString::new("centroids").unwrap();
+        let mask = CString::new("mask").unwrap();
+        let out = CString::new("out").unwrap();
+
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, q.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, packed_k.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, sigma_k.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, mean_k.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, v.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, signs.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, centroids.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, mask.as_ptr());
+
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, out.as_ptr());
+
+        let source = CString::new(TQ_SDPA_4BIT_KERNEL).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("tq_sdpa_4bit").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Maximum kv_len the fused SDPA kernel supports per call (4096; bounded
+/// by threadgroup scratch memory).
+pub const TQ_SDPA_MAX_KV: i32 = 4096;
+
+/// Fully-fused TurboQuant SDPA: one Metal dispatch does
+/// QK-score-from-compressed-K + softmax + V matmul. Returns
+/// `[B, Hq, 1, D]` in the same dtype as Q.
+///
+/// `mask` is optional; pass `None` for no mask, or a `[KV]` f32 tensor
+/// of additive log-prob mask values that broadcasts over all query
+/// heads / batches.
+pub fn tq_sdpa_4bit(
+    q: &Array,
+    packed_k: &Array,
+    sigma_k: &Array,
+    mean_k: &Array,
+    v: &Array,
+    signs: &Array,
+    centroids: &Array,
+    mask: Option<&Array>,
+    scale: f32,
+    kv_repeat: i32,
+) -> Result<Array, Exception> {
+    let qs = q.shape();
+    if qs.len() != 4 || qs[2] != 1 {
+        return Err(Exception::custom(format!(
+            "tq_sdpa_4bit expects Q [B, Hq, 1, D], got {qs:?}",
+        )));
+    }
+    let b = qs[0];
+    let h_q = qs[1];
+    let d = qs[3];
+    let ps = packed_k.shape();
+    if ps.len() != 4 || ps[3] != d / 8 {
+        return Err(Exception::custom(format!(
+            "tq_sdpa_4bit packed_k shape mismatch, got {ps:?} for D={d}",
+        )));
+    }
+    let h_kv = ps[1];
+    let kv = ps[2];
+    if h_q != h_kv * kv_repeat {
+        return Err(Exception::custom(format!(
+            "GQA mismatch: Hq={h_q}, Hkv={h_kv}, kv_repeat={kv_repeat}",
+        )));
+    }
+    if kv > TQ_SDPA_MAX_KV {
+        return Err(Exception::custom(format!(
+            "tq_sdpa_4bit kv_len {kv} exceeds MAX={TQ_SDPA_MAX_KV}; fall back to non-fused",
+        )));
+    }
+    if d > 512 || d % 8 != 0 {
+        return Err(Exception::custom(format!("D must be ≤ 512, div by 8; got {d}")));
+    }
+    let dtype: u32 = q.dtype().into();
+    // Pre-scale Q so the kernel doesn't have to take an f32 constant.
+    let scale_arr = mlx_rs::array!(scale).as_dtype(q.dtype())?;
+    let q_f = q.multiply(&scale_arr)?;
+    let v_f = v.as_dtype(q.dtype())?;
+    let signs_f32 = signs.as_dtype(mlx_rs::Dtype::Float32)?;
+    let centroids_f32 = centroids.as_dtype(mlx_rs::Dtype::Float32)?;
+    let sigma_f32 = sigma_k.as_dtype(mlx_rs::Dtype::Float32)?;
+    let mean_f32 = mean_k.as_dtype(mlx_rs::Dtype::Float32)?;
+    let (has_mask, mask_arr) = match mask {
+        Some(m) => (1i32, m.as_dtype(mlx_rs::Dtype::Float32)?),
+        None => (0i32, mlx_rs::Array::from_slice::<f32>(&[0.0], &[1])),
+    };
+
+    let kernel = TQ_SDPA_4BIT_KERNEL_HANDLE.get_or_init(create_tq_sdpa_4bit_kernel);
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype,
+        );
+        for (name, value) in [
+            ("D", d), ("Hq", h_q), ("Hkv", h_kv), ("KV", kv), ("B", b),
+            ("kv_repeat", kv_repeat), ("has_mask", has_mask),
+        ] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        // Pre-scale Q on the host (kernels don't accept f32 template args).
+        // Done after the dtype conversion above using mlx ops.
+        let _ = scale;
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config, 64 * b * h_q, 1, 1,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+
+        let out_shape: [i32; 4] = [b, h_q, 1, d];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, out_shape.as_ptr(), out_shape.len(), dtype,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, q_f.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, packed_k.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, sigma_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, mean_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, v_f.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, signs_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, centroids_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, mask_arr.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("tq_sdpa_4bit kernel failed"));
+        }
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+        Ok(Array::from_ptr(result))
+    }
+}
+
 fn create_tq_qk_score_kernel() -> MetalKernel {
     unsafe {
         let q_in = CString::new("q_in").unwrap();

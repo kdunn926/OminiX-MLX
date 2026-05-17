@@ -434,6 +434,13 @@ pub struct TurboQuantKVCache {
 
 impl TurboQuantKVCache {
     pub fn new() -> Self {
+        // Default sink size from env (TURBOQUANT_SINK_TOKENS, defaults to 4).
+        // Set to 0 to exclusively use the fully-fused SDPA path on the
+        // entire compressed bulk.
+        let sink_tokens: i32 = std::env::var("TURBOQUANT_SINK_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
         Self {
             packed_keys: None,
             key_sigma: None,
@@ -443,7 +450,7 @@ impl TurboQuantKVCache {
             v_scales: None,
             v_biases: None,
             sink_values: None,
-            sink_tokens: 4,
+            sink_tokens,
             v_group_size: 64,
             v_bits: 8,
             offset: 0,
@@ -735,29 +742,14 @@ impl KeyValueCache for TurboQuantKVCache {
         if qs.len() != 4 || qs[2] != 1 {
             return Ok(None);
         }
-        // Gate: fused path adds 2-3 extra Metal dispatches per attention
-        // call (QK score, softmax, V matmul) vs the stock SDPA single
-        // dispatch on dequantized K. The K-data-movement savings only
-        // pay off when kv_len is large enough that K bytes dominate
-        // kernel-launch overhead. Default threshold: 512 kv positions.
-        // Override via env var TURBOQUANT_FUSED_KV_MIN=N.
-        let kv_min: i32 = std::env::var("TURBOQUANT_FUSED_KV_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(512);
-        let projected_kv_len = self.offset + k_new.shape()[2];
-        if projected_kv_len < kv_min {
-            return Ok(None);
-        }
         let b = qs[0];
         let h_q = qs[1];
         let d = qs[3];
         let dtype = q.dtype();
 
-        // 1. Append new K/V via the existing update logic.
+        // Append the new block first so subsequent reasoning sees the
+        // updated offset and the right sink/bulk split.
         let _ = self.update_and_fetch(k_new, v_new)?;
-        // After update_and_fetch, self.offset is up to date and the
-        // compressed bulk / sink buffers cover [0, offset).
 
         let n_sink = self
             .sink_keys
@@ -765,6 +757,46 @@ impl KeyValueCache for TurboQuantKVCache {
             .map(|s| s.shape()[2])
             .unwrap_or(0);
         let n_bulk = self.offset - n_sink;
+
+        // FAST PATH: fully-fused single-dispatch SDPA. Requires:
+        //   - no sink tokens (set TURBOQUANT_SINK_TOKENS=0)
+        //   - bulk fits in the kernel's scratch buffer (TQ_SDPA_MAX_KV)
+        //   - kv_len ≥ TURBOQUANT_FUSED_KV_MIN.
+        //
+        // Default kv_min is high (8192) because at small kv_len the
+        // single-threadgroup-per-head design (8 thread-groups × 64
+        // threads = 512 threads total) underutilises the GPU vs stock
+        // mlx SDPA which schedules thousands of threadgroups. The fused
+        // kernel becomes a win only at long contexts where K-decompress
+        // bytes dominate kernel-launch + V-matmul costs.
+        let fused_min: i32 = std::env::var("TURBOQUANT_FUSED_KV_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let bulk_ok = n_sink == 0
+            && n_bulk >= fused_min
+            && n_bulk <= crate::metal_kernels::TQ_SDPA_MAX_KV;
+        if bulk_ok {
+            let packed = self.packed_keys.as_ref().unwrap();
+            let sigma = self.key_sigma.as_ref().unwrap();
+            let mean = self.key_mean.as_ref().unwrap();
+            // V is still stored compressed (8-bit per-group); reconstruct
+            // once and hand to the SDPA kernel. Fusing V dequant into the
+            // same kernel is the next deferred item.
+            let v_full = self.reconstruct_values(dtype)?;
+            let signs_vec = cached_signs(d, self.seed);
+            let signs = Array::from_slice(&signs_vec, &[d]);
+            let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+            let out = crate::metal_kernels::tq_sdpa_4bit(
+                q, packed, sigma, mean, &v_full,
+                &signs, &centroids, mask, scale, kv_repeat,
+            )?;
+            return Ok(Some(out));
+        }
+
+        // SLOW PATH: partially-fused (QK kernel + standalone softmax + V
+        // matmul) handles sink-token mixtures and oversized contexts.
+        // The cache was already updated at the top of this method.
 
         // 2. Score the sink (BF16) prefix via a standard matmul.
         // Output shape: [B, Hq, 1, n_sink].
