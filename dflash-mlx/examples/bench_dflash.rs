@@ -15,11 +15,10 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use dflash_mlx::{
     build_tree, discover_draft_for_target, topk_per_position, verify_tree_naive,
-    DFlashDraftAdapter, DFlashDraftModel, DFlashSession, DraftCheckpointInfo, DraftModel,
-    Gemma4TargetAdapter, MockDraftAdapter, Qwen36TargetAdapter, SessionMetrics,
-    SpeculativeCycleConfig, TargetModel,
+    DDTreeConfig, DFlashDraftAdapter, DFlashDraftModel, DFlashSession, DraftCheckpointInfo,
+    DraftModel, Gemma4TargetAdapter, GemmaTreeTarget, MockDraftAdapter, Qwen36TargetAdapter,
+    SessionMetrics, SpeculativeCycleConfig, TargetModel,
 };
-use dflash_mlx::engine::ddtree::{verify_tree_fused, GemmaTreeTarget};
 use mlx_rs::ops::indexing::IndexOp;
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
 
@@ -252,10 +251,44 @@ where
     ))
 }
 
-/// DDTree run loop. Builds a budget-N tree from draft logits per cycle and
-/// verifies each tree branch sequentially (snapshot/restore between
-/// branches) before walking to the longest accepted path.
-fn run_ddtree<T: TargetModel + GemmaTreeTarget, D: DraftModel>(
+/// Run the DDTree path through the DFlashSession integration. Wraps the
+/// iterator returned by `run_generate_ddtree` and tallies timing.
+fn run_dflash_ddtree<T, D>(
+    session: &mut DFlashSession<T, D>,
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    temp: f32,
+    eos_tokens: &HashSet<u32>,
+) -> Result<(RunStats, SessionMetrics)>
+where
+    T: TargetModel + GemmaTreeTarget,
+    D: DraftModel,
+{
+    let start = Instant::now();
+    let mut ttft = None;
+    let mut total_tokens = 0usize;
+    let eos_vec: Vec<u32> = eos_tokens.iter().copied().collect();
+    for token in session.run_generate_ddtree(prompt_tokens, max_tokens, temp, &eos_vec) {
+        let token_id = token?;
+        if ttft.is_none() {
+            ttft = Some(start.elapsed().as_secs_f64());
+        }
+        if eos_tokens.contains(&token_id) {
+            break;
+        }
+        total_tokens += 1;
+    }
+    Ok((
+        finalize_stats(start, ttft, total_tokens),
+        session.metrics().clone(),
+    ))
+}
+
+/// DDTree naive driver — kept as a separate path for measurement
+/// comparison (verifies each tree branch with KV snapshot/restore between
+/// branches). Production code should prefer the fused integrated path
+/// via `DFlashSession::run_generate_ddtree`.
+fn run_ddtree_naive<T: TargetModel + GemmaTreeTarget, D: DraftModel>(
     target: &mut T,
     draft: &mut D,
     prompt_tokens: Vec<u32>,
@@ -265,7 +298,6 @@ fn run_ddtree<T: TargetModel + GemmaTreeTarget, D: DraftModel>(
     block_size: usize,
     tree_budget: usize,
     tree_topk: usize,
-    fused: bool,
 ) -> Result<(RunStats, SessionMetrics)> {
     let start = Instant::now();
     let prompt_arr = mlx_rs::Array::from_slice(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
@@ -281,20 +313,6 @@ fn run_ddtree<T: TargetModel + GemmaTreeTarget, D: DraftModel>(
     mlx_rs::transforms::eval([&first_tok_arr])?;
     let first_token = first_tok_arr.item::<u32>();
     let ttft = start.elapsed().as_secs_f64();
-
-    // Install first_token in target's KV cache and capture the predicted
-    // token AFTER first_token. Used by fused DDTree as the "root_pred" for
-    // accept_path's seed comparison.
-    let first_arr = mlx_rs::Array::from_slice(&[first_token], &[1, 1]);
-    let first_post_logits = target.verify(&first_arr)?;
-    mlx_rs::transforms::eval([&first_post_logits])?;
-    let root_pred_arr = mlx_rs::argmax_axis!(
-        first_post_logits.index((.., -1, ..)).reshape(&[-1])?,
-        -1
-    )?
-    .as_dtype(mlx_rs::Dtype::Uint32)?;
-    mlx_rs::transforms::eval([&root_pred_arr])?;
-    let mut root_pred = root_pred_arr.item::<u32>();
 
     let mut emitted: Vec<u32> = vec![first_token];
     let mut last_token = first_token;
@@ -325,70 +343,9 @@ fn run_ddtree<T: TargetModel + GemmaTreeTarget, D: DraftModel>(
         let kv_offset = target.step_count() as i32;
         let start_pos = kv_offset; // seed token at absolute position kv_offset
 
-        let (accepted, bonus) = if fused {
-            // One fused tree forward → per-node logits + per-node hidden.
-            let (tokens, position_ids, mask) = dflash_mlx::engine::ddtree::compile_tree_inputs(
-                last_token, &tree, start_pos, kv_offset, mlx_rs::Dtype::Bfloat16,
-            )?;
-            let (tree_logits, tree_hidden) = target
-                .verify_tree_with_hidden_call(&tokens, &position_ids, &mask)?;
-            mlx_rs::transforms::eval([&tree_logits, &tree_hidden])?;
-
-            // Acceptance walk.
-            let preds = mlx_rs::argmax_axis!(&tree_logits, -1)?
-                .as_dtype(mlx_rs::Dtype::Uint32)?
-                .reshape(&[-1])?;
-            mlx_rs::transforms::eval([&preds])?;
-            let preds_slice = preds.as_slice::<u32>();
-            let predicted_after_node: Vec<u32> = preds_slice.to_vec();
-            let (acc, bonus_tok) =
-                dflash_mlx::engine::ddtree::accept_path(&tree, &predicted_after_node, root_pred);
-
-            // In-place interior KV compaction: keep just the accepted
-            // node slots (positions kv_offset + acc[0], +acc[1], ...).
-            // Then capture bonus's "next root pred" from the LAST
-            // accepted node's hidden via lm_head, or fall back to the
-            // tree's seed-based root_pred when nothing accepted (bonus
-            // is then just root_pred and the cycle commits only that).
-            if acc.is_empty() {
-                // Nothing accepted ⇒ keep no tree slots. Bonus must still
-                // get its K/V installed before the next cycle.
-                target.compact_cache_call(
-                    kv_offset,
-                    &mlx_rs::Array::from_slice::<i32>(&[], &[0]),
-                )?;
-                let bonus_arr = mlx_rs::Array::from_slice(&[bonus_tok], &[1, 1]);
-                let bonus_logits = target.verify(&bonus_arr)?;
-                mlx_rs::transforms::eval([&bonus_logits])?;
-                let next_root_arr = mlx_rs::argmax_axis!(
-                    bonus_logits.index((.., -1, ..)).reshape(&[-1])?,
-                    -1
-                )?
-                .as_dtype(mlx_rs::Dtype::Uint32)?;
-                mlx_rs::transforms::eval([&next_root_arr])?;
-                root_pred = next_root_arr.item::<u32>();
-            } else {
-                let keep_idx_i32: Vec<i32> = acc.iter().map(|&i| i as i32).collect();
-                let keep_arr = mlx_rs::Array::from_slice(
-                    &keep_idx_i32,
-                    &[keep_idx_i32.len() as i32],
-                );
-                target.compact_cache_call(kv_offset, &keep_arr)?;
-                // Now feed bonus alone (1 token) to install its K/V and
-                // grab next-cycle root_pred from its post-norm hidden.
-                let bonus_arr = mlx_rs::Array::from_slice(&[bonus_tok], &[1, 1]);
-                let bonus_logits = target.verify(&bonus_arr)?;
-                mlx_rs::transforms::eval([&bonus_logits])?;
-                let next_root_arr = mlx_rs::argmax_axis!(
-                    bonus_logits.index((.., -1, ..)).reshape(&[-1])?,
-                    -1
-                )?
-                .as_dtype(mlx_rs::Dtype::Uint32)?;
-                mlx_rs::transforms::eval([&next_root_arr])?;
-                root_pred = next_root_arr.item::<u32>();
-            }
-            (acc, bonus_tok)
-        } else {
+        let _ = start_pos;
+        let _ = kv_offset;
+        let (accepted, bonus) = {
             let (acc, bonus_tok, _accepted_tokens) =
                 verify_tree_naive(target, last_token, &tree)?;
             (acc, bonus_tok)
@@ -580,18 +537,38 @@ fn run_gemma4(
                     "DDTree mode: budget={} topk={} block_size={} fused={}",
                     args.ddtree.budget, args.ddtree.topk, block_size, args.ddtree.fused
                 );
-                run_ddtree(
-                    &mut target,
-                    &mut draft,
-                    prompt_ids,
-                    args.max_tokens,
-                    args.temp,
-                    &eos_tokens,
-                    block_size,
-                    args.ddtree.budget,
-                    args.ddtree.topk,
-                    args.ddtree.fused,
-                )?
+                if args.ddtree.fused {
+                    // Production path: DDTree integrated into DFlashSession.
+                    let spec_config = SpeculativeCycleConfig {
+                        block_len: block_size,
+                        ddtree: Some(DDTreeConfig {
+                            tree_budget: args.ddtree.budget,
+                            tree_topk: args.ddtree.topk,
+                        }),
+                        ..Default::default()
+                    };
+                    let mut session = DFlashSession::new(target, draft, spec_config);
+                    run_dflash_ddtree(
+                        &mut session,
+                        prompt_ids,
+                        args.max_tokens,
+                        args.temp,
+                        &eos_tokens,
+                    )?
+                } else {
+                    // Naive path: kept for measurement comparison only.
+                    run_ddtree_naive(
+                        &mut target,
+                        &mut draft,
+                        prompt_ids,
+                        args.max_tokens,
+                        args.temp,
+                        &eos_tokens,
+                        block_size,
+                        args.ddtree.budget,
+                        args.ddtree.topk,
+                    )?
+                }
             } else {
                 let spec_config = SpeculativeCycleConfig {
                     block_len: block_size,

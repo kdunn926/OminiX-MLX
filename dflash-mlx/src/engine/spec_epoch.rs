@@ -453,6 +453,294 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
     }
 }
 
+// ============================================================================
+// DDTree (tree-shaped speculative decoding) integration
+// ============================================================================
+
+impl<Target, Draft> DFlashSession<Target, Draft>
+where
+    Target: TargetModel + crate::engine::ddtree::GemmaTreeTarget,
+    Draft: DraftModel,
+{
+    /// DDTree variant of `run_generate`.
+    ///
+    /// Uses the DFlash drafter to produce per-position logits, builds a
+    /// budget-N tree from them, runs a single fused tree forward on the
+    /// target with a custom visibility mask + per-token position_ids,
+    /// walks the tree to accept the longest matching path, then compacts
+    /// the cache in-place (keeping only the accepted slots) and runs a
+    /// 1-token verify on the bonus to install its K/V and capture the
+    /// next-cycle root_pred.
+    ///
+    /// Falls back to plain `run_generate` semantics if `config.ddtree`
+    /// is None.
+    pub fn run_generate_ddtree(
+        &mut self,
+        prompt_tokens: Vec<u32>,
+        max_tokens: usize,
+        temp: f32,
+        eos_token_ids: &[u32],
+    ) -> impl Iterator<Item = Result<u32, Exception>> + '_ {
+        let ddtree_cfg = match self.config.ddtree {
+            Some(cfg) => cfg,
+            None => {
+                // No-op pass-through; rely on the caller to use
+                // `run_generate` instead. We return an iterator that just
+                // delegates by buffering all tokens. To keep this simple
+                // and avoid lifetime gymnastics, surface an error.
+                return Box::new(std::iter::once(Err(Exception::custom(
+                    "run_generate_ddtree called but SpeculativeCycleConfig.ddtree is None",
+                ))))
+                    as Box<dyn Iterator<Item = Result<u32, Exception>>>;
+            }
+        };
+        let block_len = self.config.block_len;
+        self.metrics = SessionMetrics::default();
+        let eos_tokens: HashSet<u32> = eos_token_ids.iter().copied().collect();
+
+        let mut prompt_tokens = Some(prompt_tokens);
+        let mut initialized = false;
+        let mut finished = max_tokens == 0;
+        let mut emitted = 0usize;
+        let mut last_token: u32 = 0;
+        let mut root_pred: u32 = 0;
+        let mut pending = VecDeque::<Result<u32, Exception>>::new();
+
+        Box::new(std::iter::from_fn(move || loop {
+            if let Some(item) = pending.pop_front() {
+                if let Ok(t) = &item {
+                    emitted += 1;
+                    last_token = *t;
+                    if emitted >= max_tokens || eos_tokens.contains(t) {
+                        finished = true;
+                        pending.clear();
+                    }
+                }
+                return Some(item);
+            }
+            if finished {
+                return None;
+            }
+            if !initialized {
+                let prompt = prompt_tokens.take().unwrap_or_default();
+                if prompt.is_empty() {
+                    finished = true;
+                    return Some(Err(Exception::custom("prompt_tokens must not be empty")));
+                }
+                let prompt_arr = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
+                let target_logits = match self.target.prefill(&prompt_arr) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        finished = true;
+                        return Some(Err(e));
+                    }
+                };
+                if let Err(e) = self.draft.prefill(&prompt_arr) {
+                    finished = true;
+                    return Some(Err(e));
+                }
+                if let Some(h) = self.target.last_target_hidden() {
+                    self.draft.set_target_hidden(h);
+                }
+                let first_token = match self
+                    .target
+                    .sample(&target_logits, temp)
+                    .and_then(|t| scalar_token(&t))
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        finished = true;
+                        return Some(Err(e));
+                    }
+                };
+                // Install first_token in target KV + capture root_pred.
+                let first_arr = Array::from_slice(&[first_token], &[1, 1]);
+                let first_post = match self.target.verify(&first_arr) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        finished = true;
+                        return Some(Err(e));
+                    }
+                };
+                if let Err(e) = eval([&first_post]) {
+                    finished = true;
+                    return Some(Err(e));
+                }
+                let root_pred_token = match argmax_axis!(
+                    first_post.index((.., -1, ..)).reshape(&[-1]).unwrap(),
+                    -1
+                )
+                .and_then(|a| a.as_dtype(Dtype::Uint32))
+                .and_then(|a| {
+                    let c = a.contiguous()?;
+                    eval([&c])?;
+                    Ok(c.item::<u32>())
+                }) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        finished = true;
+                        return Some(Err(e));
+                    }
+                };
+                root_pred = root_pred_token;
+                pending.push_back(Ok(first_token));
+                initialized = true;
+                continue;
+            }
+
+            let remaining = max_tokens.saturating_sub(emitted);
+            if remaining < 2 {
+                finished = true;
+                return None;
+            }
+            let block = block_len.min(remaining).max(2);
+
+            // Staged embedding + target hidden for the DFlash drafter.
+            if let Some(emb) = self.target.embed_token(last_token) {
+                self.draft.set_staged_embedding(emb);
+            }
+            if let Some(h) = self.target.last_target_hidden() {
+                self.draft.set_target_hidden(h);
+            }
+            let last_arr = Array::from_slice(&[last_token], &[1, 1]);
+            let drafted = match self.draft.draft_block(&last_arr, block) {
+                Ok(b) => b,
+                Err(e) => {
+                    finished = true;
+                    return Some(Err(e));
+                }
+            };
+            // drafted.logits: [1, block-1, vocab].
+            let block_logits = drafted.logits.index((0, .., ..));
+            if let Err(e) = eval([&block_logits]) {
+                finished = true;
+                return Some(Err(e));
+            }
+            let (top_ids, top_lps) =
+                match crate::engine::ddtree::topk_per_position(&block_logits, ddtree_cfg.tree_topk) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        finished = true;
+                        return Some(Err(e));
+                    }
+                };
+            let tree = crate::engine::ddtree::build_tree(
+                &top_ids,
+                &top_lps,
+                ddtree_cfg.tree_budget,
+            );
+
+            let kv_offset = self.target.step_count() as i32;
+            let start_pos = kv_offset;
+
+            // Fused tree verify.
+            let (tokens, position_ids, mask) =
+                match crate::engine::ddtree::compile_tree_inputs(
+                    last_token,
+                    &tree,
+                    start_pos,
+                    kv_offset,
+                    Dtype::Bfloat16,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        finished = true;
+                        return Some(Err(e));
+                    }
+                };
+            let tree_logits = match self
+                .target
+                .verify_tree_call(&tokens, &position_ids, &mask)
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    finished = true;
+                    return Some(Err(e));
+                }
+            };
+            if let Err(e) = eval([&tree_logits]) {
+                finished = true;
+                return Some(Err(e));
+            }
+            let preds = match argmax_axis!(&tree_logits, -1)
+                .and_then(|a| a.as_dtype(Dtype::Uint32))
+                .and_then(|a| a.reshape(&[-1]))
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    finished = true;
+                    return Some(Err(e.into()));
+                }
+            };
+            if let Err(e) = eval([&preds]) {
+                finished = true;
+                return Some(Err(e));
+            }
+            let preds_vec = preds.as_slice::<u32>().to_vec();
+            let (accepted, bonus) =
+                crate::engine::ddtree::accept_path(&tree, &preds_vec, root_pred);
+
+            // Compact in-place to just the accepted node slots, then
+            // 1-token verify on bonus to install its K/V + capture next
+            // cycle's root_pred from the last-position logits.
+            let keep_i32: Vec<i32> = accepted.iter().map(|&i| i as i32).collect();
+            let keep_arr = Array::from_slice(
+                &keep_i32,
+                &[keep_i32.len() as i32],
+            );
+            if let Err(e) = self.target.compact_cache_call(kv_offset, &keep_arr) {
+                finished = true;
+                return Some(Err(e));
+            }
+            let bonus_arr = Array::from_slice(&[bonus], &[1, 1]);
+            let bonus_logits = match self.target.verify(&bonus_arr) {
+                Ok(l) => l,
+                Err(e) => {
+                    finished = true;
+                    return Some(Err(e));
+                }
+            };
+            if let Err(e) = eval([&bonus_logits]) {
+                finished = true;
+                return Some(Err(e));
+            }
+            let next_root = match argmax_axis!(
+                bonus_logits.index((.., -1, ..)).reshape(&[-1]).unwrap(),
+                -1
+            )
+            .and_then(|a| a.as_dtype(Dtype::Uint32))
+            .and_then(|a| {
+                let c = a.contiguous()?;
+                eval([&c])?;
+                Ok(c.item::<u32>())
+            }) {
+                Ok(t) => t,
+                Err(e) => {
+                    finished = true;
+                    return Some(Err(e));
+                }
+            };
+            root_pred = next_root;
+
+            // Commit accepted prefix + bonus.
+            for &i in &accepted {
+                pending.push_back(Ok(tree[i].token_id));
+            }
+            pending.push_back(Ok(bonus));
+
+            self.metrics.total_cycles += 1;
+            self.metrics.total_accepted += accepted.len();
+            self.metrics.total_drafted += tree.len();
+            if self.metrics.total_drafted > 0 {
+                self.metrics.acceptance_ratio =
+                    self.metrics.total_accepted as f32 / self.metrics.total_drafted as f32;
+            }
+            self.metrics.avg_block_len =
+                self.metrics.total_accepted as f32 / self.metrics.total_cycles.max(1) as f32;
+        })) as Box<dyn Iterator<Item = Result<u32, Exception>>>
+    }
+}
+
 fn build_verify_inputs(last_token: u32, drafted_tokens: &Array) -> Result<Array, Exception> {
     if drafted_tokens.shape().len() != 1 {
         return Err(Exception::custom(format!(
