@@ -500,52 +500,75 @@ where
         queries = queries.transpose_axes(&[0, 2, 1, 3])?;
 
         let is_shared_kv = shared_kv.is_some();
-        let (keys, values) = if let Some((shared_k, shared_v)) = shared_kv {
-            // KV-shared layer: use pre-computed KV from reference layer.
-            // Keys already have RoPE applied and are in [B, H, S, D] format.
-            // Do NOT update the cache — the reference layer manages it.
-            (shared_k, shared_v)
+
+        // Compute new K/V (with RoPE on K) WITHOUT touching the cache yet,
+        // so we can opt into the cache's fused-attention fast path
+        // (TurboQuant) before falling back to update_and_fetch + SDPA.
+        let pending_new_kv: Option<(Array, Array)> = if is_shared_kv {
+            None
         } else {
-            // Normal layer: compute K/V from projections
             let k_proj = self.k_proj.as_mut().expect("k_proj required for non-shared layer");
             let raw_keys = k_proj.forward(x)?;
             let raw_values = match self.v_proj.as_mut() {
                 Some(v_proj) => v_proj.forward(x)?,
                 None => raw_keys.clone(),
             };
-
             let k_norm = self.k_norm.as_mut().expect("k_norm required for non-shared layer");
-            let mut keys =
+            let mut new_k =
                 k_norm.forward(&raw_keys.reshape(&[B, L, self.n_kv_heads, self.head_dim])?)?;
-            let mut values = match self.v_norm.as_ref() {
+            let mut new_v = match self.v_norm.as_ref() {
                 Some(v_norm) => {
                     v_norm.forward(&raw_values.reshape(&[B, L, self.n_kv_heads, self.head_dim])?)?
                 }
                 None => raw_values.reshape(&[B, L, self.n_kv_heads, self.head_dim])?,
             };
-
-            keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-            values = values.transpose_axes(&[0, 2, 1, 3])?;
-
-            keys = match position_ids {
-                Some(pos) => self.rope.apply_per_position(&keys, pos)?,
-                None => self.rope.apply(&keys, offset)?,
+            new_k = new_k.transpose_axes(&[0, 2, 1, 3])?;
+            new_v = new_v.transpose_axes(&[0, 2, 1, 3])?;
+            new_k = match position_ids {
+                Some(pos) => self.rope.apply_per_position(&new_k, pos)?,
+                None => self.rope.apply(&new_k, offset)?,
             };
-
-            cache.update_and_fetch(keys, values)?
+            Some((new_k, new_v))
         };
 
-        // For shared KV layers, the reference layer already incremented the
-        // cache offset via update_and_fetch. Derive the correct query RoPE
-        // offset from the KV sequence length instead.
-        let rope_offset = if is_shared_kv {
-            (keys.shape()[2] - L) as i32
+        // Apply RoPE on queries. For shared KV layers, derive offset from
+        // the borrowed KV length; otherwise use the cache offset before
+        // this step's update.
+        let rope_offset = if let Some((shared_k, _)) = shared_kv.as_ref() {
+            (shared_k.shape()[2] - L) as i32
         } else {
             offset
         };
         queries = match position_ids {
             Some(pos) => self.rope.apply_per_position(&queries, pos)?,
             None => self.rope.apply(&queries, rope_offset)?,
+        };
+
+        // Try fused-attention fast path: q_len=1, non-shared KV, no
+        // sliding window (spike scope). Falls back to standard SDPA if
+        // the cache returns Ok(None) (default impl, or unsupported
+        // shapes) or any of the gating conditions fail.
+        let fused_eligible = !is_shared_kv && L == 1 && self.sliding_window.is_none();
+        if fused_eligible {
+            if let Some((new_k, new_v)) = pending_new_kv.as_ref().map(|(k, v)| (k.clone(), v.clone())) {
+                let kv_repeat = (self.n_heads / self.n_kv_heads) as i32;
+                if let Some(fused_out) = cache.try_fused_attention(
+                    &queries, new_k, new_v, self.scale, mask, kv_repeat,
+                )? {
+                    let out = fused_out
+                        .transpose_axes(&[0, 2, 1, 3])?
+                        .reshape(&[B, L, -1])?;
+                    return self.o_proj.forward(&out);
+                }
+            }
+        }
+
+        // Fallback: standard update_and_fetch + scaled_dot_product_attention.
+        let (keys, values) = if let Some((shared_k, shared_v)) = shared_kv {
+            (shared_k, shared_v)
+        } else {
+            let (new_k, new_v) = pending_new_kv.expect("non-shared KV not computed");
+            cache.update_and_fetch(new_k, new_v)?
         };
 
         let sliding_mask = match (mask, self.sliding_window) {

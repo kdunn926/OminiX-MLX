@@ -19,6 +19,34 @@ pub trait KeyValueCache {
     /// Default implementation does nothing (for caches that don't support reset).
     fn reset(&mut self) {}
 
+    /// Optional fused-attention fast path. When a cache holds keys in a
+    /// non-trivial compressed form (e.g. TurboQuant), it can fold the
+    /// new-block append + Q @ K^T score + scale + mask + softmax + attn
+    /// @ V steps into one operation that never materialises a full
+    /// dequantized K tensor.
+    ///
+    /// Returns `Ok(Some(attn_out))` when handled; `Ok(None)` to fall
+    /// back to the caller's standard `update_and_fetch` + SDPA path.
+    ///
+    /// `q` is `[B, Hq, q_len, D]`, `k_new`/`v_new` are
+    /// `[B, Hkv, q_len_or_more, D]` (the just-projected new K/V block to
+    /// append). `kv_repeat = Hq / Hkv` for GQA. `mask` is the same
+    /// per-query mask the caller would have passed to SDPA (additive
+    /// log-prob style, shape broadcastable to `[..., q_len, kv_len]`).
+    ///
+    /// Default impl: not fused.
+    fn try_fused_attention(
+        &mut self,
+        _q: &Array,
+        _k_new: Array,
+        _v_new: Array,
+        _scale: f32,
+        _mask: Option<&Array>,
+        _kv_repeat: i32,
+    ) -> Result<Option<Array>, Exception> {
+        Ok(None)
+    }
+
     /// Returns sliced key/value tensors up to the current offset, if available.
     fn current_kv(&self) -> Option<(Array, Array)> {
         None
@@ -689,6 +717,138 @@ impl KeyValueCache for TurboQuantKVCache {
         let k = self.reconstruct_keys(dtype, d).ok()?;
         let v = self.reconstruct_values(dtype).ok()?;
         Some((k, v))
+    }
+
+    fn try_fused_attention(
+        &mut self,
+        q: &Array,
+        k_new: Array,
+        v_new: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        kv_repeat: i32,
+    ) -> Result<Option<Array>, Exception> {
+        use crate::turboquant::{cached_signs, CENTROIDS_4BIT};
+        // Spike scope: q_len=1 only. Prefill / multi-token verify
+        // (q_len > 1) takes the standard update_and_fetch + SDPA path.
+        let qs = q.shape();
+        if qs.len() != 4 || qs[2] != 1 {
+            return Ok(None);
+        }
+        // Gate: fused path adds 2-3 extra Metal dispatches per attention
+        // call (QK score, softmax, V matmul) vs the stock SDPA single
+        // dispatch on dequantized K. The K-data-movement savings only
+        // pay off when kv_len is large enough that K bytes dominate
+        // kernel-launch overhead. Default threshold: 512 kv positions.
+        // Override via env var TURBOQUANT_FUSED_KV_MIN=N.
+        let kv_min: i32 = std::env::var("TURBOQUANT_FUSED_KV_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let projected_kv_len = self.offset + k_new.shape()[2];
+        if projected_kv_len < kv_min {
+            return Ok(None);
+        }
+        let b = qs[0];
+        let h_q = qs[1];
+        let d = qs[3];
+        let dtype = q.dtype();
+
+        // 1. Append new K/V via the existing update logic.
+        let _ = self.update_and_fetch(k_new, v_new)?;
+        // After update_and_fetch, self.offset is up to date and the
+        // compressed bulk / sink buffers cover [0, offset).
+
+        let n_sink = self
+            .sink_keys
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let n_bulk = self.offset - n_sink;
+
+        // 2. Score the sink (BF16) prefix via a standard matmul.
+        // Output shape: [B, Hq, 1, n_sink].
+        let sink_scores = if n_sink > 0 {
+            let sk = self.sink_keys.as_ref().unwrap(); // [B, Hkv, n_sink, D]
+            let h_kv = sk.shape()[1];
+            // Expand sink K to GQA layout by repeating along head axis.
+            // Cheapest: matmul Q with sink K^T directly via per-head loop
+            // would be slow; instead reshape Q to [B, Hkv, kv_repeat, 1, D]
+            // and broadcast against sink K [B, Hkv, 1, n_sink, D]^T.
+            // Simpler: reshape Q to [B*Hq, 1, D] and tile sink K to
+            // [B*Hq, n_sink, D].
+            let sk_dt = sk.as_dtype(dtype)?;
+            // Tile sink K along head axis by kv_repeat.
+            // Reshape to [B, Hkv, 1, n_sink, D] → broadcast to
+            // [B, Hkv, kv_repeat, n_sink, D] → [B, Hq, n_sink, D].
+            let sk_5d = sk_dt
+                .reshape(&[b, h_kv, 1, n_sink, d])?;
+            let sk_tiled = mlx_rs::ops::broadcast_to(
+                &sk_5d,
+                &[b, h_kv, kv_repeat, n_sink, d],
+            )?
+            .reshape(&[b, h_q, n_sink, d])?;
+            // Q [B, Hq, 1, D] @ sk_tiled [B, Hq, D, n_sink].
+            let sk_t = sk_tiled.transpose_axes(&[0, 1, 3, 2])?;
+            Some(q.matmul(&sk_t)?.as_dtype(mlx_rs::Dtype::Float32)?)
+        } else {
+            None
+        };
+
+        // 3. Fused QK on the compressed bulk via tq_qk_score.
+        // Output shape: [B, Hq, 1, n_bulk] f32.
+        let bulk_scores = if n_bulk > 0 {
+            let packed = self
+                .packed_keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("bulk requested but packed_keys unset"))?;
+            let sigma = self.key_sigma.as_ref().unwrap();
+            let mean = self.key_mean.as_ref().unwrap();
+            let signs_vec = cached_signs(d, self.seed);
+            let signs = Array::from_slice(&signs_vec, &[d]);
+            let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+            let scores = crate::metal_kernels::tq_qk_score(
+                q,
+                packed,
+                sigma,
+                mean,
+                &signs,
+                &centroids,
+                kv_repeat,
+            )?;
+            Some(scores)
+        } else {
+            None
+        };
+
+        // 4. Concatenate scores along the kv axis (sink first, then bulk).
+        let mut scores = match (sink_scores, bulk_scores) {
+            (Some(s), Some(b)) => concatenate_axis(&[s, b], 3)?,
+            (Some(s), None) => s,
+            (None, Some(b)) => b,
+            (None, None) => {
+                return Err(Exception::custom("try_fused_attention: empty cache"));
+            }
+        };
+
+        // 5. Scale + mask + softmax.
+        scores = scores.multiply(mlx_rs::array!(scale))?;
+        if let Some(m) = mask {
+            let m_f = m.as_dtype(mlx_rs::Dtype::Float32)?;
+            scores = scores.add(&m_f)?;
+        }
+        let attn = mlx_rs::ops::softmax_axis(&scores, -1, Some(true))?
+            .as_dtype(dtype)?;
+
+        // 6. V multiply on the reconstructed values (still dequantize V
+        // for the spike — fused V-mul is the next deferred item).
+        let v_full = self.reconstruct_values(dtype)?; // [B, Hkv, offset, D]
+        let h_kv = v_full.shape()[1];
+        let v_5d = v_full.reshape(&[b, h_kv, 1, self.offset, d])?;
+        let v_tiled = mlx_rs::ops::broadcast_to(&v_5d, &[b, h_kv, kv_repeat, self.offset, d])?
+            .reshape(&[b, h_q, self.offset, d])?;
+        let out = attn.matmul(&v_tiled)?;
+        Ok(Some(out))
     }
 
     fn eval(&self) -> Result<(), Exception> {
