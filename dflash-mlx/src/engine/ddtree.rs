@@ -389,6 +389,135 @@ pub fn verify_tree_naive<T: TargetModel>(
     Ok((accepted, bonus, accepted_tokens))
 }
 
+/// Flatten a tree into the inputs that `Gemma4TargetAdapter::verify_tree`
+/// expects.
+///
+/// Returns:
+///   `tokens [1, L]` — flat node token ids (seed at index 0, then tree
+///     nodes in node-index order).
+///   `position_ids [L]` — per-node absolute positions
+///     (= start + node.depth, with start = seed's position).
+///   `attention_mask [L, kv_offset + L]` — additive log-prob mask: 0 for
+///     positions the node attends to, large-negative for blocked. The
+///     prefix [0..kv_offset) is fully visible to every node. Within the
+///     L appended slots, node i attends to itself, all ancestors on its
+///     root-to-i path, and the seed (slot 0). Sibling branches are
+///     blocked.
+///
+/// `start` is the absolute position of the seed (= prompt_len - 1 + tokens
+/// committed so far). `kv_offset` is the target's current cache offset
+/// before the tree forward.
+pub fn compile_tree_inputs(
+    _seed_token: u32,
+    nodes: &[TreeNode],
+    start: i32,
+    kv_offset: i32,
+    dtype: mlx_rs::Dtype,
+) -> Result<(Array, Array, Array), Exception> {
+    // Tree verify feeds ONLY the tree's new tokens; the seed token's K/V
+    // is already in the target's KV cache at slot (kv_offset - 1) from the
+    // previous cycle's commit, and the visibility mask makes the entire
+    // [0, kv_offset) prefix visible to every new node. Feeding the seed
+    // again would duplicate its K/V (and double-rotate it), corrupting
+    // attention scores.
+    let l = nodes.len();
+    let tokens_vec: Vec<u32> = nodes.iter().map(|n| n.token_id).collect();
+    let tokens =
+        Array::from_slice(&tokens_vec, &[1, l as i32]).as_dtype(mlx_rs::Dtype::Int32)?;
+    // position_ids[i] = start + (depth - 1). With seed at logical position
+    // (start - 1), depth-1 children sit at `start`, depth-2 at `start+1`, etc.
+    let pos_vec: Vec<i32> = nodes.iter().map(|n| start + (n.depth as i32 - 1)).collect();
+    let position_ids = Array::from_slice(&pos_vec, &[l as i32]);
+
+    // Visibility over the L appended slots: node i attends to itself + all
+    // ancestors on the root-to-i path. Sibling branches blocked.
+    let mut vis = vec![false; l * l];
+    for (node_idx, _) in nodes.iter().enumerate() {
+        let i = node_idx;
+        vis[i * l + i] = true;
+        let mut cur = node_idx;
+        while nodes[cur].parent != usize::MAX {
+            let parent_flat = nodes[cur].parent;
+            vis[i * l + parent_flat] = true;
+            cur = nodes[cur].parent;
+        }
+    }
+    // Compose: [L, kv_offset + L] with prefix all-visible, suffix per vis.
+    let total_kv = kv_offset + l as i32;
+    let neg_inf = match dtype {
+        mlx_rs::Dtype::Bfloat16 => -3.0e38f32, // bf16 finite min ≈ -3.39e38
+        mlx_rs::Dtype::Float16 => -6.5e4f32,
+        _ => -1.0e30f32,
+    };
+    let mut mask_f32: Vec<f32> = Vec::with_capacity(l * total_kv as usize);
+    for i in 0..l {
+        // Prefix: 0 (visible to all)
+        for _ in 0..kv_offset {
+            mask_f32.push(0.0);
+        }
+        // Suffix: per vis row i
+        for j in 0..l {
+            mask_f32.push(if vis[i * l + j] { 0.0 } else { neg_inf });
+        }
+    }
+    let attention_mask = Array::from_slice(&mask_f32, &[l as i32, total_kv])
+        .as_dtype(dtype)?;
+
+    Ok((tokens, position_ids, attention_mask))
+}
+
+/// Fused DDTree verify driver.
+///
+/// One target forward per cycle over the flat tree, then accept the
+/// longest matching path via `accept_path`. After acceptance, the caller
+/// must:
+///   (a) rollback_kv(0) to drop the tree from the target's KV cache, and
+///   (b) re-feed `[seed, accepted_tokens..., bonus]` linearly to install
+///       the canonical cache for the next cycle.
+///
+/// Returns (accepted_node_indices, bonus_token).
+pub fn verify_tree_fused<T: TargetModel + GemmaTreeTarget>(
+    target: &mut T,
+    nodes: &[TreeNode],
+    start: i32,
+    kv_offset: i32,
+    root_pred: u32,
+    dtype: mlx_rs::Dtype,
+) -> Result<(Vec<usize>, u32), Exception> {
+    if nodes.is_empty() {
+        return Ok((Vec::new(), root_pred));
+    }
+    let (tokens, position_ids, mask) =
+        compile_tree_inputs(0, nodes, start, kv_offset, dtype)?;
+    let logits = target.verify_tree_call(&tokens, &position_ids, &mask)?;
+    eval([&logits])?;
+    let preds = argmax_axis!(logits, -1)?
+        .as_dtype(Dtype::Uint32)?
+        .reshape(&[-1])?;
+    eval([&preds])?;
+    let preds_slice = preds.as_slice::<u32>();
+    // preds_slice[i] = target's prediction at position (start + tree[i].depth)
+    // = what should equal a depth-(tree[i].depth + 1) child of node i.
+    // We do NOT have a slot for "prediction after seed" from this forward
+    // — root_pred is supplied by the caller (captured at the end of the
+    // previous cycle's commit).
+    let predicted_after_node: Vec<u32> = preds_slice.to_vec();
+    let (accepted, bonus) = accept_path(nodes, &predicted_after_node, root_pred);
+    Ok((accepted, bonus))
+}
+
+/// Thin trait letting the DDTree driver call `verify_tree` on adapters that
+/// support it (currently `Gemma4TargetAdapter`). Defined here so the
+/// driver doesn't need to know about specific adapter types.
+pub trait GemmaTreeTarget {
+    fn verify_tree_call(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<Array, Exception>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

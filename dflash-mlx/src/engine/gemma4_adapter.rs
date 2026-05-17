@@ -83,6 +83,53 @@ impl Gemma4TargetAdapter {
         }
     }
 
+}
+
+impl crate::engine::ddtree::GemmaTreeTarget for Gemma4TargetAdapter {
+    fn verify_tree_call(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<Array, Exception> {
+        self.verify_tree(tokens, position_ids, attention_mask)
+    }
+}
+
+impl Gemma4TargetAdapter {
+    /// DDTree fused tree verify.
+    ///
+    /// Runs `Model::forward_tree` over a flat tree of tokens with explicit
+    /// per-node `position_ids` and a bidirectional tree-visibility mask.
+    /// Returns `[1, L, vocab]` per-node logits. The target's KV cache grows
+    /// by L slots (one per tree node). Callers must call `rollback_kv` to
+    /// drop the entire tree before installing the accepted prefix linearly.
+    ///
+    /// This skips DFlash's hidden-state capture (DDTree currently uses the
+    /// DFlash drafter without target-hidden conditioning per-cycle — the
+    /// drafter still works from the most-recently-committed hidden, which
+    /// gets refreshed by the post-cycle linear forward). If a future
+    /// integration needs per-tree-node hidden capture, extend forward_tree
+    /// to also return captures.
+    pub fn verify_tree(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<Array, Exception> {
+        // Treat the tree verify as a single verify "block" for rollback
+        // accounting: record the input length so rollback_kv(n_keep) trims
+        // (tree_len - n_keep) entries.
+        self.verify_inputs = Some(tokens.clone());
+        self.verify_step = self.step;
+        self.verify_segment_count_pre = self.target_hidden_segments.len();
+        let logits = self
+            .model
+            .forward_tree(tokens, position_ids, attention_mask, &mut self.cache)?;
+        self.step += tokens.shape()[1] as usize;
+        Ok(logits)
+    }
+
     fn fresh_cache(model: &Model) -> Vec<KVCache> {
         let num_slots = *model.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
         gemma4_mlx::init_cache::<KVCache>(num_slots)

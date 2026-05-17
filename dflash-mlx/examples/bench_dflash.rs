@@ -19,6 +19,7 @@ use dflash_mlx::{
     Gemma4TargetAdapter, MockDraftAdapter, Qwen36TargetAdapter, SessionMetrics,
     SpeculativeCycleConfig, TargetModel,
 };
+use dflash_mlx::engine::ddtree::{verify_tree_fused, GemmaTreeTarget};
 use mlx_rs::ops::indexing::IndexOp;
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
 
@@ -30,6 +31,7 @@ struct DDTreeArgs {
     enabled: bool,
     budget: usize,
     topk: usize,
+    fused: bool,
 }
 
 struct Args {
@@ -253,7 +255,7 @@ where
 /// DDTree run loop. Builds a budget-N tree from draft logits per cycle and
 /// verifies each tree branch sequentially (snapshot/restore between
 /// branches) before walking to the longest accepted path.
-fn run_ddtree<T: TargetModel, D: DraftModel>(
+fn run_ddtree<T: TargetModel + GemmaTreeTarget, D: DraftModel>(
     target: &mut T,
     draft: &mut D,
     prompt_tokens: Vec<u32>,
@@ -263,6 +265,7 @@ fn run_ddtree<T: TargetModel, D: DraftModel>(
     block_size: usize,
     tree_budget: usize,
     tree_topk: usize,
+    fused: bool,
 ) -> Result<(RunStats, SessionMetrics)> {
     let start = Instant::now();
     let prompt_arr = mlx_rs::Array::from_slice(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
@@ -278,6 +281,20 @@ fn run_ddtree<T: TargetModel, D: DraftModel>(
     mlx_rs::transforms::eval([&first_tok_arr])?;
     let first_token = first_tok_arr.item::<u32>();
     let ttft = start.elapsed().as_secs_f64();
+
+    // Install first_token in target's KV cache and capture the predicted
+    // token AFTER first_token. Used by fused DDTree as the "root_pred" for
+    // accept_path's seed comparison.
+    let first_arr = mlx_rs::Array::from_slice(&[first_token], &[1, 1]);
+    let first_post_logits = target.verify(&first_arr)?;
+    mlx_rs::transforms::eval([&first_post_logits])?;
+    let root_pred_arr = mlx_rs::argmax_axis!(
+        first_post_logits.index((.., -1, ..)).reshape(&[-1])?,
+        -1
+    )?
+    .as_dtype(mlx_rs::Dtype::Uint32)?;
+    mlx_rs::transforms::eval([&root_pred_arr])?;
+    let mut root_pred = root_pred_arr.item::<u32>();
 
     let mut emitted: Vec<u32> = vec![first_token];
     let mut last_token = first_token;
@@ -305,9 +322,45 @@ fn run_ddtree<T: TargetModel, D: DraftModel>(
         mlx_rs::transforms::eval([&block_logits])?;
         let (top_ids, top_lps) = topk_per_position(&block_logits, tree_topk)?;
         let tree = build_tree(&top_ids, &top_lps, tree_budget);
-        let pre_step = target.step_count();
-        let (accepted, bonus, _accepted_tokens) =
-            verify_tree_naive(target, last_token, &tree)?;
+        let kv_offset = target.step_count() as i32;
+        let start_pos = kv_offset; // seed token at absolute position kv_offset
+
+        let (accepted, bonus) = if fused {
+            let (acc, bonus_tok) = verify_tree_fused(
+                target,
+                &tree,
+                start_pos,
+                kv_offset,
+                root_pred,
+                mlx_rs::Dtype::Bfloat16,
+            )?;
+            // Drop tree, then install accepted prefix + bonus linearly.
+            target.rollback_kv(0)?;
+            let mut commit_ids: Vec<u32> = Vec::with_capacity(acc.len() + 1);
+            for &idx in &acc {
+                commit_ids.push(tree[idx].token_id);
+            }
+            commit_ids.push(bonus_tok);
+            let commit_arr = mlx_rs::Array::from_slice(
+                &commit_ids,
+                &[1, commit_ids.len() as i32],
+            );
+            let commit_logits = target.verify(&commit_arr)?;
+            mlx_rs::transforms::eval([&commit_logits])?;
+            // Capture pred for "after bonus" → next cycle's root_pred.
+            let next_root_arr = mlx_rs::argmax_axis!(
+                commit_logits.index((.., -1, ..)).reshape(&[-1])?,
+                -1
+            )?
+            .as_dtype(mlx_rs::Dtype::Uint32)?;
+            mlx_rs::transforms::eval([&next_root_arr])?;
+            root_pred = next_root_arr.item::<u32>();
+            (acc, bonus_tok)
+        } else {
+            let (acc, bonus_tok, _accepted_tokens) =
+                verify_tree_naive(target, last_token, &tree)?;
+            (acc, bonus_tok)
+        };
         let n_accepted = accepted.len();
         metrics.total_cycles += 1;
         metrics.total_drafted += tree.len();
@@ -329,7 +382,6 @@ fn run_ddtree<T: TargetModel, D: DraftModel>(
         if let Some(h) = target.last_target_hidden() {
             draft.set_target_hidden(h);
         }
-        let _ = pre_step;
     }
 
     if metrics.total_drafted > 0 {
@@ -493,8 +545,8 @@ fn run_gemma4(
             let mut draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
             let (dflash_stats, metrics) = if args.ddtree.enabled {
                 println!(
-                    "DDTree mode: budget={} topk={} block_size={}",
-                    args.ddtree.budget, args.ddtree.topk, block_size
+                    "DDTree mode: budget={} topk={} block_size={} fused={}",
+                    args.ddtree.budget, args.ddtree.topk, block_size, args.ddtree.fused
                 );
                 run_ddtree(
                     &mut target,
@@ -506,6 +558,7 @@ fn run_gemma4(
                     block_size,
                     args.ddtree.budget,
                     args.ddtree.topk,
+                    args.ddtree.fused,
                 )?
             } else {
                 let spec_config = SpeculativeCycleConfig {
@@ -570,6 +623,7 @@ fn parse_args() -> Result<Args> {
     let mut ddtree_enabled = false;
     let mut ddtree_budget = 16usize;
     let mut ddtree_topk = 4usize;
+    let mut ddtree_naive = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -613,6 +667,7 @@ fn parse_args() -> Result<Args> {
                     .parse()
                     .context("invalid --tree-budget value")?
             }
+            "--tree-naive" => ddtree_naive = true,
             "--tree-topk" => {
                 ddtree_topk = args
                     .next()
@@ -641,6 +696,7 @@ fn parse_args() -> Result<Args> {
             enabled: ddtree_enabled,
             budget: ddtree_budget,
             topk: ddtree_topk,
+            fused: !ddtree_naive,
         },
     })
 }
