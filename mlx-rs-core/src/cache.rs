@@ -353,31 +353,52 @@ impl KeyValueCache for KVCache {
 
 /// KV cache where keys are stored in TurboQuant 4-bit form (Hadamard-
 /// rotated + per-vector sigma + Lloyd-Max N(0,1) codebook) and values
-/// are kept at the native bf16/f16 dtype. Each `update_and_fetch` runs
-/// the `tq_compress_4bit` Metal kernel on the new K block, appends the
-/// packed indices + per-vector sigma + mean to the cache, and returns
-/// the decompressed K (via `tq_decompress_4bit`) so attention sees
-/// a normal `[B, H, S, D]` BF16 tensor.
+/// are stored in 8-bit per-group form (stock `mlx_rs::ops::quantize`
+/// symmetric absmax, group_size=64). Sink tokens (configurable, default
+/// 4) stay at the native dtype on both K and V — per the upstream
+/// `tq-kv` 3-Fix ablation, these first few tokens carry the
+/// disproportionate attention weight at decode time and quantizing them
+/// is the largest single source of quality loss.
 ///
-/// Memory: head_dim=256 sliding K shrinks from 512 bytes/vector (BF16)
-/// to 128 bytes packed + 4 bytes sigma + 4 bytes mean = 136 bytes
-/// ≈ 3.8× compression on K. V stays at native bf16.
+/// Memory (Gemma4-26B-A4B sliding head, head_dim=256, group_size=64):
+///   - K: 512 bytes BF16  → 128 (packed) + 4 (sigma) + 4 (mean) = 136 B  ≈ 3.8×
+///   - V: 512 bytes BF16  → 256 (u32 packed) + 16 (4 scales) + 16 (4 biases) ≈ 1.7×
+///   - Combined KV: ≈ 2.6× compression including the sink-token overhead.
+///   - Long contexts amortise the sink-token cost: 4 BF16-sink tokens on
+///     a 4096-token cache add ~0.1% overhead vs the compressed bulk.
 ///
 /// Spike caveats (matches `turboquant.rs`):
-///   - V is NOT compressed.
 ///   - No pre-RoPE quantization, no QJL, no calibrated codebooks.
+///   - V uses mlx stock symmetric quantize; the upstream paper's
+///     4-bit V path (+1.3% PPL) would need a Lloyd-Max V codebook.
 ///   - Cached signs reuse the same seed across all cycles; for safety
 ///     across a long process lifetime, use a unique seed per cache.
 #[derive(Debug, Clone)]
 pub struct TurboQuantKVCache {
     /// Packed 4-bit key indices, shape `[B, H, n_tokens, D/8]` u32.
+    /// Holds only positions [sink_tokens..offset). Positions [0..sink)
+    /// live in `sink_keys` at native dtype.
     packed_keys: Option<Array>,
-    /// Per-vector sigma, shape `[B, H, n_tokens]` f32.
+    /// Per-vector sigma for compressed K, shape `[B, H, n_compressed]` f32.
     key_sigma: Option<Array>,
-    /// Per-vector mean, shape `[B, H, n_tokens]` f32.
+    /// Per-vector mean for compressed K, shape `[B, H, n_compressed]` f32.
     key_mean: Option<Array>,
-    /// Native-dtype values, shape `[B, H, n_tokens, D]`.
-    values: Option<Array>,
+    /// Sink tokens for K: first `sink_tokens` positions kept at native
+    /// dtype, shape `[B, H, n_sink, D]`. None until the first update.
+    sink_keys: Option<Array>,
+    /// Compressed values: quantized `[B, H, n_compressed, packed_cols]`,
+    /// scales/biases broadcast over groups.
+    quant_v: Option<Array>,
+    v_scales: Option<Array>,
+    v_biases: Option<Array>,
+    /// Sink tokens for V: first `sink_tokens` positions at native dtype.
+    sink_values: Option<Array>,
+    /// Number of sink tokens (capped at `offset` until the cache grows).
+    sink_tokens: i32,
+    /// Group size for V's per-group quantizer (must divide head_dim).
+    v_group_size: i32,
+    /// Bits for V (default 8; supported: 4 or 8).
+    v_bits: i32,
     offset: i32,
     /// Sign tensor seed (deterministic across the lifetime of this cache).
     seed: u64,
@@ -389,7 +410,14 @@ impl TurboQuantKVCache {
             packed_keys: None,
             key_sigma: None,
             key_mean: None,
-            values: None,
+            sink_keys: None,
+            quant_v: None,
+            v_scales: None,
+            v_biases: None,
+            sink_values: None,
+            sink_tokens: 4,
+            v_group_size: 64,
+            v_bits: 8,
             offset: 0,
             seed: 0x5EED_5EED,
         }
@@ -399,37 +427,114 @@ impl TurboQuantKVCache {
         Self { seed, ..Self::new() }
     }
 
+    /// Override sink-token count. Set to 0 to disable.
+    pub fn with_sink_tokens(mut self, n: i32) -> Self {
+        self.sink_tokens = n.max(0);
+        self
+    }
+
+    /// Override V quantization config. `bits` must be 4 or 8.
+    pub fn with_v_quant(mut self, bits: i32, group_size: i32) -> Self {
+        self.v_bits = bits;
+        self.v_group_size = group_size;
+        self
+    }
+
     /// Reconstruct the full keys tensor `[B, H, offset, D]` at the
-    /// caller-requested dtype by running `tq_decompress_4bit` over the
-    /// packed slots.
+    /// caller-requested dtype: concatenates the native-dtype sink prefix
+    /// with the TurboQuant-decompressed bulk.
     fn reconstruct_keys(&self, dtype: mlx_rs::Dtype, d: i32) -> Result<Array, Exception> {
         use crate::turboquant::{cached_signs, CENTROIDS_4BIT};
-        let packed = self
-            .packed_keys
+        let n_sink = self
+            .sink_keys
             .as_ref()
-            .expect("packed_keys unset before reconstruct");
-        let sigma = self.key_sigma.as_ref().expect("sigma unset");
-        let mean = self.key_mean.as_ref().expect("mean unset");
-        let shape = packed.shape().to_vec(); // [B, H, n_total, D/8]
-        let b = shape[0];
-        let h = shape[1];
-        let n_total = shape[2];
-        let kept_n = self.offset;
-        if kept_n == 0 {
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let n_compressed = self.offset - n_sink;
+        if self.offset == 0 {
             return Err(Exception::custom("reconstruct_keys on empty cache"));
         }
-        // Slice to the offset window.
-        let packed_w = packed.index((Ellipsis, ..kept_n, ..));
-        let sigma_w = sigma.index((Ellipsis, ..kept_n));
-        let mean_w = mean.index((Ellipsis, ..kept_n));
-        let signs_vec = cached_signs(d, self.seed);
-        let signs = Array::from_slice(&signs_vec, &[d]);
-        let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
-        let out_shape = vec![b, h, kept_n, d];
-        let _ = n_total;
-        crate::metal_kernels::tq_decompress_4bit(
-            &packed_w, &sigma_w, &mean_w, &signs, &centroids, &out_shape, dtype,
-        )
+        let bulk = if n_compressed > 0 {
+            let packed = self
+                .packed_keys
+                .as_ref()
+                .expect("packed_keys unset with compressed positions");
+            let sigma = self.key_sigma.as_ref().expect("sigma unset");
+            let mean = self.key_mean.as_ref().expect("mean unset");
+            let shape = packed.shape().to_vec();
+            let b = shape[0];
+            let h = shape[1];
+            let packed_w = packed.index((Ellipsis, ..n_compressed, ..));
+            let sigma_w = sigma.index((Ellipsis, ..n_compressed));
+            let mean_w = mean.index((Ellipsis, ..n_compressed));
+            let signs_vec = cached_signs(d, self.seed);
+            let signs = Array::from_slice(&signs_vec, &[d]);
+            let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+            let out_shape = vec![b, h, n_compressed, d];
+            Some(crate::metal_kernels::tq_decompress_4bit(
+                &packed_w, &sigma_w, &mean_w, &signs, &centroids, &out_shape, dtype,
+            )?)
+        } else {
+            None
+        };
+        match (self.sink_keys.as_ref(), bulk) {
+            (Some(s), Some(b)) => concatenate_axis(&[s.clone(), b], 2),
+            (Some(s), None) => Ok(s.clone()),
+            (None, Some(b)) => Ok(b),
+            (None, None) => Err(Exception::custom("reconstruct_keys: nothing to return")),
+        }
+    }
+
+    /// Reconstruct the full values tensor `[B, H, offset, D]` by
+    /// concatenating sink V with dequantized bulk V.
+    fn reconstruct_values(&self, dtype: mlx_rs::Dtype) -> Result<Array, Exception> {
+        let n_sink = self
+            .sink_values
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let n_compressed = self.offset - n_sink;
+        if self.offset == 0 {
+            return Err(Exception::custom("reconstruct_values on empty cache"));
+        }
+        let bulk = if n_compressed > 0 {
+            let q = self.quant_v.as_ref().expect("quant_v unset");
+            let s = self.v_scales.as_ref().expect("v_scales unset");
+            let bi = self.v_biases.as_ref().expect("v_biases unset");
+            // q shape: [B, H, n_compressed, packed_cols]
+            // s/bi shape: [B, H, n_compressed, n_groups]
+            // We flatten to [B*H*n_compressed, packed_cols] for dequantize,
+            // then reshape back.
+            let qs = q.shape();
+            let b = qs[0];
+            let h = qs[1];
+            let t = qs[2];
+            let packed_cols = qs[3];
+            let n_groups = s.shape()[3];
+            let head_dim = n_groups * self.v_group_size;
+            let q_flat = q.reshape(&[b * h * t, packed_cols])?;
+            let s_flat = s.reshape(&[b * h * t, n_groups])?;
+            let bi_flat = bi.reshape(&[b * h * t, n_groups])?;
+            let deq = mlx_rs::ops::dequantize(
+                &q_flat,
+                &s_flat,
+                &bi_flat,
+                self.v_group_size,
+                self.v_bits,
+                None::<&str>,
+            )?
+            .as_dtype(dtype)?
+            .reshape(&[b, h, t, head_dim])?;
+            Some(deq)
+        } else {
+            None
+        };
+        match (self.sink_values.as_ref(), bulk) {
+            (Some(s), Some(b)) => concatenate_axis(&[s.clone(), b], 2),
+            (Some(s), None) => Ok(s.clone()),
+            (None, Some(b)) => Ok(b),
+            (None, None) => Err(Exception::custom("reconstruct_values: nothing to return")),
+        }
     }
 }
 
@@ -452,7 +557,11 @@ impl KeyValueCache for TurboQuantKVCache {
         self.packed_keys = None;
         self.key_sigma = None;
         self.key_mean = None;
-        self.values = None;
+        self.sink_keys = None;
+        self.quant_v = None;
+        self.v_scales = None;
+        self.v_biases = None;
+        self.sink_values = None;
         self.offset = 0;
     }
 
@@ -469,59 +578,129 @@ impl KeyValueCache for TurboQuantKVCache {
         let d = k_shape[3];
         let dtype = keys.dtype();
 
-        // Compress the new K block: input shape [B, H, T, D] → flat per
-        // vector. The kernel treats the leading dims as one big batch.
-        let signs_vec = cached_signs(d, self.seed);
-        let signs = Array::from_slice(&signs_vec, &[d]);
-        let boundaries = Array::from_slice(&BOUNDARIES_4BIT, &[15]);
-        let (packed_new, sigma_new, mean_new) =
-            crate::metal_kernels::tq_compress_4bit(&keys, &signs, &boundaries)?;
-        // Kernel outputs flatten the leading dims: packed [B*H*T, D/8],
-        // sigma/mean [B*H*T]. Reshape back to [B, H, T, ...] so the
-        // token-axis concatenate matches `values`'s layout.
-        let packed_new = packed_new.reshape(&[b, h, t_new, d / 8])?;
-        let sigma_new = sigma_new.reshape(&[b, h, t_new])?;
-        let mean_new = mean_new.reshape(&[b, h, t_new])?;
+        // Determine how many of the new tokens go into the sink (kept at
+        // native dtype) vs the compressed bulk. Sink positions are the
+        // first `sink_tokens` positions of the whole cache; once the
+        // sink is full all subsequent tokens go to the bulk.
+        let already_sinked = self
+            .sink_keys
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let sink_room = (self.sink_tokens - already_sinked).max(0);
+        let n_to_sink = sink_room.min(t_new);
+        let n_to_compress = t_new - n_to_sink;
 
-        // Append along the token axis.
-        self.packed_keys = Some(match self.packed_keys.take() {
-            Some(prev) => concatenate_axis(&[prev, packed_new], 2)?,
-            None => packed_new,
-        });
-        self.key_sigma = Some(match self.key_sigma.take() {
-            Some(prev) => concatenate_axis(&[prev, sigma_new], 2)?,
-            None => sigma_new,
-        });
-        self.key_mean = Some(match self.key_mean.take() {
-            Some(prev) => concatenate_axis(&[prev, mean_new], 2)?,
-            None => mean_new,
-        });
-        self.values = Some(match self.values.take() {
-            Some(prev) => concatenate_axis(&[prev, values], 2)?,
-            None => values,
-        });
+        if n_to_sink > 0 {
+            let k_sink = keys.index((Ellipsis, ..n_to_sink, ..));
+            let v_sink = values.index((Ellipsis, ..n_to_sink, ..));
+            self.sink_keys = Some(match self.sink_keys.take() {
+                Some(prev) => concatenate_axis(&[prev, k_sink], 2)?,
+                None => k_sink,
+            });
+            self.sink_values = Some(match self.sink_values.take() {
+                Some(prev) => concatenate_axis(&[prev, v_sink], 2)?,
+                None => v_sink,
+            });
+        }
+
+        if n_to_compress > 0 {
+            let k_bulk = keys.index((Ellipsis, n_to_sink.., ..));
+            let v_bulk = values.index((Ellipsis, n_to_sink.., ..));
+
+            // Compress K via TurboQuant Metal kernel.
+            let signs_vec = cached_signs(d, self.seed);
+            let signs = Array::from_slice(&signs_vec, &[d]);
+            let boundaries = Array::from_slice(&BOUNDARIES_4BIT, &[15]);
+            let (packed_new, sigma_new, mean_new) =
+                crate::metal_kernels::tq_compress_4bit(&k_bulk, &signs, &boundaries)?;
+            let packed_new = packed_new.reshape(&[b, h, n_to_compress, d / 8])?;
+            let sigma_new = sigma_new.reshape(&[b, h, n_to_compress])?;
+            let mean_new = mean_new.reshape(&[b, h, n_to_compress])?;
+
+            // Compress V via stock symmetric per-group quantize. Reshape
+            // [B, H, T, D] → [B*H*T, D] so quantize sees a 2D input and
+            // produces grouped scales along the last axis.
+            let v_flat = v_bulk.reshape(&[b * h * n_to_compress, d])?;
+            let (vq, vs, vbi) = mlx_rs::ops::quantize(
+                &v_flat,
+                self.v_group_size,
+                self.v_bits,
+                None::<&str>,
+            )?;
+            let n_groups = d / self.v_group_size;
+            let packed_v_cols = vq.shape()[1];
+            let vq = vq.reshape(&[b, h, n_to_compress, packed_v_cols])?;
+            let vs = vs.reshape(&[b, h, n_to_compress, n_groups])?;
+            let vbi = vbi.reshape(&[b, h, n_to_compress, n_groups])?;
+
+            self.packed_keys = Some(match self.packed_keys.take() {
+                Some(prev) => concatenate_axis(&[prev, packed_new], 2)?,
+                None => packed_new,
+            });
+            self.key_sigma = Some(match self.key_sigma.take() {
+                Some(prev) => concatenate_axis(&[prev, sigma_new], 2)?,
+                None => sigma_new,
+            });
+            self.key_mean = Some(match self.key_mean.take() {
+                Some(prev) => concatenate_axis(&[prev, mean_new], 2)?,
+                None => mean_new,
+            });
+            self.quant_v = Some(match self.quant_v.take() {
+                Some(prev) => concatenate_axis(&[prev, vq], 2)?,
+                None => vq,
+            });
+            self.v_scales = Some(match self.v_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, vs], 2)?,
+                None => vs,
+            });
+            self.v_biases = Some(match self.v_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, vbi], 2)?,
+                None => vbi,
+            });
+        }
+
         self.offset += t_new;
 
-        // Reconstruct K for the attention call.
         let k_full = self.reconstruct_keys(dtype, d)?;
-        let v_full = self.values.as_ref().unwrap().clone();
+        let v_full = self.reconstruct_values(dtype)?;
         Ok((k_full, v_full))
     }
 
     fn current_kv(&self) -> Option<(Array, Array)> {
-        let values = self.values.as_ref()?.clone();
-        let d = values.shape()[3];
-        let dtype = values.dtype();
+        if self.offset == 0 {
+            return None;
+        }
+        // Infer head_dim + dtype from whichever side has the larger
+        // surface (sink for very small caches, compressed otherwise).
+        let (d, dtype) = if let Some(s) = self.sink_values.as_ref() {
+            (s.shape()[3], s.dtype())
+        } else if let Some(q) = self.quant_v.as_ref() {
+            let packed_cols = q.shape()[3];
+            // Recover D from packed_cols: packed_cols * 32 / v_bits.
+            let d = (packed_cols * 32) / self.v_bits;
+            // quant_v dtype is uint32; the original input was the model
+            // dtype but we lost it. Default to bf16 since that's what
+            // Gemma4 uses; downstream attention casts as needed.
+            (d, mlx_rs::Dtype::Bfloat16)
+        } else {
+            return None;
+        };
         let k = self.reconstruct_keys(dtype, d).ok()?;
-        Some((k, values))
+        let v = self.reconstruct_values(dtype).ok()?;
+        Some((k, v))
     }
 
     fn eval(&self) -> Result<(), Exception> {
         let mut arrays: Vec<&Array> = Vec::new();
-        if let Some(a) = &self.packed_keys { arrays.push(a); }
-        if let Some(a) = &self.key_sigma  { arrays.push(a); }
-        if let Some(a) = &self.key_mean   { arrays.push(a); }
-        if let Some(a) = &self.values     { arrays.push(a); }
+        if let Some(a) = &self.packed_keys  { arrays.push(a); }
+        if let Some(a) = &self.key_sigma    { arrays.push(a); }
+        if let Some(a) = &self.key_mean     { arrays.push(a); }
+        if let Some(a) = &self.sink_keys    { arrays.push(a); }
+        if let Some(a) = &self.quant_v      { arrays.push(a); }
+        if let Some(a) = &self.v_scales     { arrays.push(a); }
+        if let Some(a) = &self.v_biases     { arrays.push(a); }
+        if let Some(a) = &self.sink_values  { arrays.push(a); }
         if !arrays.is_empty() {
             mlx_rs::transforms::eval(arrays)?;
         }
