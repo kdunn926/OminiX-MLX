@@ -303,15 +303,9 @@ impl GemmaRope {
             Self::Standard(rope) => standard_inv_freq(rope.base, head_dim)?,
             Self::Proportional(rope) => rope.inv_freq.clone(),
         };
-        // positions: [L] float32 → [L, 1] · [1, half_dim] = [L, half_dim]
-        let pos_f = positions.as_dtype(Dtype::Float32)?;
-        let freqs = ops::outer(&pos_f, &inv_freq)?;
-        let emb = ops::concatenate_axis(&[&freqs, &freqs], -1)?;
-        let seq_len = x.shape()[2];
-        let shape = [1, 1, seq_len, head_dim];
-        let cos = ops::cos(&emb)?.as_dtype(x.dtype())?.reshape(&shape)?;
-        let sin = ops::sin(&emb)?.as_dtype(x.dtype())?.reshape(&shape)?;
-        apply_rotary_pos_emb(x, &cos, &sin)
+        // Single-dispatch Metal kernel; replaces the prior
+        // outer + concat + cos + sin + multiply + rotate-half chain.
+        mlx_rs_core::per_position_rope(x, positions, &inv_freq)
     }
 }
 

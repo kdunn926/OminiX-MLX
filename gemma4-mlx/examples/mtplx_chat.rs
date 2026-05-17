@@ -22,11 +22,42 @@ use mlx_rs::{
 
 use gemma4_mlx::{
     load_tokenizer, mtplx_target::load_mtplx_target, Gemma4ChatTemplate, Gemma4Message, Generate,
-    KVCache,
+    KVCache, KeyValueCache, QuantizedKVCache,
 };
 
 /// EOS token IDs from generation_config.json.
 const EOS_TOKEN_IDS: &[i32] = &[1, 106, 50];
+
+fn run_decode<C: KeyValueCache + Default>(
+    model: &mut gemma4_mlx::Model,
+    cache: &mut Vec<C>,
+    prompt_arr: &Array,
+    temp: f32,
+    max_new: usize,
+    t_gen: &std::time::Instant,
+    t_first: &mut Option<std::time::Duration>,
+    emitted: &mut Vec<i32>,
+) -> Result<()> {
+    let generator = Generate::new(model, cache, temp, prompt_arr);
+    print!("Generating: ");
+    for (i, tok) in generator.enumerate() {
+        if i >= max_new {
+            break;
+        }
+        let tok_arr = tok.map_err(|e| anyhow!("gen step: {e:?}"))?;
+        eval([&tok_arr])?;
+        if t_first.is_none() {
+            *t_first = Some(t_gen.elapsed());
+        }
+        let id: i32 = tok_arr.reshape(&[-1])?.item::<i32>();
+        if EOS_TOKEN_IDS.contains(&id) {
+            println!("\n[hit eos at step {i}: {id}]");
+            break;
+        }
+        emitted.push(id);
+    }
+    Ok(())
+}
 fn temperature() -> f32 {
     std::env::var("TEMP")
         .ok()
@@ -81,28 +112,23 @@ fn main() -> Result<()> {
     );
     let prompt_arr = Array::from(prompt_ids.as_slice()).index(NewAxis);
 
-    let mut cache: Vec<KVCache> = Vec::new();
-    let generator = Generate::new(&mut model, &mut cache, temp, &prompt_arr);
+    // Cache type selector: set QUANTIZE_KV=1 to use mixed-precision Q8K/Q4V
+    // KV cache (mlx_rs_core::QuantizedKVCache) instead of the default
+    // bf16 KVCache. The generic `Generate` iterator and `Model::forward`
+    // path both work with any `KeyValueCache + Default`, so this is a
+    // type-level switch only.
+    let quantize_kv = std::env::var("QUANTIZE_KV").is_ok();
+    println!("quantize_kv: {quantize_kv}");
 
-    print!("Generating: ");
-    let mut emitted: Vec<i32> = Vec::with_capacity(max_new);
     let t_gen = std::time::Instant::now();
     let mut t_first: Option<std::time::Duration> = None;
-    for (i, tok) in generator.enumerate() {
-        if i >= max_new {
-            break;
-        }
-        let tok_arr = tok.map_err(|e| anyhow!("gen step: {e:?}"))?;
-        eval([&tok_arr])?;
-        if t_first.is_none() {
-            t_first = Some(t_gen.elapsed());
-        }
-        let id: i32 = tok_arr.reshape(&[-1])?.item::<i32>();
-        if EOS_TOKEN_IDS.contains(&id) {
-            println!("\n[hit eos at step {i}: {id}]");
-            break;
-        }
-        emitted.push(id);
+    let mut emitted: Vec<i32> = Vec::with_capacity(max_new);
+    if quantize_kv {
+        let mut cache: Vec<QuantizedKVCache> = Vec::new();
+        run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
+    } else {
+        let mut cache: Vec<KVCache> = Vec::new();
+        run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
     }
     let total = t_gen.elapsed();
     let ttft = t_first.unwrap_or(total);

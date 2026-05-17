@@ -527,6 +527,12 @@ where
                     finished = true;
                     return Some(Err(Exception::custom("prompt_tokens must not be empty")));
                 }
+                // Build CopySpec index over the prompt if not provided —
+                // matches run_generate's behavior, enables free drafts on
+                // prompts that echo themselves.
+                if self.copyspec.is_none() {
+                    self.copyspec = Some(CopySpecIndex::new(&prompt));
+                }
                 let prompt_arr = Array::from_slice(&prompt, &[1, prompt.len() as i32]);
                 let target_logits = match self.target.prefill(&prompt_arr) {
                     Ok(l) => l,
@@ -595,40 +601,67 @@ where
             }
             let block = block_len.min(remaining).max(2);
 
-            // Staged embedding + target hidden for the DFlash drafter.
-            if let Some(emb) = self.target.embed_token(last_token) {
-                self.draft.set_staged_embedding(emb);
-            }
-            if let Some(h) = self.target.last_target_hidden() {
-                self.draft.set_target_hidden(h);
-            }
-            let last_arr = Array::from_slice(&[last_token], &[1, 1]);
-            let drafted = match self.draft.draft_block(&last_arr, block) {
-                Ok(b) => b,
-                Err(e) => {
+            // CopySpec short-circuit: if the prompt-tail index has a hit
+            // for (committed tail + last_token), use those prompt tokens as
+            // a degenerate "chain tree" (one node per depth, no branching)
+            // and skip the draft model forward entirely. The target verify
+            // still gates every proposed token via the same accept_path
+            // walk used for real trees.
+            let copyspec_hit = self
+                .copyspec
+                .as_ref()
+                .and_then(|c| c.draft_after(last_token, block - 1, None));
+            let (tree, from_copyspec) = if let Some(chain) = copyspec_hit {
+                self.metrics.copyspec_hits += 1;
+                self.metrics.copyspec_tokens += chain.len();
+                let chain_tree: Vec<crate::engine::ddtree::TreeNode> = chain
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &tok)| crate::engine::ddtree::TreeNode {
+                        token_id: tok,
+                        parent: if i == 0 { usize::MAX } else { i - 1 },
+                        depth: i + 1,
+                        joint_logp: 0.0,
+                    })
+                    .collect();
+                (chain_tree, true)
+            } else {
+                // Staged embedding + target hidden for the DFlash drafter.
+                if let Some(emb) = self.target.embed_token(last_token) {
+                    self.draft.set_staged_embedding(emb);
+                }
+                if let Some(h) = self.target.last_target_hidden() {
+                    self.draft.set_target_hidden(h);
+                }
+                let last_arr = Array::from_slice(&[last_token], &[1, 1]);
+                let drafted = match self.draft.draft_block(&last_arr, block) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        finished = true;
+                        return Some(Err(e));
+                    }
+                };
+                let block_logits = drafted.logits.index((0, .., ..));
+                if let Err(e) = eval([&block_logits]) {
                     finished = true;
                     return Some(Err(e));
                 }
-            };
-            // drafted.logits: [1, block-1, vocab].
-            let block_logits = drafted.logits.index((0, .., ..));
-            if let Err(e) = eval([&block_logits]) {
-                finished = true;
-                return Some(Err(e));
-            }
-            let (top_ids, top_lps) =
-                match crate::engine::ddtree::topk_per_position(&block_logits, ddtree_cfg.tree_topk) {
+                let (top_ids, top_lps) = match crate::engine::ddtree::topk_per_position(
+                    &block_logits,
+                    ddtree_cfg.tree_topk,
+                ) {
                     Ok(v) => v,
                     Err(e) => {
                         finished = true;
                         return Some(Err(e));
                     }
                 };
-            let tree = crate::engine::ddtree::build_tree(
-                &top_ids,
-                &top_lps,
-                ddtree_cfg.tree_budget,
-            );
+                (
+                    crate::engine::ddtree::build_tree(&top_ids, &top_lps, ddtree_cfg.tree_budget),
+                    false,
+                )
+            };
+            let _ = from_copyspec;
 
             let kv_offset = self.target.step_count() as i32;
             let start_pos = kv_offset;
@@ -723,10 +756,22 @@ where
             root_pred = next_root;
 
             // Commit accepted prefix + bonus.
+            let mut committed_this: Vec<u32> = Vec::with_capacity(accepted.len() + 1);
             for &i in &accepted {
-                pending.push_back(Ok(tree[i].token_id));
+                let t = tree[i].token_id;
+                pending.push_back(Ok(t));
+                committed_this.push(t);
             }
             pending.push_back(Ok(bonus));
+            committed_this.push(bonus);
+
+            // Extend CopySpec index with everything committed this cycle so
+            // future cycles can short-circuit when the model echoes
+            // previously-emitted spans (common in code, math, structured
+            // outputs).
+            if let Some(cs) = self.copyspec.as_mut() {
+                cs.append_committed(&committed_this);
+            }
 
             self.metrics.total_cycles += 1;
             self.metrics.total_accepted += accepted.len();

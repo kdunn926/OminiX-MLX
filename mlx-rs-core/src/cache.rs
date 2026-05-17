@@ -191,7 +191,6 @@ impl KVCache {
     /// be in `[0, offset - past_length)`. Out-of-bounds indices are
     /// silently treated as if they were the last position (mlx semantics).
     pub fn compact(&mut self, past_length: i32, keep_indices: &Array) -> Result<(), Exception> {
-        use mlx_rs::ops::indexing::take_axis;
         let past_length = past_length.max(0);
         if past_length >= self.offset {
             return Ok(());
@@ -203,27 +202,23 @@ impl KVCache {
         }
         let current_length = self.offset - past_length;
         if keep_count == current_length {
-            // No reordering needed iff indices are 0,1,...,current_length-1.
-            // Fast path: trust the caller and skip — typical DDTree usage
-            // accepts an arbitrary subset so this branch rarely fires, but
-            // when it does it avoids an unnecessary index_select.
+            // Fast path: nothing to compact iff indices == 0,1,...,n-1.
+            // We trust the caller here — DDTree's accepted path is
+            // generally a proper subset.
             return Ok(());
         }
         if let (Some(keys), Some(values)) = (self.keys.as_mut(), self.values.as_mut()) {
-            // Slice the appended window, gather, and write back at the
-            // contiguous prefix of the same window.
-            let window_k = keys.index((Ellipsis, past_length..self.offset, ..));
-            let window_v = values.index((Ellipsis, past_length..self.offset, ..));
-            let kept_k = take_axis(&window_k, keep_indices, -2)?;
-            let kept_v = take_axis(&window_v, keep_indices, -2)?;
-            keys.index_mut(
-                (Ellipsis, past_length..past_length + keep_count, ..),
-                &kept_k,
-            );
-            values.index_mut(
-                (Ellipsis, past_length..past_length + keep_count, ..),
-                &kept_v,
-            );
+            // Single fused Metal dispatch per K/V: prefix [0..past_length)
+            // copies straight through, suffix [past_length..past_length+keep_count)
+            // gathers from input[past_length + keep_indices[i]]. Replaces the
+            // prior two-dispatch take_axis + index_mut pattern.
+            let new_keys = crate::metal_kernels::kv_compact(keys, past_length, keep_indices)?;
+            let new_values = crate::metal_kernels::kv_compact(values, past_length, keep_indices)?;
+            // The fused kernel produces a buffer of length past_length +
+            // keep_count, which is smaller than the original preallocated
+            // capacity; the next `update_and_fetch` will grow it as needed.
+            *keys = new_keys;
+            *values = new_values;
         }
         self.offset = past_length + keep_count;
         Ok(())

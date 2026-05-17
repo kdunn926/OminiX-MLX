@@ -274,27 +274,59 @@ impl TargetModel for Gemma4TargetAdapter {
         self.verify_step = 0;
         self.verify_segment_count_pre = 0;
 
+        const PREFILL_CHUNK: i32 = 64;
         let seq_len = prompt.shape()[1];
 
-        // TODO: chunked prefill. The Qwen36 adapter chunks at 64 tokens to
-        // reduce peak Metal allocation. `forward_with_hidden_capture` in
-        // gemma4-mlx does not currently support chunked prefill with hidden
-        // accumulation across chunks (would need to slice each chunk's
-        // captured `[B, chunk_T, K*H]` and stitch). For v1 we forward the
-        // whole prompt at once; for long prompts this may OOM on large
-        // models. Acceptable for the bench-routing milestone.
-        // Use the last-only variant for prefill: at vocab=262k on a 26B
-        // model the per-position LM head matmul dominates the forward when
-        // T is large, but the sampling step only needs the last position's
-        // logits. Cuts prefill LM head cost from O(T*V*H) to O(V*H).
-        let (logits, captures) = self.model.forward_last_logits_with_hidden_capture(
-            prompt,
-            &mut self.cache,
-            &self.target_layer_ids,
-        )?;
-        self.append_target_hidden(captures)?;
+        if seq_len <= PREFILL_CHUNK {
+            // Short prompt — single forward (matches the prior path).
+            let (logits, captures) = self.model.forward_last_logits_with_hidden_capture(
+                prompt,
+                &mut self.cache,
+                &self.target_layer_ids,
+            )?;
+            self.append_target_hidden(captures)?;
+            self.step = seq_len as usize;
+            return Ok(logits);
+        }
+
+        // Chunked prefill — bounds peak Metal allocation (MoE expert
+        // intermediates + attention activations grow with chunk size, not
+        // total prompt length). Intermediate chunks pay the per-position
+        // LM head cost wastefully, which is acceptable: at vocab=262k on
+        // a 26B model the LM head is ~10% of the per-chunk compute and
+        // the memory headroom recovered is the dominant win on long
+        // prompts that would otherwise OOM.
+        let mut last_logits: Option<Array> = None;
+        let mut pos = 0;
+        while pos < seq_len {
+            let end = (pos + PREFILL_CHUNK).min(seq_len);
+            let chunk = prompt.index((.., pos..end));
+            let is_last = end == seq_len;
+            let (logits, captures) = if is_last {
+                self.model.forward_last_logits_with_hidden_capture(
+                    &chunk,
+                    &mut self.cache,
+                    &self.target_layer_ids,
+                )?
+            } else {
+                let (per_pos_logits, captures) = self.model.forward_with_hidden_capture(
+                    &chunk,
+                    &mut self.cache,
+                    &self.target_layer_ids,
+                )?;
+                // Force eval to free per-chunk intermediates before the
+                // next chunk starts.
+                mlx_rs::transforms::eval([&per_pos_logits, &captures])?;
+                (per_pos_logits, captures)
+            };
+            self.append_target_hidden(captures)?;
+            if is_last {
+                last_logits = Some(logits);
+            }
+            pos = end;
+        }
         self.step = seq_len as usize;
-        Ok(logits)
+        Ok(last_logits.expect("chunked prefill produced no logits"))
     }
 
     fn verify(&mut self, drafted_tokens: &Array) -> Result<Array, Exception> {

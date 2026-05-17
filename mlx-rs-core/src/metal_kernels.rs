@@ -4,10 +4,358 @@
 //! - fused_swiglu: 10-12x faster than separate silu + multiply (for MoE models)
 //! - fused_modulate: Fused LayerNorm + modulation for DiT transformers
 //! - deltanet_recurrence: GPU-side delta-rule scan for Qwen3.5/Qwen3.6 prefill
+//! - kv_compact: single-dispatch interior KV-cache compaction for tree-shaped
+//!   speculative decoding (DDTree)
 
-use mlx_rs::{Array, error::Exception};
+use mlx_rs::{Array, Dtype, error::Exception};
 use std::ffi::CString;
 use std::sync::OnceLock;
+
+// =============================================================================
+// KV compaction kernel
+// =============================================================================
+//
+// Used by DDTree-style speculative decoding to drop rejected tree branches
+// from the interior of a KV cache buffer in a single Metal dispatch. The
+// kernel writes a fresh output cache of shape `[B, H, past_length +
+// keep_count, D]`:
+//   positions [0..past_length)            ← copied straight from input
+//   positions [past_length..pl+keep_cnt)  ← gathered from input[past_length + keep_indices[i]]
+//
+// This replaces the prior implementation that did `take_axis` (one Metal
+// dispatch into a temp tensor) + `index_mut` (a second dispatch to copy
+// back), so the per-cycle compact cost is roughly halved on long caches
+// where the prefix copy dominates.
+const KV_COMPACT_KERNEL_SOURCE: &str = r#"
+    // Grid layout: (D * out_S, H, B) — one thread per output element.
+    uint d = thread_position_in_grid.x % uint(D);
+    uint t = thread_position_in_grid.x / uint(D);
+    uint h = thread_position_in_grid.y;
+    uint b = thread_position_in_grid.z;
+    if (t >= uint(out_S)) return;
+
+    // Source slot in the input cache.
+    int src_t;
+    if (int(t) < past_length) {
+        src_t = int(t);
+    } else {
+        src_t = past_length + keep_indices[int(t) - past_length];
+    }
+
+    uint in_stride_t  = uint(D);
+    uint in_stride_h  = uint(S) * in_stride_t;
+    uint in_stride_b  = uint(H) * in_stride_h;
+    uint out_stride_t = uint(D);
+    uint out_stride_h = uint(out_S) * out_stride_t;
+    uint out_stride_b = uint(H) * out_stride_h;
+
+    uint src = b * in_stride_b  + h * in_stride_h  + uint(src_t) * in_stride_t + d;
+    uint dst = b * out_stride_b + h * out_stride_h + t * out_stride_t          + d;
+    out[dst] = in_buf[src];
+"#;
+
+static KV_COMPACT_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+
+// =============================================================================
+// Per-position RoPE kernel
+// =============================================================================
+//
+// The stock `mlx::fast::rope` Metal kernel takes a single starting offset
+// and rotates positions [offset, offset+1, ..., offset+L-1] sequentially.
+// For DDTree's fused tree forward we need DIFFERENT positions per token
+// (siblings at the same tree depth share a position), so the spike has
+// been using a slow Rust path that computes cos/sin via outer product +
+// generic ops.
+//
+// This kernel does the per-position rotation in one Metal dispatch.
+// Layout: each thread computes ONE output element using the
+// non-traditional rotate-half formulation (the same one MLX's
+// `apply_rotary_pos_emb` uses):
+//   for d in 0..half_dim:
+//       angle = positions[t] * inv_freq[d]
+//       out[..t, d]            = x[..t, d]            * cos(angle)
+//                              - x[..t, d + half_dim] * sin(angle)
+//       out[..t, d + half_dim] = x[..t, d + half_dim] * cos(angle)
+//                              + x[..t, d]            * sin(angle)
+const PER_POSITION_ROPE_KERNEL_SOURCE: &str = r#"
+    uint d = thread_position_in_grid.x % uint(D);
+    uint t = thread_position_in_grid.x / uint(D);
+    uint h = thread_position_in_grid.y;
+    uint b = thread_position_in_grid.z;
+    if (t >= uint(L)) return;
+
+    uint half_dim = uint(D) / 2;
+    uint d_lo = (d < half_dim) ? d : (d - half_dim);
+
+    float pos   = positions[t];
+    float invf  = inv_freq[d_lo];
+    float angle = pos * invf;
+    float cos_v = metal::cos(angle);
+    float sin_v = metal::sin(angle);
+
+    uint stride_t = uint(D);
+    uint stride_h = uint(L) * stride_t;
+    uint stride_b = uint(H) * stride_h;
+    uint base = b * stride_b + h * stride_h + t * stride_t;
+
+    T x_lo = in_buf[base + d_lo];
+    T x_hi = in_buf[base + d_lo + half_dim];
+    T out_v;
+    if (d < half_dim) {
+        out_v = T(float(x_lo) * cos_v - float(x_hi) * sin_v);
+    } else {
+        out_v = T(float(x_hi) * cos_v + float(x_lo) * sin_v);
+    }
+    out[base + d] = out_v;
+"#;
+
+static PER_POSITION_ROPE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_per_position_rope_kernel() -> MetalKernel {
+    unsafe {
+        let in_name = CString::new("in_buf").unwrap();
+        let inv_name = CString::new("inv_freq").unwrap();
+        let pos_name = CString::new("positions").unwrap();
+        let out_name = CString::new("out").unwrap();
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, in_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, inv_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, pos_name.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, out_name.as_ptr());
+        let source = CString::new(PER_POSITION_ROPE_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("per_position_rope").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Apply rotary positional embedding to `x` of shape `[B, H, L, D]` using
+/// a per-token `positions[L]` array and a `inv_freq[D/2]` table (both
+/// f32). Non-traditional (rotate-half) variant. Returns a fresh `[B, H,
+/// L, D]` of the same dtype as `x`.
+///
+/// Single Metal dispatch — replaces the prior outer-product + cos + sin
+/// + rotate-half chain (~6 MLX kernels) that the spike used.
+pub fn per_position_rope(
+    x: &Array,
+    positions: &Array,
+    inv_freq: &Array,
+) -> Result<Array, Exception> {
+    let shape = x.shape();
+    if shape.len() != 4 {
+        return Err(Exception::custom(format!(
+            "per_position_rope expects [B,H,L,D], got {:?}",
+            shape
+        )));
+    }
+    let b = shape[0];
+    let h = shape[1];
+    let l = shape[2];
+    let d = shape[3];
+    if d % 2 != 0 {
+        return Err(Exception::custom(format!(
+            "per_position_rope requires even head_dim, got D={d}"
+        )));
+    }
+    let dtype: u32 = x.dtype().into();
+    let positions = positions.as_dtype(Dtype::Float32)?;
+    let inv_freq = inv_freq.as_dtype(Dtype::Float32)?;
+
+    let kernel = PER_POSITION_ROPE_KERNEL.get_or_init(create_per_position_rope_kernel);
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype,
+        );
+        for (name, value) in [("D", d), ("H", h), ("L", l)] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config,
+            (d * l).max(1),
+            h.max(1),
+            b.max(1),
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+        let out_shape: [i32; 4] = [b, h, l, d];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            dtype,
+        );
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, x.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, inv_freq.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, positions.as_ptr());
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("per_position_rope kernel execution failed"));
+        }
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+        Ok(Array::from_ptr(result))
+    }
+}
+
+fn create_kv_compact_kernel() -> MetalKernel {
+    unsafe {
+        let in_name = CString::new("in_buf").unwrap();
+        let idx_name = CString::new("keep_indices").unwrap();
+        let out_name = CString::new("out").unwrap();
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, in_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, idx_name.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, out_name.as_ptr());
+        let source = CString::new(KV_COMPACT_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("kv_compact_gather").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Compact a `[B, H, S, D]` cache buffer by keeping only the slots in
+/// `keep_indices` (offsets into the appended window starting at
+/// `past_length`). Returns a fresh `[B, H, past_length + keep_count, D]`
+/// buffer in ONE Metal dispatch.
+///
+/// Replaces the prior stock-MLX path which dispatched `take_axis` into a
+/// temp tensor (one Metal kernel) and then `index_mut` to scatter back
+/// into the cache buffer (a second Metal kernel) — two dispatches, two
+/// allocations. The fused kernel does both regions (prefix copy + window
+/// gather) in a single grid.
+pub fn kv_compact(
+    in_buf: &Array,
+    past_length: i32,
+    keep_indices: &Array,
+) -> Result<Array, Exception> {
+    let shape = in_buf.shape();
+    if shape.len() != 4 {
+        return Err(Exception::custom(format!(
+            "kv_compact expects [B,H,S,D], got {:?}",
+            shape
+        )));
+    }
+    let b = shape[0];
+    let h = shape[1];
+    let s = shape[2];
+    let d = shape[3];
+    let keep_count = keep_indices.shape()[0];
+    let out_s = past_length + keep_count;
+    let dtype: u32 = in_buf.dtype().into();
+    let keep_indices = if keep_indices.dtype() != Dtype::Int32 {
+        keep_indices.as_dtype(Dtype::Int32)?
+    } else {
+        keep_indices.clone()
+    };
+
+    let kernel = KV_COMPACT_KERNEL.get_or_init(create_kv_compact_kernel);
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype,
+        );
+        for (name, value) in [
+            ("D", d),
+            ("H", h),
+            ("S", s),
+            ("out_S", out_s),
+            ("past_length", past_length),
+            ("keep_count", keep_count),
+        ] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config,
+            (d * out_s).max(1),
+            h.max(1),
+            b.max(1),
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+
+        let out_shape: [i32; 4] = [b, h, out_s, d];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            dtype,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, in_buf.as_ptr());
+        // Sentinel keep_indices if empty (kernel still receives a valid pointer).
+        let keep_for_kernel = if keep_count == 0 {
+            mlx_rs::Array::from_slice::<i32>(&[0i32], &[1])
+        } else {
+            keep_indices
+        };
+        mlx_sys::mlx_vector_array_append_value(inputs, keep_for_kernel.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("kv_compact kernel execution failed"));
+        }
+
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok(Array::from_ptr(result))
+    }
+}
 
 const SWIGLU_KERNEL_SOURCE: &str = r#"
     uint elem = thread_position_in_grid.x;
