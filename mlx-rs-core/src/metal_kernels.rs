@@ -312,6 +312,268 @@ const TQ_DECOMPRESS_4BIT_KERNEL: &str = r#"
 static TQ_COMPRESS_4BIT_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
 static TQ_DECOMPRESS_4BIT_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
 
+// =============================================================================
+// Fused TurboQuant QK score kernel
+// =============================================================================
+//
+// Computes per-position attention scores directly from compressed K
+// (no intermediate dequantization) using the algebraic identity:
+//   Q · K = Q · (signs ⊙ Hadamard^-1(centroids[idx] * sigma) + mean)
+//         = Hadamard(signs ⊙ Q) · (centroids[idx] * sigma) + mean * sum(Q)
+//         = sigma * (Q_rot · centroids[idx]) + mean * query_sum
+//
+// where Q_rot = Hadamard(signs ⊙ Q) is the pre-rotated query (Hadamard
+// is orthogonal symmetric so it's its own inverse modulo normalization).
+//
+// Grid layout: one threadgroup per (b, h, q) triple. Each threadgroup
+// owns one Q vector, pre-rotates it once, then computes scores against
+// all kv positions in parallel across the 64 threads.
+//
+// GQA mapping: q_head h → kv_head h / kv_repeat, where kv_repeat =
+// n_q_heads / n_kv_heads. Both head counts come in via template ints.
+const TQ_QK_SCORE_KERNEL: &str = r#"
+    uint tid = thread_position_in_threadgroup.x;
+    uint group = threadgroup_position_in_grid.x;
+    // Decompose group = b * Hq + h_q (q_len = 1 in spike).
+    uint b   = group / uint(Hq);
+    uint h_q = group % uint(Hq);
+    if (b >= uint(B)) return;
+    uint h_kv = h_q / uint(kv_repeat);
+
+    threadgroup float s_q[512]; // pre-rotated query, head_dim ≤ 512
+
+    // Step 1: load Q[b, h_q, 0, :] × signs.
+    uint q_offset = (b * uint(Hq) + h_q) * uint(D);
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        s_q[i] = float(q_in[q_offset + i]) * signs[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: query_sum = sum_i (signs[i] * Q[i]).
+    // Derivation: K_recon[d] = (WHT(centroids[idx]*sigma)[d] + mean) * signs[d].
+    // Then Q·K_recon = sum_d Q[d]*signs[d] * WHT(c)[d] + mean * sum_d Q[d]*signs[d]
+    //               = sigma * (Q_rot · centroids[idx]) + mean * (signs⊙Q).sum()
+    // — i.e. mean is multiplied by the SIGNED query sum, not the raw sum.
+    threadgroup float s_red[64];
+    float local_sum = 0.0f;
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        local_sum += s_q[i]; // s_q already holds Q[i] * signs[i].
+    }
+    s_red[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) { s_red[tid] += s_red[tid + 32]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 16) { s_red[tid] += s_red[tid + 16]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 8)  { s_red[tid] += s_red[tid +  8]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 4)  { s_red[tid] += s_red[tid +  4]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 2)  { s_red[tid] += s_red[tid +  2]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { s_red[0] += s_red[1]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float query_sum = s_red[0];
+
+    // Step 3: in-place WHT on the sign-flipped Q (now in s_q).
+    for (uint step = 1u; step < uint(D); step <<= 1u) {
+        for (uint i = tid; i < uint(D) / 2u; i += uint(64)) {
+            uint j = (i / step) * (step * 2u) + (i % step);
+            uint k = j + step;
+            float a = s_q[j];
+            float b2 = s_q[k];
+            s_q[j] = a + b2;
+            s_q[k] = a - b2;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = metal::rsqrt(float(D));
+    for (uint i = tid; i < uint(D); i += uint(64)) {
+        s_q[i] *= scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: per-kv-position score.
+    // packed_k shape conceptually [B, H_kv, KV, D/8]; we read by index.
+    // sigma/mean shape [B, H_kv, KV].
+    uint packed_per_vec = uint(D) / 8u;
+    uint kv_stride_inner = packed_per_vec;
+    uint kv_stride_h     = uint(KV) * kv_stride_inner;
+    uint kv_stride_b     = uint(Hkv) * kv_stride_h;
+    uint kv_meta_stride_h = uint(KV);
+    uint kv_meta_stride_b = uint(Hkv) * kv_meta_stride_h;
+
+    uint out_offset = ((b * uint(Hq) + h_q) * 1u) * uint(KV);
+
+    for (uint k = tid; k < uint(KV); k += uint(64)) {
+        uint base = b * kv_stride_b + h_kv * kv_stride_h + k * kv_stride_inner;
+        float dot = 0.0f;
+        for (uint w = 0u; w < packed_per_vec; ++w) {
+            uint packed = packed_k[base + w];
+            // 8 indices in one u32.
+            uint d0 = w * 8u;
+            dot += s_q[d0 + 0u] * centroids[(packed >>  0u) & 0xFu];
+            dot += s_q[d0 + 1u] * centroids[(packed >>  4u) & 0xFu];
+            dot += s_q[d0 + 2u] * centroids[(packed >>  8u) & 0xFu];
+            dot += s_q[d0 + 3u] * centroids[(packed >> 12u) & 0xFu];
+            dot += s_q[d0 + 4u] * centroids[(packed >> 16u) & 0xFu];
+            dot += s_q[d0 + 5u] * centroids[(packed >> 20u) & 0xFu];
+            dot += s_q[d0 + 6u] * centroids[(packed >> 24u) & 0xFu];
+            dot += s_q[d0 + 7u] * centroids[(packed >> 28u) & 0xFu];
+        }
+        uint meta = b * kv_meta_stride_b + h_kv * kv_meta_stride_h + k;
+        float sigma_k = sigma_in[meta];
+        float mean_k  = mean_in[meta];
+        scores_out[out_offset + k] = sigma_k * dot + mean_k * query_sum;
+    }
+"#;
+
+static TQ_QK_SCORE_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_tq_qk_score_kernel() -> MetalKernel {
+    unsafe {
+        let q_in = CString::new("q_in").unwrap();
+        let packed_k = CString::new("packed_k").unwrap();
+        let sigma_in = CString::new("sigma_in").unwrap();
+        let mean_in = CString::new("mean_in").unwrap();
+        let signs = CString::new("signs").unwrap();
+        let centroids = CString::new("centroids").unwrap();
+        let scores_out = CString::new("scores_out").unwrap();
+
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, q_in.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, packed_k.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, sigma_in.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, mean_in.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, signs.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, centroids.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, scores_out.as_ptr());
+
+        let source = CString::new(TQ_QK_SCORE_KERNEL).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("tq_qk_score").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Fused QK score from TurboQuant 4-bit compressed K. Returns
+/// `[B, H, q_len=1, KV]` f32 scores (no scaling, no mask, no softmax —
+/// caller handles those).
+///
+/// This is the decode-time hot-path kernel: skips the K decompression
+/// entirely. For prefill / multi-query verify, use the
+/// `tq_decompress_4bit` + standard SDPA path instead (this kernel
+/// hard-codes q_len=1 for the spike).
+///
+/// GQA: `kv_repeat = n_q_heads / n_kv_heads` (must divide evenly).
+pub fn tq_qk_score(
+    q: &Array,
+    packed_k: &Array,
+    sigma_k: &Array,
+    mean_k: &Array,
+    signs: &Array,
+    centroids: &Array,
+    kv_repeat: i32,
+) -> Result<Array, Exception> {
+    let qs = q.shape();
+    if qs.len() != 4 || qs[2] != 1 {
+        return Err(Exception::custom(format!(
+            "tq_qk_score expects Q [B, Hq, 1, D] (q_len=1), got {qs:?}"
+        )));
+    }
+    let b = qs[0];
+    let h_q = qs[1];
+    let d = qs[3];
+    let ps = packed_k.shape();
+    if ps.len() != 4 || ps[3] != d / 8 {
+        return Err(Exception::custom(format!(
+            "tq_qk_score expects packed_k [B, Hkv, KV, D/8], got {ps:?}",
+        )));
+    }
+    let h_kv = ps[1];
+    let kv = ps[2];
+    if h_q != h_kv * kv_repeat {
+        return Err(Exception::custom(format!(
+            "GQA mismatch: Hq={h_q}, Hkv={h_kv}, kv_repeat={kv_repeat}"
+        )));
+    }
+    if d > 512 || d % 8 != 0 {
+        return Err(Exception::custom(format!("D must be ≤ 512 and div by 8, got {d}")));
+    }
+
+    let kernel = TQ_QK_SCORE_KERNEL_HANDLE.get_or_init(create_tq_qk_score_kernel);
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        for (name, value) in [
+            ("D", d), ("Hq", h_q), ("Hkv", h_kv), ("KV", kv), ("B", b),
+            ("kv_repeat", kv_repeat),
+        ] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        // Total threads = 64 × (B * Hq) threadgroups.
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config,
+            64 * b * h_q,
+            1,
+            1,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+
+        let out_shape: [i32; 4] = [b, h_q, 1, kv];
+        let f32_dtype: u32 = mlx_rs::Dtype::Float32.into();
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, out_shape.as_ptr(), out_shape.len(), f32_dtype,
+        );
+
+        let q_f32 = q.as_dtype(mlx_rs::Dtype::Float32)?;
+        let signs_f32 = signs.as_dtype(mlx_rs::Dtype::Float32)?;
+        let centroids_f32 = centroids.as_dtype(mlx_rs::Dtype::Float32)?;
+        let sigma_f32 = sigma_k.as_dtype(mlx_rs::Dtype::Float32)?;
+        let mean_f32 = mean_k.as_dtype(mlx_rs::Dtype::Float32)?;
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, q_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, packed_k.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, sigma_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, mean_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, signs_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, centroids_f32.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("tq_qk_score kernel failed"));
+        }
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+        Ok(Array::from_ptr(result))
+    }
+}
+
 fn create_tq_compress_4bit_kernel() -> MetalKernel {
     unsafe {
         let keys_in = CString::new("keys_in").unwrap();

@@ -239,6 +239,126 @@ mod tests {
     }
 
     #[test]
+    fn fused_qk_score_matches_dequantize_matmul() {
+        // Validates the algebraic identity:
+        //   tq_qk_score(Q, packed, sigma, mean, signs, centroids) ≈
+        //   Q · decompress(packed, sigma, mean, signs, centroids)
+        // on a [B=1, Hq=4, Hkv=2, KV=8, D=128] toy with kv_repeat=2.
+        use crate::metal_kernels::{tq_compress_4bit, tq_decompress_4bit, tq_qk_score};
+        let d = 128i32;
+        let kv = 8i32;
+        let h_q = 4i32;
+        let h_kv = 2i32;
+        let kv_repeat = h_q / h_kv;
+        let seed = 42u64;
+        // Build random K [B=1, Hkv, KV, D] and Q [B=1, Hq, 1, D].
+        let mut k_data = Vec::with_capacity((h_kv * kv * d) as usize);
+        for v in 0..(h_kv * kv) {
+            for i in 0..d {
+                let p = (v as f32) * 0.21 + (i as f32) * 0.07;
+                k_data.push(p.sin() * 0.8);
+            }
+        }
+        let k_arr = mlx_rs::Array::from_slice(&k_data, &[1, h_kv, kv, d])
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        let mut q_data = Vec::with_capacity((h_q * d) as usize);
+        for h in 0..h_q {
+            for i in 0..d {
+                let p = (h as f32) * 0.13 + (i as f32) * 0.05;
+                q_data.push(p.cos() * 0.6);
+            }
+        }
+        let q_arr = mlx_rs::Array::from_slice(&q_data, &[1, h_q, 1, d])
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+
+        // Compress K.
+        let signs_vec = cached_signs(d, seed);
+        let signs = mlx_rs::Array::from_slice(&signs_vec, &[d]);
+        let boundaries = mlx_rs::Array::from_slice(&BOUNDARIES_4BIT, &[15]);
+        let centroids = mlx_rs::Array::from_slice(&CENTROIDS_4BIT, &[16]);
+        let (packed, sigma, mean) = tq_compress_4bit(&k_arr, &signs, &boundaries).unwrap();
+        let packed = packed.reshape(&[1, h_kv, kv, d / 8]).unwrap();
+        let sigma = sigma.reshape(&[1, h_kv, kv]).unwrap();
+        let mean = mean.reshape(&[1, h_kv, kv]).unwrap();
+
+        // Reference path: decompress K and do Q @ K^T per head.
+        let k_recon = tq_decompress_4bit(
+            &packed,
+            &sigma,
+            &mean,
+            &signs,
+            &centroids,
+            &[1, h_kv, kv, d],
+            mlx_rs::Dtype::Float32,
+        )
+        .unwrap();
+        mlx_rs::transforms::eval([&k_recon]).unwrap();
+        // Expand K to [B, Hq, KV, D] by repeating per GQA.
+        // Q @ K^T : [B, Hq, 1, D] · [B, Hq, D, KV] → [B, Hq, 1, KV].
+        let k_recon_slice = k_recon.as_slice::<f32>();
+        let q_slice = q_arr.as_slice::<f32>();
+        let mut ref_scores = vec![0f32; (h_q * kv) as usize];
+        for hq in 0..h_q {
+            let hkv = hq / kv_repeat;
+            for k in 0..kv {
+                let mut acc = 0f32;
+                for i in 0..d {
+                    let q_v = q_slice[(hq * d + i) as usize];
+                    let k_v = k_recon_slice[((hkv * kv + k) * d + i) as usize];
+                    acc += q_v * k_v;
+                }
+                ref_scores[(hq * kv + k) as usize] = acc;
+            }
+        }
+
+        // Fused path.
+        let fused = tq_qk_score(
+            &q_arr,
+            &packed,
+            &sigma,
+            &mean,
+            &signs,
+            &centroids,
+            kv_repeat,
+        )
+        .unwrap();
+        mlx_rs::transforms::eval([&fused]).unwrap();
+        let fused_slice = fused.as_slice::<f32>();
+        assert_eq!(fused_slice.len(), ref_scores.len());
+
+        // Compare. The fused path computes scores via the identity
+        // sigma * (Q_rot · centroids[idx]) + mean * sum(Q); the
+        // reference goes via dequantize + Q@K^T. Both routes share the
+        // same compressed K so any divergence is from numerical
+        // round-off, not the algorithm.
+        // Tolerance: max(0.5% relative, 0.05 absolute) across all positions.
+        // Absolute floor matters because some score positions are
+        // genuinely near zero; relative-only comparison blows up there.
+        let mut worst_pos = 0;
+        let mut worst_err = 0f32;
+        for i in 0..ref_scores.len() {
+            let r = ref_scores[i];
+            let f = fused_slice[i];
+            let abs_err = (f - r).abs();
+            let denom = r.abs().max(1.0);
+            let rel = abs_err / denom;
+            let scored = if abs_err < 0.05 { 0.0 } else { rel };
+            if scored > worst_err {
+                worst_err = scored;
+                worst_pos = i;
+            }
+        }
+        assert!(
+            worst_err < 0.005,
+            "fused vs ref relative error at pos {worst_pos} = {worst_err} > 0.5%; ref={} fused={}",
+            ref_scores[worst_pos],
+            fused_slice[worst_pos],
+        );
+    }
+
+    #[test]
     fn metal_roundtrip_matches_cpu_within_tolerance() {
         let dim = 256i32;
         let n = 4i32; // batch of 4 vectors
