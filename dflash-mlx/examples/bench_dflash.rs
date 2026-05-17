@@ -14,16 +14,25 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use dflash_mlx::{
-    discover_draft_for_target, DFlashDraftAdapter, DFlashDraftModel, DFlashSession,
-    DraftCheckpointInfo, Gemma4TargetAdapter, MockDraftAdapter, Qwen36TargetAdapter,
-    SessionMetrics, SpeculativeCycleConfig,
+    build_tree, discover_draft_for_target, topk_per_position, verify_tree_naive,
+    DDTreeConfig, DFlashDraftAdapter, DFlashDraftModel, DFlashSession, DraftCheckpointInfo,
+    DraftModel, Gemma4TargetAdapter, GemmaTreeTarget, MockDraftAdapter, Qwen36TargetAdapter,
+    SessionMetrics, SpeculativeCycleConfig, TargetModel,
 };
+use mlx_rs::ops::indexing::IndexOp;
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
 
 const DEFAULT_PROMPT: &str =
     "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n";
 
 #[derive(Debug)]
+struct DDTreeArgs {
+    enabled: bool,
+    budget: usize,
+    topk: usize,
+    fused: bool,
+}
+
 struct Args {
     target: PathBuf,
     draft: Option<PathBuf>,
@@ -31,6 +40,7 @@ struct Args {
     max_tokens: usize,
     temp: f32,
     cpu: bool,
+    ddtree: DDTreeArgs,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +251,136 @@ where
     ))
 }
 
+/// Run the DDTree path through the DFlashSession integration. Wraps the
+/// iterator returned by `run_generate_ddtree` and tallies timing.
+fn run_dflash_ddtree<T, D>(
+    session: &mut DFlashSession<T, D>,
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    temp: f32,
+    eos_tokens: &HashSet<u32>,
+) -> Result<(RunStats, SessionMetrics)>
+where
+    T: TargetModel + GemmaTreeTarget,
+    D: DraftModel,
+{
+    let start = Instant::now();
+    let mut ttft = None;
+    let mut total_tokens = 0usize;
+    let eos_vec: Vec<u32> = eos_tokens.iter().copied().collect();
+    for token in session.run_generate_ddtree(prompt_tokens, max_tokens, temp, &eos_vec) {
+        let token_id = token?;
+        if ttft.is_none() {
+            ttft = Some(start.elapsed().as_secs_f64());
+        }
+        if eos_tokens.contains(&token_id) {
+            break;
+        }
+        total_tokens += 1;
+    }
+    Ok((
+        finalize_stats(start, ttft, total_tokens),
+        session.metrics().clone(),
+    ))
+}
+
+/// DDTree naive driver — kept as a separate path for measurement
+/// comparison (verifies each tree branch with KV snapshot/restore between
+/// branches). Production code should prefer the fused integrated path
+/// via `DFlashSession::run_generate_ddtree`.
+fn run_ddtree_naive<T: TargetModel + GemmaTreeTarget, D: DraftModel>(
+    target: &mut T,
+    draft: &mut D,
+    prompt_tokens: Vec<u32>,
+    max_tokens: usize,
+    temp: f32,
+    eos_tokens: &HashSet<u32>,
+    block_size: usize,
+    tree_budget: usize,
+    tree_topk: usize,
+) -> Result<(RunStats, SessionMetrics)> {
+    let start = Instant::now();
+    let prompt_arr = mlx_rs::Array::from_slice(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
+    let target_logits = target.prefill(&prompt_arr)?;
+    let _ = draft.prefill(&prompt_arr)?;
+    if let Some(h) = target.last_target_hidden() {
+        draft.set_target_hidden(h);
+    }
+    let first_tok_arr = target
+        .sample(&target_logits, temp)?
+        .as_dtype(mlx_rs::Dtype::Uint32)?;
+    let first_tok_arr = first_tok_arr.contiguous()?;
+    mlx_rs::transforms::eval([&first_tok_arr])?;
+    let first_token = first_tok_arr.item::<u32>();
+    let ttft = start.elapsed().as_secs_f64();
+
+    let mut emitted: Vec<u32> = vec![first_token];
+    let mut last_token = first_token;
+    let mut metrics = SessionMetrics::default();
+
+    while emitted.len() < max_tokens && !eos_tokens.contains(&last_token) {
+        let remaining = max_tokens - emitted.len();
+        if remaining < 2 {
+            break;
+        }
+        let block_len = block_size.min(remaining).max(2);
+
+        // Staged embedding for DFlash drafter alignment.
+        if let Some(staged_emb) = target.embed_token(last_token) {
+            draft.set_staged_embedding(staged_emb);
+        }
+        if let Some(h) = target.last_target_hidden() {
+            draft.set_target_hidden(h);
+        }
+        let last_arr = mlx_rs::Array::from_slice(&[last_token], &[1, 1]);
+        let drafted = draft.draft_block(&last_arr, block_len)?;
+        // drafted.logits: [1, block_len-1, vocab] — per-position next-token
+        // logits over the diffusion block.
+        let block_logits = drafted.logits.index((0, .., ..));
+        mlx_rs::transforms::eval([&block_logits])?;
+        let (top_ids, top_lps) = topk_per_position(&block_logits, tree_topk)?;
+        let tree = build_tree(&top_ids, &top_lps, tree_budget);
+        let kv_offset = target.step_count() as i32;
+        let start_pos = kv_offset; // seed token at absolute position kv_offset
+
+        let _ = start_pos;
+        let _ = kv_offset;
+        let (accepted, bonus) = {
+            let (acc, bonus_tok, _accepted_tokens) =
+                verify_tree_naive(target, last_token, &tree)?;
+            (acc, bonus_tok)
+        };
+        let n_accepted = accepted.len();
+        metrics.total_cycles += 1;
+        metrics.total_drafted += tree.len();
+        metrics.total_accepted += n_accepted;
+
+        // Commit accepted path + bonus.
+        for &idx in &accepted {
+            let tok = tree[idx].token_id;
+            emitted.push(tok);
+            if eos_tokens.contains(&tok) || emitted.len() >= max_tokens {
+                break;
+            }
+        }
+        if !eos_tokens.contains(emitted.last().unwrap()) && emitted.len() < max_tokens {
+            emitted.push(bonus);
+        }
+        last_token = *emitted.last().unwrap();
+        // Sync hidden capture for next cycle.
+        if let Some(h) = target.last_target_hidden() {
+            draft.set_target_hidden(h);
+        }
+    }
+
+    if metrics.total_drafted > 0 {
+        metrics.acceptance_ratio = metrics.total_accepted as f32 / metrics.total_drafted as f32;
+        metrics.avg_block_len = metrics.total_accepted as f32 / metrics.total_cycles as f32;
+    }
+    metrics.total_tokens = emitted.len();
+    Ok((finalize_stats(start, Some(ttft), emitted.len()), metrics))
+}
+
 fn finalize_stats(start: Instant, ttft: Option<f64>, total_tokens: usize) -> RunStats {
     let elapsed = start.elapsed().as_secs_f64();
     let prefill_s = ttft.unwrap_or(elapsed);
@@ -389,20 +529,60 @@ fn run_gemma4(
             let lm_head_weight = model
                 .get_lm_head_weight()
                 .map_err(|e| anyhow!(e.to_string()))?;
-            let target = Gemma4TargetAdapter::with_dflash(model, args.temp, target_layer_ids);
-            let draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
-            let spec_config = SpeculativeCycleConfig {
-                block_len: block_size,
-                ..Default::default()
+            let mut target =
+                Gemma4TargetAdapter::with_dflash(model, args.temp, target_layer_ids);
+            let mut draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
+            let (dflash_stats, metrics) = if args.ddtree.enabled {
+                println!(
+                    "DDTree mode: budget={} topk={} block_size={} fused={}",
+                    args.ddtree.budget, args.ddtree.topk, block_size, args.ddtree.fused
+                );
+                if args.ddtree.fused {
+                    // Production path: DDTree integrated into DFlashSession.
+                    let spec_config = SpeculativeCycleConfig {
+                        block_len: block_size,
+                        ddtree: Some(DDTreeConfig {
+                            tree_budget: args.ddtree.budget,
+                            tree_topk: args.ddtree.topk,
+                        }),
+                        ..Default::default()
+                    };
+                    let mut session = DFlashSession::new(target, draft, spec_config);
+                    run_dflash_ddtree(
+                        &mut session,
+                        prompt_ids,
+                        args.max_tokens,
+                        args.temp,
+                        &eos_tokens,
+                    )?
+                } else {
+                    // Naive path: kept for measurement comparison only.
+                    run_ddtree_naive(
+                        &mut target,
+                        &mut draft,
+                        prompt_ids,
+                        args.max_tokens,
+                        args.temp,
+                        &eos_tokens,
+                        block_size,
+                        args.ddtree.budget,
+                        args.ddtree.topk,
+                    )?
+                }
+            } else {
+                let spec_config = SpeculativeCycleConfig {
+                    block_len: block_size,
+                    ..Default::default()
+                };
+                let mut session = DFlashSession::new(target, draft, spec_config);
+                run_dflash_session(
+                    &mut session,
+                    prompt_ids,
+                    args.max_tokens,
+                    args.temp,
+                    &eos_tokens,
+                )?
             };
-            let mut session = DFlashSession::new(target, draft, spec_config);
-            let (dflash_stats, metrics) = run_dflash_session(
-                &mut session,
-                prompt_ids,
-                args.max_tokens,
-                args.temp,
-                &eos_tokens,
-            )?;
             println!(
                 "DFlash(gemma4): prefill_s={:.3} decode_tok_s={:.2} acceptance_ratio={:.3} avg_block_len={:.2} total_tokens={}",
                 dflash_stats.prefill_s,
@@ -449,6 +629,10 @@ fn parse_args() -> Result<Args> {
     let mut max_tokens = 200usize;
     let mut temp = 0.7f32;
     let mut cpu = false;
+    let mut ddtree_enabled = false;
+    let mut ddtree_budget = 16usize;
+    let mut ddtree_topk = 4usize;
+    let mut ddtree_naive = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -484,6 +668,22 @@ fn parse_args() -> Result<Args> {
                     .context("invalid --temp value")?
             }
             "--cpu" => cpu = true,
+            "--ddtree" => ddtree_enabled = true,
+            "--tree-budget" => {
+                ddtree_budget = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--tree-budget requires a value"))?
+                    .parse()
+                    .context("invalid --tree-budget value")?
+            }
+            "--tree-naive" => ddtree_naive = true,
+            "--tree-topk" => {
+                ddtree_topk = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--tree-topk requires a value"))?
+                    .parse()
+                    .context("invalid --tree-topk value")?
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: cargo run --release --example bench_dflash -- --target /path/to/Qwen3.6-35B-A3B-4bit [--draft /path/to/DFlash-draft-model] [--prompt \"...\"] [--max-tokens 200] [--temp 0.7] [--cpu]"
@@ -501,5 +701,11 @@ fn parse_args() -> Result<Args> {
         max_tokens,
         temp,
         cpu,
+        ddtree: DDTreeArgs {
+            enabled: ddtree_enabled,
+            budget: ddtree_budget,
+            topk: ddtree_topk,
+            fused: !ddtree_naive,
+        },
     })
 }

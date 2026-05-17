@@ -178,6 +178,52 @@ impl KVCache {
         self.values.as_ref()
     }
 
+    /// Compact the "appended window" `[past_length .. offset)` by keeping
+    /// only the slots in `keep_indices` (interpreted as offsets within the
+    /// window: `0` ⇒ position `past_length`, `1` ⇒ `past_length + 1`, …).
+    /// Kept slots are written contiguously starting at `past_length` and
+    /// `offset` becomes `past_length + keep_indices.len()`.
+    ///
+    /// Used by tree-based speculative decoding (e.g. DDTree) to drop
+    /// rejected branches from the middle of a verify forward in-place,
+    /// avoiding the cost of rolling back and re-feeding the accepted
+    /// prefix. `keep_indices` must be a 1-D int32 tensor; its values must
+    /// be in `[0, offset - past_length)`. Out-of-bounds indices are
+    /// silently treated as if they were the last position (mlx semantics).
+    pub fn compact(&mut self, past_length: i32, keep_indices: &Array) -> Result<(), Exception> {
+        let past_length = past_length.max(0);
+        if past_length >= self.offset {
+            return Ok(());
+        }
+        let keep_count = keep_indices.shape()[0];
+        if keep_count == 0 {
+            self.offset = past_length;
+            return Ok(());
+        }
+        let current_length = self.offset - past_length;
+        if keep_count == current_length {
+            // Fast path: nothing to compact iff indices == 0,1,...,n-1.
+            // We trust the caller here — DDTree's accepted path is
+            // generally a proper subset.
+            return Ok(());
+        }
+        if let (Some(keys), Some(values)) = (self.keys.as_mut(), self.values.as_mut()) {
+            // Single fused Metal dispatch per K/V: prefix [0..past_length)
+            // copies straight through, suffix [past_length..past_length+keep_count)
+            // gathers from input[past_length + keep_indices[i]]. Replaces the
+            // prior two-dispatch take_axis + index_mut pattern.
+            let new_keys = crate::metal_kernels::kv_compact(keys, past_length, keep_indices)?;
+            let new_values = crate::metal_kernels::kv_compact(values, past_length, keep_indices)?;
+            // The fused kernel produces a buffer of length past_length +
+            // keep_count, which is smaller than the original preallocated
+            // capacity; the next `update_and_fetch` will grow it as needed.
+            *keys = new_keys;
+            *values = new_values;
+        }
+        self.offset = past_length + keep_count;
+        Ok(())
+    }
+
     /// Drop the last `n_drop` cached positions by rewinding `offset`. The
     /// underlying preallocated buffer is unchanged; the next
     /// `update_and_fetch` will overwrite the rolled-back slots in place.

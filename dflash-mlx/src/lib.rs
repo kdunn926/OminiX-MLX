@@ -7,11 +7,15 @@ pub mod runtime;
 pub mod verify_qmm;
 
 pub use engine::acceptance::match_acceptance_length;
-pub use engine::config::{AdaptiveBlockPolicy, SpeculativeCycleConfig};
+pub use engine::config::{AdaptiveBlockPolicy, DDTreeConfig, SpeculativeCycleConfig};
 pub use engine::copyspec::CopySpecIndex;
 pub use engine::draft_adapter::DFlashDraftAdapter;
 pub use engine::gemma4_adapter::Gemma4TargetAdapter;
 pub use engine::qwen36_adapter::{DraftCheckpointInfo, MockDraftAdapter, Qwen36TargetAdapter};
+pub use engine::ddtree::{
+    accept_path, build_tree, compile_tree_inputs, topk_per_position, verify_tree_fused,
+    verify_tree_naive, GemmaTreeTarget, TreeNode,
+};
 pub use engine::spec_epoch::{
     DFlashSession, DraftBlock, DraftModel, GenerateEvent, SessionMetrics, TargetModel,
 };

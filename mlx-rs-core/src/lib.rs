@@ -35,6 +35,7 @@ pub use memory::{
 };
 pub use metal_kernels::{
     deltanet_recurrence, deltanet_tape_replay, deltanet_with_tape, fused_modulate, fused_swiglu,
+    kv_compact, per_position_rope,
 };
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{

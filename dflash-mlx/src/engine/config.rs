@@ -10,6 +10,32 @@ pub struct SpeculativeCycleConfig {
     pub tpc_threshold: f32,
     pub adaptive_window: usize,
     pub adaptive_cooldown: usize,
+    /// DDTree (Diffusion Draft Tree) override. When `Some`, sessions whose
+    /// target implements `GemmaTreeTarget` can use `run_generate_ddtree`
+    /// for tree-shaped speculative decoding. The plain `run_generate`
+    /// path ignores this field.
+    pub ddtree: Option<DDTreeConfig>,
+}
+
+/// Knobs for the DDTree variant of the spec-decoding cycle.
+#[derive(Debug, Clone, Copy)]
+pub struct DDTreeConfig {
+    /// Maximum number of tree nodes per cycle (excludes the implicit
+    /// root / seed). Larger budgets explore more candidates but cost
+    /// proportionally more per-cycle verify.
+    pub tree_budget: usize,
+    /// Per-depth top-k token count for tree expansion. The heap pops at
+    /// most `topk` candidates per depth before expanding deeper.
+    pub tree_topk: usize,
+}
+
+impl Default for DDTreeConfig {
+    fn default() -> Self {
+        Self {
+            tree_budget: 6,
+            tree_topk: 2,
+        }
+    }
 }
 
 impl Default for SpeculativeCycleConfig {
@@ -23,6 +49,7 @@ impl Default for SpeculativeCycleConfig {
             tpc_threshold: 3.5,
             adaptive_window: 4,
             adaptive_cooldown: 64,
+            ddtree: None,
         }
     }
 }

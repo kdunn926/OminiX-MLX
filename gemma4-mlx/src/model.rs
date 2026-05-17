@@ -275,6 +275,47 @@ impl GemmaRope {
             <nn::Rope as Module<nn::RopeInput>>::training_mode(rope, mode);
         }
     }
+
+    /// Per-position RoPE for `x` of shape `[B, H, L, D]` with positions
+    /// `[L]` (i64 / int32). Used by DDTree's fused tree-mask verify where
+    /// tree nodes at the same depth share the same logical position even
+    /// though they sit at different cache slots.
+    ///
+    /// Falls back to a generic cos/sin path for both Standard and
+    /// Proportional variants — the `fast::rope` Metal kernel only accepts
+    /// a single starting offset, so per-position rotation has to be done
+    /// the slow way (one outer product + cos/sin per call). For
+    /// small-L tree forwards (≤ tree_budget tokens) this is dominated by
+    /// attention/MLP costs anyway.
+    pub fn apply_per_position(
+        &self,
+        x: &Array,
+        positions: &Array,
+    ) -> Result<Array, Exception> {
+        if x.shape().len() != 4 {
+            return Err(Exception::custom(format!(
+                "apply_per_position expects 4D [B,H,L,D], got shape {:?}",
+                x.shape()
+            )));
+        }
+        let head_dim = x.shape()[3];
+        let inv_freq = match self {
+            Self::Standard(rope) => standard_inv_freq(rope.base, head_dim)?,
+            Self::Proportional(rope) => rope.inv_freq.clone(),
+        };
+        // Single-dispatch Metal kernel; replaces the prior
+        // outer + concat + cos + sin + multiply + rotate-half chain.
+        mlx_rs_core::per_position_rope(x, positions, &inv_freq)
+    }
+}
+
+fn standard_inv_freq(base: f32, head_dim: i32) -> Result<Array, Exception> {
+    let half_dim = head_dim / 2;
+    let mut inv = Vec::with_capacity(half_dim as usize);
+    for i in 0..half_dim {
+        inv.push(1.0 / base.powf((2 * i) as f32 / head_dim as f32));
+    }
+    Ok(Array::from_slice(&inv, &[half_dim]))
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +462,12 @@ pub struct AttentionInput<'a, C> {
     pub cache: &'a mut C,
     /// Pre-computed shared KV from an earlier layer (for KV-shared layers).
     pub shared_kv: Option<(Array, Array)>,
+    /// Explicit per-token RoPE positions. When `Some([L])`, each token in
+    /// the L-length input gets its Q (and K, if computed) rotated to its
+    /// own position instead of the sequential `cache.offset() + i` default.
+    /// Used by DDTree's fused tree-mask forward where tree nodes at the
+    /// same depth share the same logical position.
+    pub position_ids: Option<&'a Array>,
 }
 
 impl<C> Module<AttentionInput<'_, C>> for Attention
@@ -437,6 +484,7 @@ where
             mask,
             cache,
             shared_kv,
+            position_ids,
         } = input;
 
         let shape = x.shape();
@@ -479,7 +527,10 @@ where
             keys = keys.transpose_axes(&[0, 2, 1, 3])?;
             values = values.transpose_axes(&[0, 2, 1, 3])?;
 
-            keys = self.rope.apply(&keys, offset)?;
+            keys = match position_ids {
+                Some(pos) => self.rope.apply_per_position(&keys, pos)?,
+                None => self.rope.apply(&keys, offset)?,
+            };
 
             cache.update_and_fetch(keys, values)?
         };
@@ -492,7 +543,10 @@ where
         } else {
             offset
         };
-        queries = self.rope.apply(&queries, rope_offset)?;
+        queries = match position_ids {
+            Some(pos) => self.rope.apply_per_position(&queries, pos)?,
+            None => self.rope.apply(&queries, rope_offset)?,
+        };
 
         let sliding_mask = match (mask, self.sliding_window) {
             (None, Some(window)) => {
@@ -734,6 +788,9 @@ pub struct DecoderLayerInput<'a, C> {
     pub shared_kv: Option<(Array, Array)>,
     /// Per-layer embedding input for this layer.
     pub per_layer_input: Option<&'a Array>,
+    /// Optional per-token RoPE positions; forwarded into `AttentionInput`.
+    /// `None` ⇒ standard cache-offset-based sequential rotation.
+    pub position_ids: Option<&'a Array>,
 }
 
 impl<C> Module<DecoderLayerInput<'_, C>> for DecoderLayer
@@ -750,6 +807,7 @@ where
             cache,
             shared_kv,
             per_layer_input,
+            position_ids,
         } = input;
 
         let residual = hidden_states.clone();
@@ -760,6 +818,7 @@ where
             mask,
             cache,
             shared_kv,
+            position_ids,
         })?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
         let mut hidden_states = residual.add(&attn_out)?;
@@ -997,6 +1056,7 @@ where
                 cache: &mut cache[cache_slot],
                 shared_kv,
                 per_layer_input: ple_slice.as_ref(),
+                position_ids: None,
             })?;
 
             // If this layer stores KV for sharing, snapshot the sliced KV
@@ -1066,6 +1126,7 @@ impl LanguageModel {
                 cache: &mut cache[cache_slot],
                 shared_kv,
                 per_layer_input: ple_slice.as_ref(),
+                position_ids: None,
             })?;
 
             if self.kv_store_layers.contains(&i) {
@@ -1239,6 +1300,129 @@ impl Model {
         mq_embedding_dequant_weight(&self.model.embed_tokens, self.quantization.as_ref())
     }
 
+    /// DDTree fused-tree forward.
+    ///
+    /// Runs a single target forward over the flat list of tree tokens
+    /// `[1, L]` with explicit per-token `position_ids [L]` and a custom
+    /// `[L, kv_offset + L]` attention mask (additive log-probs style:
+    /// 0 for visible, large-negative for blocked).
+    ///
+    /// Returns `[1, L, vocab]` per-position logits. The target's KV cache
+    /// grows by L slots; caller is responsible for trimming/compacting
+    /// rejected tree positions before the next forward.
+    /// As `forward_tree` but also returns per-token post-norm hidden so
+    /// callers (DDTree) can derive next-cycle root_pred from the
+    /// last-accepted-node hidden without an extra LM head call.
+    pub fn forward_tree_with_hidden(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+        cache: &mut Vec<KVCache>,
+    ) -> Result<(Array, Array), Exception> {
+        if self.args.num_kv_shared_layers > 0 {
+            return Err(Exception::custom(
+                "forward_tree_with_hidden: shared KV layers not supported in the DDTree spike path",
+            ));
+        }
+        if self.model.hidden_size_per_layer_input > 0 {
+            return Err(Exception::custom(
+                "forward_tree_with_hidden: PLE not supported in the DDTree spike path",
+            ));
+        }
+        let mut h = self.model.embed_tokens.forward(tokens)?;
+        let scale = if self.model.embed_scale.dtype() == h.dtype() {
+            self.model.embed_scale.clone()
+        } else {
+            self.model.embed_scale.as_dtype(h.dtype())?
+        };
+        h = h.multiply(&scale)?;
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let cache_slot = self.model.kv_cache_map[i];
+            h = layer.forward(DecoderLayerInput {
+                hidden_states: &h,
+                mask: Some(attention_mask),
+                cache: &mut cache[cache_slot],
+                shared_kv: None,
+                per_layer_input: None,
+                position_ids: Some(position_ids),
+            })?;
+        }
+        let normed = self.model.norm.forward(&h)?;
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm) => lm.forward(&normed)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &normed)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok((logits, normed))
+    }
+
+    pub fn forward_tree(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+        cache: &mut Vec<KVCache>,
+    ) -> Result<Array, Exception> {
+        if self.args.num_kv_shared_layers > 0 {
+            return Err(Exception::custom(
+                "forward_tree: shared KV layers not supported in the DDTree spike path",
+            ));
+        }
+        if self.model.hidden_size_per_layer_input > 0 {
+            return Err(Exception::custom(
+                "forward_tree: PLE not supported in the DDTree spike path",
+            ));
+        }
+        let mut h = self.model.embed_tokens.forward(tokens)?;
+        let scale = if self.model.embed_scale.dtype() == h.dtype() {
+            self.model.embed_scale.clone()
+        } else {
+            self.model.embed_scale.as_dtype(h.dtype())?
+        };
+        h = h.multiply(&scale)?;
+
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let cache_slot = self.model.kv_cache_map[i];
+            h = layer.forward(DecoderLayerInput {
+                hidden_states: &h,
+                mask: Some(attention_mask),
+                cache: &mut cache[cache_slot],
+                shared_kv: None,
+                per_layer_input: None,
+                position_ids: Some(position_ids),
+            })?;
+        }
+        let normed = self.model.norm.forward(&h)?;
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm) => lm.forward(&normed)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &normed)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok(logits)
+    }
+
+    /// Project a pre-LM-head hidden state (post-final-norm) through the LM
+    /// head to get logits. Used by external verify loops that have already
+    /// captured the hidden state and just need the projection.
+    pub fn forward_via_hidden(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm) => lm.forward(hidden)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, hidden)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok(logits)
+    }
+
     /// Forward pass that captures hidden states after each requested layer index
     /// AND returns last-position logits.  Returns `(logits[B, vocab], captures[B, T, K*H])`
     /// where K = `target_layer_ids.len()` and captures are concatenated along the last axis
@@ -1352,6 +1536,7 @@ impl Model {
                 cache: &mut cache[cache_slot],
                 shared_kv: None,
                 per_layer_input: None,
+                position_ids: None,
             })?;
 
             if target_layer_ids.iter().any(|&id| id == i) {
