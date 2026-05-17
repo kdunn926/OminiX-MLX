@@ -326,35 +326,67 @@ fn run_ddtree<T: TargetModel + GemmaTreeTarget, D: DraftModel>(
         let start_pos = kv_offset; // seed token at absolute position kv_offset
 
         let (accepted, bonus) = if fused {
-            let (acc, bonus_tok) = verify_tree_fused(
-                target,
-                &tree,
-                start_pos,
-                kv_offset,
-                root_pred,
-                mlx_rs::Dtype::Bfloat16,
+            // One fused tree forward → per-node logits + per-node hidden.
+            let (tokens, position_ids, mask) = dflash_mlx::engine::ddtree::compile_tree_inputs(
+                last_token, &tree, start_pos, kv_offset, mlx_rs::Dtype::Bfloat16,
             )?;
-            // Drop tree, then install accepted prefix + bonus linearly.
-            target.rollback_kv(0)?;
-            let mut commit_ids: Vec<u32> = Vec::with_capacity(acc.len() + 1);
-            for &idx in &acc {
-                commit_ids.push(tree[idx].token_id);
+            let (tree_logits, tree_hidden) = target
+                .verify_tree_with_hidden_call(&tokens, &position_ids, &mask)?;
+            mlx_rs::transforms::eval([&tree_logits, &tree_hidden])?;
+
+            // Acceptance walk.
+            let preds = mlx_rs::argmax_axis!(&tree_logits, -1)?
+                .as_dtype(mlx_rs::Dtype::Uint32)?
+                .reshape(&[-1])?;
+            mlx_rs::transforms::eval([&preds])?;
+            let preds_slice = preds.as_slice::<u32>();
+            let predicted_after_node: Vec<u32> = preds_slice.to_vec();
+            let (acc, bonus_tok) =
+                dflash_mlx::engine::ddtree::accept_path(&tree, &predicted_after_node, root_pred);
+
+            // In-place interior KV compaction: keep just the accepted
+            // node slots (positions kv_offset + acc[0], +acc[1], ...).
+            // Then capture bonus's "next root pred" from the LAST
+            // accepted node's hidden via lm_head, or fall back to the
+            // tree's seed-based root_pred when nothing accepted (bonus
+            // is then just root_pred and the cycle commits only that).
+            if acc.is_empty() {
+                // Nothing accepted ⇒ keep no tree slots. Bonus must still
+                // get its K/V installed before the next cycle.
+                target.compact_cache_call(
+                    kv_offset,
+                    &mlx_rs::Array::from_slice::<i32>(&[], &[0]),
+                )?;
+                let bonus_arr = mlx_rs::Array::from_slice(&[bonus_tok], &[1, 1]);
+                let bonus_logits = target.verify(&bonus_arr)?;
+                mlx_rs::transforms::eval([&bonus_logits])?;
+                let next_root_arr = mlx_rs::argmax_axis!(
+                    bonus_logits.index((.., -1, ..)).reshape(&[-1])?,
+                    -1
+                )?
+                .as_dtype(mlx_rs::Dtype::Uint32)?;
+                mlx_rs::transforms::eval([&next_root_arr])?;
+                root_pred = next_root_arr.item::<u32>();
+            } else {
+                let keep_idx_i32: Vec<i32> = acc.iter().map(|&i| i as i32).collect();
+                let keep_arr = mlx_rs::Array::from_slice(
+                    &keep_idx_i32,
+                    &[keep_idx_i32.len() as i32],
+                );
+                target.compact_cache_call(kv_offset, &keep_arr)?;
+                // Now feed bonus alone (1 token) to install its K/V and
+                // grab next-cycle root_pred from its post-norm hidden.
+                let bonus_arr = mlx_rs::Array::from_slice(&[bonus_tok], &[1, 1]);
+                let bonus_logits = target.verify(&bonus_arr)?;
+                mlx_rs::transforms::eval([&bonus_logits])?;
+                let next_root_arr = mlx_rs::argmax_axis!(
+                    bonus_logits.index((.., -1, ..)).reshape(&[-1])?,
+                    -1
+                )?
+                .as_dtype(mlx_rs::Dtype::Uint32)?;
+                mlx_rs::transforms::eval([&next_root_arr])?;
+                root_pred = next_root_arr.item::<u32>();
             }
-            commit_ids.push(bonus_tok);
-            let commit_arr = mlx_rs::Array::from_slice(
-                &commit_ids,
-                &[1, commit_ids.len() as i32],
-            );
-            let commit_logits = target.verify(&commit_arr)?;
-            mlx_rs::transforms::eval([&commit_logits])?;
-            // Capture pred for "after bonus" → next cycle's root_pred.
-            let next_root_arr = mlx_rs::argmax_axis!(
-                commit_logits.index((.., -1, ..)).reshape(&[-1])?,
-                -1
-            )?
-            .as_dtype(mlx_rs::Dtype::Uint32)?;
-            mlx_rs::transforms::eval([&next_root_arr])?;
-            root_pred = next_root_arr.item::<u32>();
             (acc, bonus_tok)
         } else {
             let (acc, bonus_tok, _accepted_tokens) =

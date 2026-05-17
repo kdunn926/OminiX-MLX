@@ -1316,6 +1316,56 @@ impl Model {
     /// Returns `[1, L, vocab]` per-position logits. The target's KV cache
     /// grows by L slots; caller is responsible for trimming/compacting
     /// rejected tree positions before the next forward.
+    /// As `forward_tree` but also returns per-token post-norm hidden so
+    /// callers (DDTree) can derive next-cycle root_pred from the
+    /// last-accepted-node hidden without an extra LM head call.
+    pub fn forward_tree_with_hidden(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+        cache: &mut Vec<KVCache>,
+    ) -> Result<(Array, Array), Exception> {
+        if self.args.num_kv_shared_layers > 0 {
+            return Err(Exception::custom(
+                "forward_tree_with_hidden: shared KV layers not supported in the DDTree spike path",
+            ));
+        }
+        if self.model.hidden_size_per_layer_input > 0 {
+            return Err(Exception::custom(
+                "forward_tree_with_hidden: PLE not supported in the DDTree spike path",
+            ));
+        }
+        let mut h = self.model.embed_tokens.forward(tokens)?;
+        let scale = if self.model.embed_scale.dtype() == h.dtype() {
+            self.model.embed_scale.clone()
+        } else {
+            self.model.embed_scale.as_dtype(h.dtype())?
+        };
+        h = h.multiply(&scale)?;
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let cache_slot = self.model.kv_cache_map[i];
+            h = layer.forward(DecoderLayerInput {
+                hidden_states: &h,
+                mask: Some(attention_mask),
+                cache: &mut cache[cache_slot],
+                shared_kv: None,
+                per_layer_input: None,
+                position_ids: Some(position_ids),
+            })?;
+        }
+        let normed = self.model.norm.forward(&h)?;
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm) => lm.forward(&normed)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &normed)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok((logits, normed))
+    }
+
     pub fn forward_tree(
         &mut self,
         tokens: &Array,

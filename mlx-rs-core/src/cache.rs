@@ -178,6 +178,57 @@ impl KVCache {
         self.values.as_ref()
     }
 
+    /// Compact the "appended window" `[past_length .. offset)` by keeping
+    /// only the slots in `keep_indices` (interpreted as offsets within the
+    /// window: `0` ⇒ position `past_length`, `1` ⇒ `past_length + 1`, …).
+    /// Kept slots are written contiguously starting at `past_length` and
+    /// `offset` becomes `past_length + keep_indices.len()`.
+    ///
+    /// Used by tree-based speculative decoding (e.g. DDTree) to drop
+    /// rejected branches from the middle of a verify forward in-place,
+    /// avoiding the cost of rolling back and re-feeding the accepted
+    /// prefix. `keep_indices` must be a 1-D int32 tensor; its values must
+    /// be in `[0, offset - past_length)`. Out-of-bounds indices are
+    /// silently treated as if they were the last position (mlx semantics).
+    pub fn compact(&mut self, past_length: i32, keep_indices: &Array) -> Result<(), Exception> {
+        use mlx_rs::ops::indexing::take_axis;
+        let past_length = past_length.max(0);
+        if past_length >= self.offset {
+            return Ok(());
+        }
+        let keep_count = keep_indices.shape()[0];
+        if keep_count == 0 {
+            self.offset = past_length;
+            return Ok(());
+        }
+        let current_length = self.offset - past_length;
+        if keep_count == current_length {
+            // No reordering needed iff indices are 0,1,...,current_length-1.
+            // Fast path: trust the caller and skip — typical DDTree usage
+            // accepts an arbitrary subset so this branch rarely fires, but
+            // when it does it avoids an unnecessary index_select.
+            return Ok(());
+        }
+        if let (Some(keys), Some(values)) = (self.keys.as_mut(), self.values.as_mut()) {
+            // Slice the appended window, gather, and write back at the
+            // contiguous prefix of the same window.
+            let window_k = keys.index((Ellipsis, past_length..self.offset, ..));
+            let window_v = values.index((Ellipsis, past_length..self.offset, ..));
+            let kept_k = take_axis(&window_k, keep_indices, -2)?;
+            let kept_v = take_axis(&window_v, keep_indices, -2)?;
+            keys.index_mut(
+                (Ellipsis, past_length..past_length + keep_count, ..),
+                &kept_k,
+            );
+            values.index_mut(
+                (Ellipsis, past_length..past_length + keep_count, ..),
+                &kept_v,
+            );
+        }
+        self.offset = past_length + keep_count;
+        Ok(())
+    }
+
     /// Drop the last `n_drop` cached positions by rewinding `offset`. The
     /// underlying preallocated buffer is unchanged; the next
     /// `update_and_fetch` will overwrite the rolled-back slots in place.

@@ -94,9 +94,82 @@ impl crate::engine::ddtree::GemmaTreeTarget for Gemma4TargetAdapter {
     ) -> Result<Array, Exception> {
         self.verify_tree(tokens, position_ids, attention_mask)
     }
+    fn compact_cache_call(
+        &mut self,
+        past_length: i32,
+        keep_indices: &Array,
+    ) -> Result<(), Exception> {
+        self.compact_cache(past_length, keep_indices)
+    }
+    fn verify_tree_with_hidden_call(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        self.verify_tree_with_hidden(tokens, position_ids, attention_mask)
+    }
+    fn lm_head_call(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        self.model.forward_via_hidden(hidden)
+    }
 }
 
 impl Gemma4TargetAdapter {
+    /// Compact every layer's KV cache by keeping only the positions in
+    /// `keep_indices` (offsets into the appended window starting at
+    /// `past_length`). Drives interior-slot deletion for DDTree's tree
+    /// accept path so we can avoid a full rollback + re-feed of the
+    /// accepted prefix.
+    pub fn compact_cache(
+        &mut self,
+        past_length: i32,
+        keep_indices: &Array,
+    ) -> Result<(), Exception> {
+        // step counter follows offset: keep them in sync.
+        let new_offset = past_length + keep_indices.shape()[0];
+        for c in self.cache.iter_mut() {
+            c.compact(past_length, keep_indices)?;
+        }
+        self.step = new_offset as usize;
+        // Hidden segments: the just-completed verify pushed one segment.
+        // For DDTree's path we don't currently rely on per-cycle hidden
+        // capture (DFlash drafter feeds from the most recent committed
+        // hidden which gets refreshed by the post-cycle single-token
+        // bonus verify). Drop the latest segment so target_hidden_segments
+        // doesn't accumulate stale tree captures.
+        if self.target_hidden_segments.len() > self.verify_segment_count_pre {
+            self.target_hidden_segments
+                .truncate(self.verify_segment_count_pre);
+            self.target_hidden_positions
+                .truncate(self.verify_segment_count_pre);
+            self.target_hidden_full_cache = None;
+        }
+        self.verify_inputs = None;
+        Ok(())
+    }
+
+    /// Like `verify_tree` but also returns per-node post-norm hidden so
+    /// the caller can derive the next-cycle root_pred from the
+    /// last-accepted-node hidden without a separate LM-head call.
+    pub fn verify_tree_with_hidden(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        self.verify_inputs = Some(tokens.clone());
+        self.verify_step = self.step;
+        self.verify_segment_count_pre = self.target_hidden_segments.len();
+        let (logits, hidden) = self.model.forward_tree_with_hidden(
+            tokens,
+            position_ids,
+            attention_mask,
+            &mut self.cache,
+        )?;
+        self.step += tokens.shape()[1] as usize;
+        Ok((logits, hidden))
+    }
+
     /// DDTree fused tree verify.
     ///
     /// Runs `Model::forward_tree` over a flat tree of tokens with explicit

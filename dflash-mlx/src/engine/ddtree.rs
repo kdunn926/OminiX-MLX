@@ -516,6 +516,30 @@ pub trait GemmaTreeTarget {
         position_ids: &Array,
         attention_mask: &Array,
     ) -> Result<Array, Exception>;
+
+    /// In-place interior compaction of the appended window of every cache
+    /// layer. Caller passes a 1-D int32 Array of slot offsets (relative to
+    /// `past_length`) to keep.
+    fn compact_cache_call(
+        &mut self,
+        past_length: i32,
+        keep_indices: &Array,
+    ) -> Result<(), Exception>;
+
+    /// `verify_tree` variant that also returns per-token post-norm hidden
+    /// `[1, L, H]`. Used to derive next-cycle root_pred from the last-
+    /// accepted-node hidden without a separate LM-head call.
+    fn verify_tree_with_hidden_call(
+        &mut self,
+        tokens: &Array,
+        position_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<(Array, Array), Exception>;
+
+    /// Apply the model's LM head to a `[1, 1, H]` hidden state, returning
+    /// `[1, 1, V]` logits. Allows the DDTree driver to obtain root_pred
+    /// from the kept tree hidden after compaction.
+    fn lm_head_call(&mut self, hidden: &Array) -> Result<Array, Exception>;
 }
 
 #[cfg(test)]
