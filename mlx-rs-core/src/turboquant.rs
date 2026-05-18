@@ -287,19 +287,45 @@ mod tests {
         let sigma = sigma.reshape(&[1, h_kv, kv]).unwrap();
         let mean = mean.reshape(&[1, h_kv, kv]).unwrap();
 
-        // Reference: decompress K, compute attention manually.
+        // Reference: decompress K + decompress V (the fused kernel
+        // dequantises V inline, so the apples-to-apples reference must
+        // also use V-dequant values rather than the original BF16 V).
+        // We need to set this up AFTER compressing V below, so this
+        // block is just q_slice/k_slice; v_slice comes from v_recon.
         let k_recon = tq_decompress_4bit(
             &packed, &sigma, &mean, &signs, &centroids,
             &[1, h_kv, kv, d], mlx_rs::Dtype::Float32,
         ).unwrap();
-        mlx_rs::transforms::eval([&k_recon, &v_arr, &q_arr]).unwrap();
+        mlx_rs::transforms::eval([&k_recon, &q_arr]).unwrap();
         let k_slice = k_recon.as_slice::<f32>();
-        let v_slice = v_arr.as_slice::<f32>();
         let q_slice = q_arr.as_slice::<f32>();
+
+        // Compress V via stock mlx 8-bit per-group symmetric quantize,
+        // matching what TurboQuantKVCache stores.
+        let v_group_size = 32i32;
+        let v_bits = 8i32;
+        let v_flat = v_arr.reshape(&[h_kv * kv, d]).unwrap();
+        let (vq, vs, vb) =
+            mlx_rs::ops::quantize(&v_flat, v_group_size, v_bits, None::<&str>).unwrap();
+        let packed_v_cols = vq.shape()[1];
+        let n_groups = d / v_group_size;
+        let vq = vq.reshape(&[1, h_kv, kv, packed_v_cols]).unwrap();
+        let vs = vs.reshape(&[1, h_kv, kv, n_groups]).unwrap();
+        let vb = vb.reshape(&[1, h_kv, kv, n_groups]).unwrap();
+
+        // V reference: dequantise and use that for the reference V
+        // matmul so the comparison is apples-to-apples with the kernel.
+        let v_recon = mlx_rs::ops::dequantize(
+            &vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
+            &vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            &vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            v_group_size, v_bits, None::<&str>,
+        ).unwrap();
+        mlx_rs::transforms::eval([&v_recon]).unwrap();
+        let v_slice = v_recon.as_slice::<f32>();
         let mut ref_out = vec![0f32; (h_q * d) as usize];
         for hq in 0..h_q {
             let hkv = hq / kv_repeat;
-            // Scores [kv].
             let mut scores = vec![0f32; kv as usize];
             for k in 0..kv {
                 let mut acc = 0f32;
@@ -309,7 +335,6 @@ mod tests {
                 }
                 scores[k as usize] = acc * scale;
             }
-            // Softmax.
             let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0f32;
             let mut exps = vec![0f32; kv as usize];
@@ -319,7 +344,6 @@ mod tests {
                 sum += e;
             }
             for e in exps.iter_mut() { *e /= sum; }
-            // V multiply.
             for k in 0..kv {
                 for i in 0..d {
                     ref_out[(hq * d + i) as usize] +=
@@ -328,10 +352,12 @@ mod tests {
             }
         }
 
-        // Fused path.
+        // Fused path with packed V.
         let fused = tq_sdpa_4bit(
-            &q_arr, &packed, &sigma, &mean, &v_arr, &signs, &centroids,
-            None, scale, kv_repeat,
+            &q_arr, &packed, &sigma, &mean,
+            &vq, &vs, &vb,
+            &signs, &centroids,
+            None, scale, kv_repeat, v_group_size,
         ).unwrap();
         mlx_rs::transforms::eval([&fused]).unwrap();
         let fused_slice = fused.as_slice::<f32>();

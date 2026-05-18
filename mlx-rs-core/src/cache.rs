@@ -780,16 +780,19 @@ impl KeyValueCache for TurboQuantKVCache {
             let packed = self.packed_keys.as_ref().unwrap();
             let sigma = self.key_sigma.as_ref().unwrap();
             let mean = self.key_mean.as_ref().unwrap();
-            // V is still stored compressed (8-bit per-group); reconstruct
-            // once and hand to the SDPA kernel. Fusing V dequant into the
-            // same kernel is the next deferred item.
-            let v_full = self.reconstruct_values(dtype)?;
+            // V is now dequantised INSIDE the kernel; pass the packed
+            // tensors directly instead of materialising a BF16 V tensor
+            // first. Saves the v-dequant dispatch + the temporary
+            // [B, Hkv, KV, D] BF16 buffer.
+            let pv = self.quant_v.as_ref().unwrap();
+            let vs = self.v_scales.as_ref().unwrap();
+            let vb = self.v_biases.as_ref().unwrap();
             let signs_vec = cached_signs(d, self.seed);
             let signs = Array::from_slice(&signs_vec, &[d]);
             let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
             let out = crate::metal_kernels::tq_sdpa_4bit(
-                q, packed, sigma, mean, &v_full,
-                &signs, &centroids, mask, scale, kv_repeat,
+                q, packed, sigma, mean, pv, vs, vb,
+                &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
             )?;
             return Ok(Some(out));
         }

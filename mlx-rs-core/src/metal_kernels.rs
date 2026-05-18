@@ -466,15 +466,27 @@ static TQ_QK_SCORE_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
 //   out        [B, Hq, 1, D]     T
 const TQ_SDPA_4BIT_KERNEL: &str = r#"
     uint tid = thread_position_in_threadgroup.x;
-    uint group = threadgroup_position_in_grid.x;
-    uint b   = group / uint(Hq);
-    uint h_q = group % uint(Hq);
+    // Grid layout:
+    //   x = 64 * (b * Hq + h_q)        — picks (batch, query head)
+    //   y = d_chunk_id                 — picks which D-slice this group owns
+    uint group_x = threadgroup_position_in_grid.x;
+    uint d_chunk_id = threadgroup_position_in_grid.y;
+    uint b   = group_x / uint(Hq);
+    uint h_q = group_x % uint(Hq);
     if (b >= uint(B)) return;
     uint h_kv = h_q / uint(kv_repeat);
+    uint d_start = d_chunk_id * uint(D_CHUNK);
+    uint d_end   = metal::min(d_start + uint(D_CHUNK), uint(D));
+    if (d_start >= uint(D)) return;
 
     threadgroup float s_q[512];
     threadgroup float s_centroids[16];
-    threadgroup float s_scores[4096]; // hard-capped MAX_KV_BUF
+    // Reduced from 4096 to 1024 to drop threadgroup shared-mem from
+    // 16 KB to 4 KB — improves SM occupancy from ~1 group to ~4-5
+    // groups concurrent on Apple Silicon. Covers Gemma4's sliding
+    // window (1024) and most decode-time contexts; longer contexts
+    // fall back to partial-fuse.
+    threadgroup float s_scores[1024];
     threadgroup float s_red[64];
     threadgroup float s_query_sum;
     threadgroup float s_global_max;
@@ -597,16 +609,42 @@ const TQ_SDPA_4BIT_KERNEL: &str = r#"
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv_total = 1.0f / s_total_sum;
 
-    // Phase 3: V multiply. Per-dim accumulate over kv.
-    uint v_inner = uint(D);
+    // Phase 3: V multiply. Per-dim accumulate over kv, restricted to
+    // this threadgroup's d_chunk slice. V is dequantised inline from
+    // packed 8-bit per-group (mlx symmetric affine), so we avoid the
+    // separate V-decompress dispatch the caller used to do.
+    //
+    // V layout:
+    //   packed_v   [B, Hkv, KV, D/4]            u32   (4 vals per word)
+    //   v_scales   [B, Hkv, KV, D/v_group_size] f32
+    //   v_biases   [B, Hkv, KV, D/v_group_size] f32
+    uint packed_per_row = uint(D) / 4u;
+    uint v_inner = packed_per_row;
     uint v_h     = uint(KV) * v_inner;
     uint v_b     = uint(Hkv) * v_h;
     uint v_base  = b * v_b + h_kv * v_h;
+
+    uint n_groups = uint(D) / uint(V_GROUP_SIZE);
+    uint vs_inner = n_groups;
+    uint vs_h     = uint(KV) * vs_inner;
+    uint vs_b     = uint(Hkv) * vs_h;
+    uint vs_base  = b * vs_b + h_kv * vs_h;
+
     uint out_offset = (b * uint(Hq) + h_q) * uint(D);
-    for (uint d = tid; d < uint(D); d += uint(64)) {
+    uint chunk_size = d_end - d_start;
+    for (uint dd = tid; dd < chunk_size; dd += uint(64)) {
+        uint d = d_start + dd;
+        uint word_idx = d / 4u;
+        uint byte_idx = d % 4u;
+        uint group_id = d / uint(V_GROUP_SIZE);
         float acc = 0.0f;
         for (uint k = 0u; k < uint(KV); ++k) {
-            acc += s_scores[k] * inv_total * float(v[v_base + k * v_inner + d]);
+            uint packed = packed_v[v_base + k * v_inner + word_idx];
+            uint byte_val = (packed >> (byte_idx * 8u)) & 0xFFu;
+            float scale = v_scales[vs_base + k * vs_inner + group_id];
+            float bias  = v_biases[vs_base + k * vs_inner + group_id];
+            float v_dq  = float(byte_val) * scale + bias;
+            acc += s_scores[k] * inv_total * v_dq;
         }
         out[out_offset + d] = T(acc);
     }
@@ -620,7 +658,9 @@ fn create_tq_sdpa_4bit_kernel() -> MetalKernel {
         let packed_k = CString::new("packed_k").unwrap();
         let sigma_k = CString::new("sigma_k").unwrap();
         let mean_k = CString::new("mean_k").unwrap();
-        let v = CString::new("v").unwrap();
+        let packed_v = CString::new("packed_v").unwrap();
+        let v_scales = CString::new("v_scales").unwrap();
+        let v_biases = CString::new("v_biases").unwrap();
         let signs = CString::new("signs").unwrap();
         let centroids = CString::new("centroids").unwrap();
         let mask = CString::new("mask").unwrap();
@@ -631,7 +671,9 @@ fn create_tq_sdpa_4bit_kernel() -> MetalKernel {
         mlx_sys::mlx_vector_string_append_value(inputs, packed_k.as_ptr());
         mlx_sys::mlx_vector_string_append_value(inputs, sigma_k.as_ptr());
         mlx_sys::mlx_vector_string_append_value(inputs, mean_k.as_ptr());
-        mlx_sys::mlx_vector_string_append_value(inputs, v.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, packed_v.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, v_scales.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, v_biases.as_ptr());
         mlx_sys::mlx_vector_string_append_value(inputs, signs.as_ptr());
         mlx_sys::mlx_vector_string_append_value(inputs, centroids.as_ptr());
         mlx_sys::mlx_vector_string_append_value(inputs, mask.as_ptr());
@@ -655,9 +697,10 @@ fn create_tq_sdpa_4bit_kernel() -> MetalKernel {
     }
 }
 
-/// Maximum kv_len the fused SDPA kernel supports per call (4096; bounded
-/// by threadgroup scratch memory).
-pub const TQ_SDPA_MAX_KV: i32 = 4096;
+/// Maximum kv_len the fused SDPA kernel supports per call (1024; bounded
+/// by threadgroup scratch memory). Matches Gemma4's sliding window
+/// natively; longer contexts fall back to partial-fuse path.
+pub const TQ_SDPA_MAX_KV: i32 = 1024;
 
 /// Fully-fused TurboQuant SDPA: one Metal dispatch does
 /// QK-score-from-compressed-K + softmax + V matmul. Returns
@@ -671,12 +714,15 @@ pub fn tq_sdpa_4bit(
     packed_k: &Array,
     sigma_k: &Array,
     mean_k: &Array,
-    v: &Array,
+    packed_v: &Array,
+    v_scales: &Array,
+    v_biases: &Array,
     signs: &Array,
     centroids: &Array,
     mask: Option<&Array>,
     scale: f32,
     kv_repeat: i32,
+    v_group_size: i32,
 ) -> Result<Array, Exception> {
     let qs = q.shape();
     if qs.len() != 4 || qs[2] != 1 {
@@ -712,7 +758,6 @@ pub fn tq_sdpa_4bit(
     // Pre-scale Q so the kernel doesn't have to take an f32 constant.
     let scale_arr = mlx_rs::array!(scale).as_dtype(q.dtype())?;
     let q_f = q.multiply(&scale_arr)?;
-    let v_f = v.as_dtype(q.dtype())?;
     let signs_f32 = signs.as_dtype(mlx_rs::Dtype::Float32)?;
     let centroids_f32 = centroids.as_dtype(mlx_rs::Dtype::Float32)?;
     let sigma_f32 = sigma_k.as_dtype(mlx_rs::Dtype::Float32)?;
@@ -730,9 +775,16 @@ pub fn tq_sdpa_4bit(
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
             config, type_name.as_ptr(), dtype,
         );
+        // D-tile so V matmul parallelises across multiple threadgroups.
+        // Chunk size 32 = 8 threadgroups per (b, h_q) at D=256, 16 at
+        // D=512. Hard upper bound is `D` (must be a divisor of D for
+        // clean tiling); 32 happens to divide every head_dim we ship.
+        let d_chunk = if d >= 32 && d % 32 == 0 { 32 } else { d };
+        let n_d_chunks = (d + d_chunk - 1) / d_chunk;
         for (name, value) in [
             ("D", d), ("Hq", h_q), ("Hkv", h_kv), ("KV", kv), ("B", b),
             ("kv_repeat", kv_repeat), ("has_mask", has_mask),
+            ("D_CHUNK", d_chunk), ("V_GROUP_SIZE", v_group_size),
         ] {
             let cname = CString::new(name).unwrap();
             mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
@@ -742,8 +794,12 @@ pub fn tq_sdpa_4bit(
         // Pre-scale Q on the host (kernels don't accept f32 template args).
         // Done after the dtype conversion above using mlx ops.
         let _ = scale;
+        // 2-D grid: x picks (b, h_q), y picks d_chunk_id.
+        // Total threadgroups = B * Hq * n_d_chunks (e.g. 1*32*8 = 256
+        // for Gemma4-26B sliding heads — proper GPU saturation vs the
+        // prior 32 threadgroups).
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(
-            config, 64 * b * h_q, 1, 1,
+            config, 64 * b * h_q, n_d_chunks, 1,
         );
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
 
@@ -752,12 +808,16 @@ pub fn tq_sdpa_4bit(
             config, out_shape.as_ptr(), out_shape.len(), dtype,
         );
 
+        let vs_f32 = v_scales.as_dtype(mlx_rs::Dtype::Float32)?;
+        let vb_f32 = v_biases.as_dtype(mlx_rs::Dtype::Float32)?;
         let inputs = mlx_sys::mlx_vector_array_new();
         mlx_sys::mlx_vector_array_append_value(inputs, q_f.as_ptr());
         mlx_sys::mlx_vector_array_append_value(inputs, packed_k.as_ptr());
         mlx_sys::mlx_vector_array_append_value(inputs, sigma_f32.as_ptr());
         mlx_sys::mlx_vector_array_append_value(inputs, mean_f32.as_ptr());
-        mlx_sys::mlx_vector_array_append_value(inputs, v_f.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, packed_v.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, vs_f32.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, vb_f32.as_ptr());
         mlx_sys::mlx_vector_array_append_value(inputs, signs_f32.as_ptr());
         mlx_sys::mlx_vector_array_append_value(inputs, centroids_f32.as_ptr());
         mlx_sys::mlx_vector_array_append_value(inputs, mask_arr.as_ptr());
