@@ -73,10 +73,51 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| {
             PathBuf::from("models/Gemma4-27B-MTPLX-Optimized-Speed/target")
         });
-    let prompt = args
+    let prompt_arg = args
         .get(2)
         .cloned()
         .unwrap_or_else(|| "The quick brown fox".to_string());
+    // If the prompt argument points to an existing JSON file, treat it as
+    // an OpenAI-format chat fixture (e.g. hermes-gateway fixtures from
+    // OminiX-API/tests/fixtures). Otherwise it's a literal prompt string.
+    let (prompt, fixture_messages) = if std::path::Path::new(&prompt_arg).exists()
+        && prompt_arg.ends_with(".json")
+    {
+        let bytes = std::fs::read(&prompt_arg)?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let msgs = v
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .ok_or_else(|| anyhow!("fixture {prompt_arg} has no messages array"))?;
+        let parsed: Vec<Gemma4Message> = msgs
+            .iter()
+            .filter_map(|m| {
+                let role = m.get("role")?.as_str()?;
+                let content = match m.get("content") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(String::from))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => return None,
+                };
+                Some(match role {
+                    "system" => Gemma4Message::system(content),
+                    "user" => Gemma4Message::user(content),
+                    "assistant" => Gemma4Message::assistant(content),
+                    "tool" => {
+                        let name = m.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        Gemma4Message::tool(name, content)
+                    }
+                    _ => return None,
+                })
+            })
+            .collect();
+        (String::new(), Some(parsed))
+    } else {
+        (prompt_arg, None)
+    };
     let max_new: usize = args
         .get(3)
         .and_then(|s| s.parse().ok())
@@ -93,7 +134,11 @@ fn main() -> Result<()> {
     println!("Loading tokenizer + chat template…");
     let tokenizer = load_tokenizer(&target_dir)?;
     let template = Gemma4ChatTemplate::load(&target_dir)?;
-    let rendered = template.render_prompt(&[Gemma4Message::user(&prompt)], &[], true)?;
+    let rendered = if let Some(msgs) = &fixture_messages {
+        template.render_prompt(msgs, &[], true)?
+    } else {
+        template.render_prompt(&[Gemma4Message::user(&prompt)], &[], true)?
+    };
     println!("Rendered prompt ({} chars).", rendered.len());
 
     println!("Loading MTPLX target (native Q4; ~13GB resident)…");
