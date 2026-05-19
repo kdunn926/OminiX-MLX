@@ -3494,10 +3494,9 @@ pub fn deltanet_tape_replay(
 // K * N * 2 fp32 flops per expert.
 // ============================================================================
 const MOE_DENSE_MATMUL_KERNEL: &str = r#"
-    uint3 gid = threadgroup_position_in_grid;
     int M = M_buf[0];
-    uint row_base = gid.x * 32u;
-    uint col_base = gid.y * 32u;
+    uint row_base = threadgroup_position_in_grid.x * 32u;
+    uint col_base = threadgroup_position_in_grid.y * 32u;
     if (row_base >= uint(M)) return;
     if (col_base >= uint(N_)) return;
 
@@ -3659,10 +3658,13 @@ pub fn moe_dense_matmul(
                 config, cname.as_ptr(), value,
             );
         }
-        // Grid: (ceil(M_padded/32), N/32, 1) threadgroups. 32 threads per tg
-        // (one simdgroup) handles a 32x32 output region via 4x4 acc tiles.
+        // Grid: (M_padded/32) × (N/32) threadgroups, each 32 threads (one
+        // simdgroup) handling a 32x32 output region via 4x4 acc tiles.
+        // MLX `set_grid` takes TOTAL THREADS (not threadgroups): total =
+        // tg_count × threads_per_tg. So x = (m_padded/32 tgs) × 32 = m_padded,
+        // y = n/32 tgs × 1 = n/32.
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(
-            config, m_padded / 32, n / 32, 1,
+            config, m_padded, n / 32, 1,
         );
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
 
@@ -3707,22 +3709,7 @@ mod tests {
     /// MoE dense matmul kernel parity test: smallest valid shapes
     /// (M=32, K=8, N=32). Compares against `mlx_rs::ops::matmul(A, B)`
     /// elementwise to fp32 tolerance.
-    ///
-    /// Currently #[ignore]'d — the kernel produces all-zero output on
-    /// this minimal case, suggesting either a silent Metal-source
-    /// compile failure or simdgroup_load misuse. Debug path (next
-    /// session):
-    ///   1. Replace the FMA body with `C[0] = 42.0f` and verify the
-    ///      output buffer receives that value — proves dispatch wiring.
-    ///   2. If wiring is OK, simplify to a single 8x8 tile (no [4][4]
-    ///      acc array) and check that tile alone.
-    ///   3. Check whether `simdgroup_matrix<float, 8, 8>` requires
-    ///      `using namespace metal;` in the source — our header only
-    ///      includes the metal_simdgroup{,_matrix} headers.
-    ///   4. Cross-check by running tinygrad's exact metal_matmul kernel
-    ///      from this same Rust scaffold.
     #[test]
-    #[ignore]
     fn moe_dense_matmul_matches_reference_min_shape() {
         // Construct deterministic A=[32, 8] and B=[32, 8] in fp32.
         let m = 32_i32;
@@ -3764,6 +3751,40 @@ mod tests {
         }
         eprintln!(
             "moe_dense_matmul parity ok: max_abs={max_abs:.6} max_rel={max_rel:.6}"
+        );
+    }
+
+    /// Larger-shape parity: M=64 (2 row-tiles), K=64 (8 K-steps), N=128 (4 col-tiles).
+    #[test]
+    fn moe_dense_matmul_matches_reference_larger_shape() {
+        let m = 64_i32;
+        let k = 64_i32;
+        let n = 128_i32;
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i as f32) * 0.013).cos()).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.017).sin()).collect();
+        let a = Array::from_slice(&a_data, &[m, k]);
+        let b = Array::from_slice(&b_data, &[k, n]);
+
+        let reference = a.matmul(&b).expect("ref matmul");
+        mlx_rs::transforms::eval([&reference]).expect("eval ref");
+
+        let m_buf = Array::from_slice(&[m], &[1]);
+        let result = moe_dense_matmul(&a, &b, &m_buf, k, n).expect("kernel");
+        mlx_rs::transforms::eval([&result]).expect("eval result");
+
+        let ref_slice = reference.as_slice::<f32>();
+        let res_slice = result.as_slice::<f32>();
+        let mut max_abs = 0.0_f32;
+        let mut max_rel = 0.0_f32;
+        for (&r, &q) in ref_slice.iter().zip(res_slice.iter()) {
+            let abs = (r - q).abs();
+            let rel = abs / r.abs().max(1e-6);
+            max_abs = max_abs.max(abs);
+            max_rel = max_rel.max(rel);
+        }
+        assert!(
+            max_abs < 1e-3,
+            "max_abs={max_abs:.6} max_rel={max_rel:.6} exceeds tolerance"
         );
     }
 
