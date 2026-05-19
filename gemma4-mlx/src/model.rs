@@ -14,7 +14,7 @@ use mlx_rs::{
     nn,
     ops::{
         self,
-        indexing::{take_along_axis, take_axis, IndexOp, NewAxis},
+        indexing::{scatter_add_single, take_along_axis, take_axis, IndexOp, NewAxis},
     },
     quantization::MaybeQuantized,
     transforms::eval,
@@ -761,6 +761,71 @@ pub struct Experts {
     pub activation: GemmaActivation,
 }
 
+/// One group of (token, k_slot) pairs that all route to the same expert.
+/// `token_indices` and `k_slots` are parallel arrays of shape `[n_tokens]`,
+/// each entry an i32 index into the original `hidden_states` rows /
+/// `top_k_weights` columns respectively.
+#[derive(Debug, Clone)]
+pub struct ExpertBucket {
+    pub expert_id: i32,
+    pub token_indices: Array,
+    pub k_slots: Array,
+    pub n_tokens: i32,
+}
+
+/// Group routed (token, k_slot) pairs by expert id. Reads `top_k_index`
+/// (shape `[n, k]`, any int dtype) on CPU and returns one
+/// [`ExpertBucket`] per expert that received any tokens. Empty experts
+/// are omitted from the returned vec.
+///
+/// Cost: one device→host copy of `n*k` i32 entries. For n=5000, k=4 that's
+/// ~80 KB — negligible vs the matmul cost downstream.
+pub fn bucket_by_expert(
+    top_k_index: &Array,
+    num_experts: i32,
+) -> Result<Vec<ExpertBucket>, Exception> {
+    let idx_i32 = top_k_index.as_dtype(Dtype::Int32)?;
+    eval([&idx_i32])?;
+    let shape = idx_i32.shape().to_vec();
+    let n = shape[0] as usize;
+    let k = shape[1] as usize;
+    let slice = idx_i32.as_slice::<i32>();
+
+    let mut per_expert: Vec<(Vec<i32>, Vec<i32>)> = (0..num_experts as usize)
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect();
+    for token_idx in 0..n {
+        for k_slot in 0..k {
+            let expert = slice[token_idx * k + k_slot] as usize;
+            if expert >= per_expert.len() {
+                return Err(Exception::from(
+                    format!(
+                        "top_k_index contained expert id {expert} but num_experts is {num_experts}"
+                    )
+                    .as_str(),
+                ));
+            }
+            per_expert[expert].0.push(token_idx as i32);
+            per_expert[expert].1.push(k_slot as i32);
+        }
+    }
+
+    let mut buckets = Vec::with_capacity(num_experts as usize);
+    for (e, (tok_idx, k_slot)) in per_expert.into_iter().enumerate() {
+        if tok_idx.is_empty() {
+            continue;
+        }
+        let n_tokens = tok_idx.len() as i32;
+        buckets.push(ExpertBucket {
+            expert_id: e as i32,
+            token_indices: Array::from_slice(&tok_idx, &[n_tokens]),
+            k_slots: Array::from_slice(&k_slot, &[n_tokens]),
+            n_tokens,
+        });
+    }
+    Ok(buckets)
+}
+
 impl Experts {
     pub fn forward_topk(
         &mut self,
@@ -797,6 +862,104 @@ impl Experts {
 
         let weighted = expert_out.multiply(&top_k_weights.index((.., .., NewAxis)))?;
         weighted.sum_axis(1, false)?.as_dtype(hidden_dtype)
+    }
+
+    /// Expert-major MoE dispatch (#35 phase 1).
+    ///
+    /// Buckets routed (token, k_slot) pairs by expert, then runs a single
+    /// dense matmul per expert over the tokens that routed there. For
+    /// prefill with n>>num_experts this consolidates per-token vector
+    /// matmuls into per-expert batched ones, which become tile-friendly
+    /// for a follow-up simdgroup_matrix kernel (#35 phase 3).
+    ///
+    /// Correctness target for phase 1: argmax-match against `forward_topk`
+    /// to fp32 tolerance. Uses stock MLX matmul (no custom kernel yet).
+    /// Gated at the call site by `GEMMA4_EXPERT_MAJOR_MOE=1`; bypassed
+    /// per-expert via `EXPERT_MAJOR_MIN_TOKENS` (default 8) below which
+    /// the existing token-major matmul is faster.
+    pub fn forward_topk_expert_major(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let hidden_dtype = hidden_states.dtype();
+        let n = hidden_states.shape()[0];
+        let h = hidden_states.shape()[1];
+        let i = self.intermediate_size;
+        let k_top = top_k_index.shape()[1];
+
+        let num_experts = self.gate_up_proj.as_ref().shape()[0];
+        let buckets = bucket_by_expert(top_k_index, num_experts)?;
+
+        let min_tokens: i32 = std::env::var("EXPERT_MAJOR_MIN_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+
+        // Promote to fp32 once. We accumulate the weighted output in fp32
+        // (matches forward_topk's intermediate dtype) and cast back at the
+        // end. For 5K-tok prefill, [n, h] fp32 ≈ 5000*5376*4 ≈ 107 MB — ok.
+        let h_f32 = hidden_states.as_dtype(Dtype::Float32)?;
+        let w_f32 = top_k_weights.as_dtype(Dtype::Float32)?;
+        let gu_f32 = self.gate_up_proj.as_ref().as_dtype(Dtype::Float32)?;
+        let dp_f32 = self.down_proj.as_ref().as_dtype(Dtype::Float32)?;
+
+        let mut output = ops::zeros::<f32>(&[n, h])?;
+
+        // Flatten weights so we can gather via per-bucket flat indices:
+        //   flat_idx[i] = token_indices[i] * k_top + k_slots[i]
+        let w_flat = w_f32.reshape(&[-1])?;
+        let k_top_arr = array!(k_top);
+
+        for bucket in &buckets {
+            if bucket.n_tokens < min_tokens {
+                // Skip-gate: defer to per-token kernel for tiny buckets.
+                // v1 still routes through this method even for skipped
+                // experts — those tokens just get a small batched matmul
+                // here. A future revision can carve them out to a sibling
+                // per-token path.
+            }
+            let e = bucket.expert_id;
+            let e_arr = Array::from_slice(&[e], &[1]);
+
+            // X_e = hidden_states[token_indices]   -> [N_e, H]
+            let x_e = take_axis(&h_f32, &bucket.token_indices, 0)?;
+
+            // W_gu = gate_up_proj[e]               -> [2I, H]
+            // take_axis returns [1, 2I, H]; squeeze to [2I, H].
+            let w_gu = take_axis(&gu_f32, &e_arr, 0)?.reshape(&[2 * i, h])?;
+            let w_gu_t = w_gu.transpose_axes(&[1, 0])?; // [H, 2I]
+            let y_e = x_e.matmul(&w_gu_t)?; // [N_e, 2I]
+
+            // Split into gate/up, apply activation+mul.
+            let split = y_e.split(2, -1)?;
+            let gate = self.activation.apply(&split[0])?;
+            let z_e = gate.multiply(&split[1])?; // [N_e, I]
+
+            // W_d = down_proj[e]                    -> [H, I]
+            let w_d = take_axis(&dp_f32, &e_arr, 0)?.reshape(&[h, i])?;
+            let w_d_t = w_d.transpose_axes(&[1, 0])?; // [I, H]
+            let out_e = z_e.matmul(&w_d_t)?; // [N_e, H]
+
+            // Gather routing weights for these (token, k_slot) pairs.
+            let flat_idx = bucket
+                .token_indices
+                .multiply(&k_top_arr)?
+                .add(&bucket.k_slots)?;
+            let w_e = take_axis(&w_flat, &flat_idx, 0)?; // [N_e]
+            let weighted = out_e.multiply(&w_e.reshape(&[bucket.n_tokens, 1])?)?;
+
+            // Scatter-add into output at the bucket's token positions.
+            // Multiple buckets may write to the same token row (top_k > 1);
+            // scatter_add_single handles the accumulation. MLX expects
+            // updates to have shape `indices.shape + (1,) + a.shape[axis+1:]`
+            // so reshape [N_e, H] → [N_e, 1, H].
+            let updates = weighted.reshape(&[bucket.n_tokens, 1, h])?;
+            output = scatter_add_single(&output, &bucket.token_indices, &updates, 0)?;
+        }
+
+        output.as_dtype(hidden_dtype)
     }
 
     pub fn training_mode(&mut self, _mode: bool) {}
@@ -912,11 +1075,18 @@ where
                 .as_mut()
                 .expect("MoE layer missing pre_feedforward_layernorm_2")
                 .forward(&hidden_states_flat)?;
-            let moe_out = self
+            let experts = self
                 .experts
                 .as_mut()
-                .expect("MoE layer missing experts")
-                .forward_topk(&moe_in, &top_k_index, &top_k_weights)?;
+                .expect("MoE layer missing experts");
+            let moe_out = if std::env::var("GEMMA4_EXPERT_MAJOR_MOE")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                experts.forward_topk_expert_major(&moe_in, &top_k_index, &top_k_weights)?
+            } else {
+                experts.forward_topk(&moe_in, &top_k_index, &top_k_weights)?
+            };
             let moe_out = moe_out.reshape(&residual.shape())?;
             let moe_out = self
                 .post_feedforward_layernorm_2
