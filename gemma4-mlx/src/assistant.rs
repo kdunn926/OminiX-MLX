@@ -133,6 +133,7 @@ pub struct AssistantAttention {
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
+    pub sliding_window: i32,
 
     #[param]
     pub q_proj: MaybeQuantized<nn::Linear>,
@@ -174,10 +175,32 @@ impl AssistantAttention {
         // ALLOWED to attend to future kv positions, but in the recurrent
         // single-step case the kv only contains tokens up to `position_offset`
         // anyway, so the distinction is moot.
+        //
+        // For sliding-attention layers, restrict to the last `sliding_window`
+        // KV positions to match target's training-time attention pattern.
+        // Without this, on long-context prompts (kv_len > sliding_window) the
+        // drafter mixes positional information target's sliding layer never saw.
+        let (sk, sv) = if self.is_sliding
+            && self.sliding_window > 0
+            && shared_k.shape()[2] > self.sliding_window
+            && std::env::var("MTPLX_PAIR_NO_SLIDING_MASK")
+                .map(|v| v != "1")
+                .unwrap_or(true)
+        {
+            use mlx_rs::ops::indexing::{Ellipsis, IndexOp, NewAxis};
+            let _ = NewAxis;
+            let w = self.sliding_window;
+            (
+                shared_k.index((Ellipsis, -w.., ..)),
+                shared_v.index((Ellipsis, -w.., ..)),
+            )
+        } else {
+            (shared_k.clone(), shared_v.clone())
+        };
         let attn_out = scaled_dot_product_attention::<mlx_rs_core::cache::KVCache>(
             queries,
-            shared_k.clone(),
-            shared_v.clone(),
+            sk,
+            sv,
             None,
             self.scale,
             None::<SdpaMask>,
@@ -562,6 +585,7 @@ pub fn load_assistant_model(model_dir: impl AsRef<Path>) -> Result<AssistantMode
             n_kv_heads,
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
+            sliding_window: text.sliding_window,
             q_proj: load_quantized_linear(
                 &weights,
                 &format!("{layer_prefix}.self_attn.q_proj"),
