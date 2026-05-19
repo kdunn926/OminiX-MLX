@@ -29,6 +29,7 @@ use mlx_rs_core::{
     cache::{KVCache, KeyValueCache},
     error::Error,
     moe_dense_matmul,
+    metal_kernels::moe_dense_matmul_bf16,
     sampler::{DefaultSampler, Sampler},
     utils::{create_causal_mask, scaled_dot_product_attention, SdpaMask},
 };
@@ -956,6 +957,134 @@ impl Experts {
         output.as_dtype(hidden_dtype)
     }
 
+    /// Expert-major MoE dispatch — phase 6 (#35).
+    ///
+    /// Same as v4 (GPU bucketing + custom kernel + small-sync) but uses
+    /// the bf16 kernel variant, eliminating the bf16→fp32 promotion that
+    /// dominated v4's bandwidth cost.
+    ///
+    /// Gated at the call site by `GEMMA4_EXPERT_MAJOR_MOE=5`.
+    pub fn forward_topk_expert_major_v5(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let n = hidden_states.shape()[0];
+        let h = hidden_states.shape()[1];
+        let i = self.intermediate_size;
+        let k_top = top_k_index.shape()[1];
+
+        if h % 32 != 0 || (2 * i) % 32 != 0 || i % 8 != 0 {
+            return Err(Exception::from(
+                "forward_topk_expert_major_v5: shape alignment not met",
+            ));
+        }
+
+        let num_experts = self.gate_up_proj.as_ref().shape()[0];
+
+        // GPU bucketing.
+        let flat_experts = top_k_index.reshape(&[-1])?.as_dtype(Dtype::Int32)?;
+        let sort_order = argsort_axis(&flat_experts, -1)?.as_dtype(Dtype::Int32)?;
+        let sorted_experts = take_axis(&flat_experts, &sort_order, 0)?;
+        let k_arr = array!(k_top);
+        let sorted_token_indices = sort_order.divide(&k_arr)?.as_dtype(Dtype::Int32)?;
+        let sorted_k_slots = sort_order.remainder(&k_arr)?.as_dtype(Dtype::Int32)?;
+
+        // Counts on GPU, single small sync.
+        let n_k = n * k_top;
+        let experts_range = ops::arange::<_, i32>(0, num_experts, 1)?
+            .as_dtype(Dtype::Int32)?
+            .reshape(&[1, num_experts])?;
+        let se_col = sorted_experts.reshape(&[n_k, 1])?;
+        let counts_arr = se_col
+            .eq(&experts_range)?
+            .as_dtype(Dtype::Int32)?
+            .sum_axis(0, false)?
+            .as_dtype(Dtype::Int32)?;
+        eval([&counts_arr])?;
+        let counts: Vec<i32> = counts_arr.as_slice::<i32>().to_vec();
+        let mut starts: Vec<i32> = Vec::with_capacity(num_experts as usize);
+        let mut acc = 0;
+        for &c in &counts {
+            starts.push(acc);
+            acc += c;
+        }
+
+        // Force bf16 for the kernel inputs. hidden_states may arrive as
+        // fp16 / fp32 depending on the model's residual stream dtype; the
+        // bf16 kernel requires bf16 A.
+        let h_bf16 = hidden_states.as_dtype(Dtype::Bfloat16)?;
+        let x_sorted_all = take_axis(&h_bf16, &sorted_token_indices, 0)?;
+        let w_flat = top_k_weights.reshape(&[-1])?;
+        let flat_routing_idx = sorted_token_indices.multiply(&k_arr)?.add(&sorted_k_slots)?;
+        let w_sorted_all = take_axis(&w_flat, &flat_routing_idx, 0)?;
+
+        // Output accumulator in fp32 for scatter precision.
+        let mut output = ops::zeros::<f32>(&[n, h])?;
+
+        for e in 0..num_experts as usize {
+            let n_e = counts[e];
+            if n_e == 0 {
+                continue;
+            }
+            let start = starts[e];
+            let x_e = x_sorted_all.index((start..start + n_e, ..));
+            let w_e = w_sorted_all.index((start..start + n_e,));
+            let tok_idx_e = sorted_token_indices.index((start..start + n_e,));
+
+            let m_padded = ((n_e + 31) / 32) * 32;
+            let pad_rows = m_padded - n_e;
+            let x_pad = if pad_rows > 0 {
+                let zeros = ops::zeros::<f32>(&[pad_rows, h])?
+                    .as_dtype(Dtype::Bfloat16)?;
+                ops::concatenate_axis(&[&x_e, &zeros], 0)?
+            } else {
+                x_e.clone()
+            };
+
+            let e_i32 = e as i32;
+            let e_arr = Array::from_slice(&[e_i32], &[1]);
+            let w_gu = take_axis(self.gate_up_proj.as_ref(), &e_arr, 0)?
+                .reshape(&[2 * i, h])?
+                .as_dtype(Dtype::Bfloat16)?;
+            let w_gu_t = w_gu.transpose_axes(&[1, 0])?;
+
+            let m_buf = Array::from_slice(&[n_e], &[1]);
+            let x_pad_bf = x_pad.as_dtype(Dtype::Bfloat16)?;
+            let y_padded = moe_dense_matmul_bf16(&x_pad_bf, &w_gu_t, &m_buf, h, 2 * i)?;
+            let y_e = y_padded.index((..n_e, ..));
+
+            let split = y_e.split(2, -1)?;
+            let gate = self.activation.apply(&split[0])?;
+            let z_e = gate.multiply(&split[1])?;
+
+            let z_pad = if pad_rows > 0 {
+                let zeros = ops::zeros::<f32>(&[pad_rows, i])?
+                    .as_dtype(Dtype::Bfloat16)?;
+                ops::concatenate_axis(&[&z_e, &zeros], 0)?
+            } else {
+                z_e
+            };
+
+            let w_d = take_axis(self.down_proj.as_ref(), &e_arr, 0)?
+                .reshape(&[h, i])?
+                .as_dtype(Dtype::Bfloat16)?;
+            let w_d_t = w_d.transpose_axes(&[1, 0])?;
+            let z_pad_bf = z_pad.as_dtype(Dtype::Bfloat16)?;
+            let out_padded = moe_dense_matmul_bf16(&z_pad_bf, &w_d_t, &m_buf, i, h)?;
+            let out_e = out_padded.index((..n_e, ..)).as_dtype(Dtype::Float32)?;
+
+            let weighted = out_e.multiply(
+                &w_e.as_dtype(Dtype::Float32)?.reshape(&[n_e, 1])?,
+            )?;
+            let updates = weighted.reshape(&[n_e, 1, h])?;
+            output = scatter_add_single(&output, &tok_idx_e, &updates, 0)?;
+        }
+
+        output.as_dtype(hidden_states.dtype())
+    }
+
     /// Expert-major MoE dispatch — phase 5 (#35).
     ///
     /// Combines phase 2 GPU bucketing (argsort, no CPU sync on top_k_index)
@@ -1435,6 +1564,7 @@ where
                 "2" => experts.forward_topk_expert_major_v2(&moe_in, &top_k_index, &top_k_weights)?,
                 "3" => experts.forward_topk_expert_major_v3(&moe_in, &top_k_index, &top_k_weights)?,
                 "4" => experts.forward_topk_expert_major_v4(&moe_in, &top_k_index, &top_k_weights)?,
+                "5" => experts.forward_topk_expert_major_v5(&moe_in, &top_k_index, &top_k_weights)?,
                 _ => experts.forward_topk(&moe_in, &top_k_index, &top_k_weights)?,
             };
             let moe_out = moe_out.reshape(&residual.shape())?;
