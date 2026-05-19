@@ -116,7 +116,17 @@ impl MtpHead {
 
         let h_norm = self.pre_fc_norm_hidden.forward(host_hidden)?;
         let e_norm = self.pre_fc_norm_embedding.forward(prev_token_emb)?;
-        let cat = concatenate_axis(&[&h_norm, &e_norm], -1)?;
+        // CRITICAL: concat order is (e_norm, h_norm) — embed first, hidden
+        // second. Matches llama.cpp PR #22673 (graph_mtp):
+        //   ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0)
+        // and the MTPLX checkpoint's training convention. The fc weight
+        // [H, 2H] expects its first H input columns to be the embed
+        // norm and the second H to be the hidden norm. Swapping (our
+        // prior implementation had [h_norm, e_norm]) caused fc to mix
+        // hidden into the embed-side weights and produce noise — every
+        // drafted token was junk in the bench (acceptance=0 across all
+        // attempts).
+        let cat = concatenate_axis(&[&e_norm, &h_norm], -1)?;
         let mut m = self.fc.forward(&cat)?;
 
         // Lazy-allocate persistent caches the first time we draft. Each

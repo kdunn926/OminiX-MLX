@@ -250,9 +250,21 @@ impl MtplxSession {
             .forward_last_hidden_and_logits(&in_arr, cache)?;
         let ar_next = argmax_id(&ar_logits)?;
 
-        // Step 2: embed the previously-committed token (host embed table).
-        // `embed_tokens` returns `[1, 1, H]`.
-        let prev_emb = self.model.embed_tokens(&[last_token])?;
+        // Step 2: embed the NEXT-to-be-committed token (ar_next), not the
+        // already-committed last_token. The MTP head's contract (per
+        // DeepSeek-V3 / Qwen3.6 spec, mirrored by llama.cpp PR #22673)
+        // is: given (hidden of position N, embed of position N+1),
+        // predict the token at position N+2. So the embedding fed into
+        // the MTP head must be the just-AR-sampled next token (`ar_next`),
+        // not the previously-committed one (`last_token`).
+        //
+        // Previously this was `embed(last_token)`, which trained the MTP
+        // head to redundantly re-predict position N+1 (= ar_next) — but
+        // we already have ar_next from the target's argmax, so the
+        // speculative win was zero. The bug surfaced as acceptance=0
+        // (the MTP head was producing well-formed predictions for the
+        // WRONG position, never matching `target_after_ar`).
+        let prev_emb = self.model.embed_tokens(&[ar_next])?;
 
         // Step 3: MTP draft hidden → apply host LM head → next-after-AR draft.
         // The MTP head returns `[1, 1, H]`; we then reuse the target's
@@ -307,6 +319,17 @@ impl MtplxSession {
         let (extra, next_anchor, accepted_flag) = match self.cfg.acceptance {
             AcceptanceMode::Greedy => {
                 let target_after_ar = argmax_id(&verify_logits)?;
+                // Debug: MTPLX_DEBUG_ACCEPT=1 logs (last_token, ar_next,
+                // drafted, target_after_ar) per cycle so we can localize
+                // where the MTP head's prediction diverges from the
+                // target's next-token argmax.
+                if std::env::var("MTPLX_DEBUG_ACCEPT").is_ok() {
+                    eprintln!(
+                        "[mtp-dbg] last={} ar_next={} drafted={} target_after_ar={} {}",
+                        last_token, ar_next, drafted, target_after_ar,
+                        if target_after_ar == drafted { "ACCEPT" } else { "REJECT" }
+                    );
+                }
                 if target_after_ar == drafted {
                     (vec![ar_next], drafted, true)
                 } else {

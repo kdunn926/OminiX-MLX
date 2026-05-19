@@ -1,0 +1,18 @@
+# Keep out of the parent workspace — this is a spike crate.
+[workspace]
+
+[package]
+name = "coreml-bridge"
+version = "0.0.1"
+edition = "2021"
+description = "Rust → Core ML predict bridge for ANE-routed vision encoders (spike)."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# half = "2" # if we want to expose Float16 tensors back to MLX
+
+[build-dependencies]
+cc = "1"
