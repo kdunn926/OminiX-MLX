@@ -103,11 +103,27 @@ impl MtpHead {
     ///
     /// Returns `[B, T, H]` hidden state. The caller must apply the host LM
     /// head (via `Model::apply_lm_head`) to produce logits.
+    /// Returns post-norm hidden (for the host LM head). Convenience
+    /// wrapper around [`forward_with_pre_norm`] for callers that don't
+    /// need the pre-norm output (e.g. K=1 cycles).
     pub fn forward(
         &mut self,
         host_hidden: &Array,
         prev_token_emb: &Array,
     ) -> Result<Array, Exception> {
+        let (post, _pre) = self.forward_with_pre_norm(host_hidden, prev_token_emb)?;
+        Ok(post)
+    }
+
+    /// Returns `(post_norm_hidden, pre_norm_hidden)`. The pre-norm output
+    /// feeds back as the next draft step's `host_hidden` for multi-step
+    /// drafting (mirrors llama.cpp PR #22673's
+    /// `llama_get_embeddings_pre_norm_ith` pattern on the draft context).
+    pub fn forward_with_pre_norm(
+        &mut self,
+        host_hidden: &Array,
+        prev_token_emb: &Array,
+    ) -> Result<(Array, Array), Exception> {
         if self.layers.is_empty() {
             return Err(Exception::custom(
                 "MtpHead::forward called on a stub head — no MTP weights were loaded.",
@@ -146,7 +162,12 @@ impl MtpHead {
             m = layer.forward(&m, None, cache_slot)?;
         }
 
-        self.norm.forward(&m)
+        // `m` here is pre-final-norm; the host LM head expects post-norm.
+        // Return both so multi-step drafting can feed pre-norm back as
+        // the next step's host_hidden input.
+        let pre = m.clone();
+        let post = self.norm.forward(&m)?;
+        Ok((post, pre))
     }
 
     /// Reset the draft KV caches at the start of a new generation. Called

@@ -31,6 +31,8 @@ Apple Silicon).
 | Qwen3.6-27B-MTPLX-Optimized | bench_mtplx (K=2) | q4/q4 KV (gs=32) ≈ llama.cpp `q4_0/q4_0` + `spec-draft-n-max 2` | 5035 | 50.5 | 53.0 | 12.45 | 15.76 | 25.50 |
 | Qwen3.6-27B-MTPLX-Optimized | bench_mtplx (K=4) | q4/q4 KV (gs=32) ≈ llama.cpp `Q4_K_M + q4_0/q4_0 + draft-mtp` | 5035 | 50.3 | 52.9 | 12.17 | 15.78 | 25.50 |
 | Qwen3.6-27B-MTPLX-Optimized | bench_mtplx (K=2, **MTP fixes**) | fp16 — concat order + ar_next embed | 5035 | 50.2 | 56.7 | **15.37** (acceptance **0.860**) | — | 25.87 |
+| Qwen3.6-27B-MTPLX-Optimized | bench_mtplx (K=2, **multi-step drafting**) | fp16 — 2 MTP forwards per cycle, batch verify | 5035 | 50.2 | 55.9 | **17.61** (acceptance 0.569) | — | — |
+| Qwen3.6-27B-MTPLX-Optimized | bench_mtplx (K=4, multi-step) | fp16 — 4 MTP forwards per cycle | 5035 | 50.9 | 58.4 | 13.42 (acceptance 0.333) | — | — |
 
 ⭐ = headline winner for that model.
 

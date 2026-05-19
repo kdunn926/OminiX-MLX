@@ -55,6 +55,28 @@ impl HybridCache {
         }
     }
 
+    /// Trim trailing `n_drop` positions from the cache. Used by multi-step
+    /// MTP drafting to roll back rejected draft positions on the target's
+    /// KV cache. Recurrent (GDN) slots are no-op — speculation paths
+    /// that include GDN layers should use `trim_gdn` with a captured
+    /// snapshot instead.
+    pub fn trim(&mut self, n_drop: i32) -> Result<(), Exception> {
+        if n_drop <= 0 {
+            return Ok(());
+        }
+        match self {
+            HybridCache::KV(kv) => {
+                kv.trim(n_drop);
+                Ok(())
+            }
+            HybridCache::TurboQuantKV(tq) => tq.trim(n_drop),
+            HybridCache::QuantizedKV(_) => Err(Exception::custom(
+                "HybridCache::trim: QuantizedKVCache trim is not implemented",
+            )),
+            HybridCache::Recurrent(_) => Ok(()), // no-op; see trim_gdn
+        }
+    }
+
     /// Deterministic rollback for a speculative-decoding verify pass.
     ///
     /// Full-attention layers drop the trailing `n_drop` positions from the

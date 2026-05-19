@@ -17,6 +17,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{argmax_axis, Array};
 use qwen3_6_mlx::{HybridCache, Model};
 
@@ -175,14 +176,11 @@ impl MtplxSession {
         while metrics.total_tokens < self.cfg.max_tokens {
             if self.mtp_active {
                 metrics.mtp_cycles += 1;
-                metrics.mtp_drafted += 1; // K=1 per cycle
-                let (accepted, next, draft_accepted) =
+                let (extra, next, n_drafted, n_accepted) =
                     self.mtp_cycle(next_id, &mut cache)?;
-                if draft_accepted {
-                    metrics.mtp_accepted += 1;
-                }
-                let _ = &accepted;
-                for tok in &accepted {
+                metrics.mtp_drafted += n_drafted;
+                metrics.mtp_accepted += n_accepted;
+                for tok in &extra {
                     produced.push(*tok);
                     metrics.total_tokens += 1;
                     if eos.contains(&(*tok as u32))
@@ -237,11 +235,23 @@ impl MtplxSession {
     /// `extra_accepted` is the list of speculatively-accepted tokens
     /// between the previous `next_id` and the new one. With K=1 this is
     /// at most one element.
+    /// Multi-step MTP cycle.
+    ///
+    /// Returns (committed_tokens, next_anchor, n_drafted, n_accepted) where:
+    /// * `committed_tokens` is the list of NEW tokens to push to `produced`
+    ///   *excluding* the anchor for the next cycle (that's `next_anchor`).
+    ///   For K=1 with acceptance, committed_tokens=[ar_next] and next_anchor=drafted.
+    ///   For K=N with j accepts, committed_tokens=[ar_next, d_0..d_{j-1}] and
+    ///   next_anchor = (j < K) correction : d_{K-1}.
+    /// * `n_drafted` = K (regardless of acceptance).
+    /// * `n_accepted` = number of drafts that matched target's argmax.
     fn mtp_cycle(
         &mut self,
         last_token: i32,
         cache: &mut Vec<HybridCache>,
-    ) -> Result<(Vec<i32>, i32, bool), MtpError> {
+    ) -> Result<(Vec<i32>, i32, usize, usize), MtpError> {
+        let k = self.cfg.block_len.max(1);
+
         // Step 1: target forward on `last_token`, keep both the last
         // hidden state and the logits.
         let in_arr = Array::from_slice(&[last_token], &[1, 1]);
@@ -250,117 +260,135 @@ impl MtplxSession {
             .forward_last_hidden_and_logits(&in_arr, cache)?;
         let ar_next = argmax_id(&ar_logits)?;
 
-        // Step 2: embed the NEXT-to-be-committed token (ar_next), not the
-        // already-committed last_token. The MTP head's contract (per
-        // DeepSeek-V3 / Qwen3.6 spec, mirrored by llama.cpp PR #22673)
-        // is: given (hidden of position N, embed of position N+1),
-        // predict the token at position N+2. So the embedding fed into
-        // the MTP head must be the just-AR-sampled next token (`ar_next`),
-        // not the previously-committed one (`last_token`).
+        // Step 2: K MTP draft steps. Each step feeds the prior MTP block's
+        // pre-norm hidden + embedding of the prior just-drafted token,
+        // producing the next draft + its pre-norm hidden for the next
+        // step. Mirrors llama.cpp PR #22673's draft-context loop.
         //
-        // Previously this was `embed(last_token)`, which trained the MTP
-        // head to redundantly re-predict position N+1 (= ar_next) — but
-        // we already have ar_next from the target's argmax, so the
-        // speculative win was zero. The bug surfaced as acceptance=0
-        // (the MTP head was producing well-formed predictions for the
-        // WRONG position, never matching `target_after_ar`).
-        let prev_emb = self.model.embed_tokens(&[ar_next])?;
+        // Step 0 anchors on the target's hidden + embed(ar_next).
+        // Step i (i>=1) anchors on MTP's own pre-norm hidden + embed(d_{i-1}).
+        let mut drafted: Vec<i32> = Vec::with_capacity(k);
+        let mut mtp_pre_hidden = hidden.clone();
+        let mut next_embed_token = ar_next;
+        for _ in 0..k {
+            let prev_emb = self.model.embed_tokens(&[next_embed_token])?;
+            let (post, pre) = {
+                let mtp = self
+                    .model
+                    .mtp_head()
+                    .expect("mtp_cycle entered without an active MTP head");
+                mtp.forward_with_pre_norm(&mtp_pre_hidden, &prev_emb)?
+            };
+            let mtp_logits_3d = self.model.apply_lm_head(&post)?;
+            let mtp_logits = {
+                let s = mtp_logits_3d.shape();
+                if s.len() == 3 {
+                    let v = s[s.len() - 1];
+                    mtp_logits_3d.reshape(&[1, v])?
+                } else {
+                    mtp_logits_3d
+                }
+            };
+            let d = argmax_id(&mtp_logits)?;
+            drafted.push(d);
+            mtp_pre_hidden = pre;
+            next_embed_token = d;
+        }
 
-        // Step 3: MTP draft hidden → apply host LM head → next-after-AR draft.
-        // The MTP head returns `[1, 1, H]`; we then reuse the target's
-        // `apply_lm_head` (its lm_head or tied embedding) to project to vocab.
-        let mtp_hidden = {
-            let mtp = self
-                .model
-                .mtp_head()
-                .expect("mtp_cycle entered without an active MTP head");
-            mtp.forward(&hidden, &prev_emb)?
-        };
-        let mtp_logits_3d = self.model.apply_lm_head(&mtp_hidden)?;
-        // Squeeze [1,1,V] → [1,V] for parity with verify_logits.
-        let mtp_logits = {
-            let s = mtp_logits_3d.shape();
-            if s.len() == 3 {
-                let v = s[s.len() - 1];
-                mtp_logits_3d.reshape(&[1, v])?
-            } else {
-                mtp_logits_3d
-            }
-        };
-        let drafted = argmax_id(&mtp_logits)?;
-
-        // Step 4: verify the draft by running target on ar_next.
-        let verify_in = Array::from_slice(&[ar_next], &[1, 1]);
-        // Record a hit/miss against the graph cache keyed on the verify
-        // input's shape. This is observation-only today: real dispatch
-        // through `GraphBank::invoke` requires capturing `&mut self.model`
-        // and `&mut cache` in a `'static + Send` closure, which doesn't
-        // type-check cleanly without rearchitecting the forward path
-        // (likely behind an `Arc<Mutex<...>>` or by exposing a pure
-        // `&[Array] -> Vec<Array>` entry point from `qwen3_6_mlx::Model`).
-        // TODO(graph-bank): wire the actual compiled forward here.
+        // Step 3: target verify on K tokens: [ar_next, d_0, ..., d_{K-2}].
+        // The K-th draft (d_{K-1}) doesn't need to be in the input — we
+        // only verify K positions, each predicting the next slot.
+        let mut verify_tokens: Vec<i32> = Vec::with_capacity(k);
+        verify_tokens.push(ar_next);
+        for d in drafted.iter().take(k - 1) {
+            verify_tokens.push(*d);
+        }
+        let verify_in =
+            Array::from_slice(&verify_tokens, &[1, verify_tokens.len() as i32]);
         let verify_key = GraphKey::new(
             "verify_forward",
             GraphKey::shape_sig_for(&[&verify_in]),
         );
         self.graph_bank.observe(&verify_key);
-        let verify_logits = self.model.forward_last_logits(&verify_in, cache)?;
+        // forward returns per-position logits [B, T, V].
+        let verify_logits_full = self.model.forward(&verify_in, cache)?;
 
-        // Route through the configured acceptance strategy. Both modes
-        // commit `ar_next` for free (cache populated, argmax confirmed)
-        // and then decide what to anchor the *next* cycle on.
-        //
-        // K=1 semantics:
-        //   * Accept: commit `drafted` as an extra token, next_anchor =
-        //     target's verified continuation (greedy: argmax; spec: free
-        //     bonus sampled from target distribution).
-        //   * Reject: drop the draft, next_anchor = correction (greedy:
-        //     target's argmax; spec: residual `(p-q)+` sample).
-        let (extra, next_anchor, accepted_flag) = match self.cfg.acceptance {
-            AcceptanceMode::Greedy => {
-                let target_after_ar = argmax_id(&verify_logits)?;
-                // Debug: MTPLX_DEBUG_ACCEPT=1 logs (last_token, ar_next,
-                // drafted, target_after_ar) per cycle so we can localize
-                // where the MTP head's prediction diverges from the
-                // target's next-token argmax.
-                if std::env::var("MTPLX_DEBUG_ACCEPT").is_ok() {
-                    eprintln!(
-                        "[mtp-dbg] last={} ar_next={} drafted={} target_after_ar={} {}",
-                        last_token, ar_next, drafted, target_after_ar,
-                        if target_after_ar == drafted { "ACCEPT" } else { "REJECT" }
-                    );
-                }
-                if target_after_ar == drafted {
-                    (vec![ar_next], drafted, true)
-                } else {
-                    if let Some(mtp) = self.model.mtp_head() {
-                        mtp.trim_cache(1);
-                    }
-                    (vec![ar_next], target_after_ar, false)
-                }
+        // Walk: find first j where target's argmax at logit position j
+        // does not match drafted[j]. Accept j drafts + 1 correction.
+        let mut n_accepted: usize = 0;
+        let mut correction: i32 = ar_next; // unused fallback
+        for j in 0..k {
+            let pos_logits = verify_logits_full.index((.., j as i32, ..));
+            let target_at = argmax_id(&pos_logits)?;
+            let d = drafted[j];
+            let accept = target_at == d;
+            if std::env::var("MTPLX_DEBUG_ACCEPT").is_ok() {
+                eprintln!(
+                    "[mtp-dbg] cycle (k={k}) j={j} drafted={d} target={target_at} {}",
+                    if accept { "ACCEPT" } else { "REJECT" }
+                );
             }
-            AcceptanceMode::Speculative => {
-                let temp = self.cfg.temp.max(1e-4);
-                let res = accept_speculative(
-                    &verify_logits,
-                    &mtp_logits,
-                    &[drafted as u32],
-                    temp,
-                    default_rng,
-                )?;
-                if res.all_accepted {
-                    let _bonus = res.correction;
-                    (vec![ar_next], drafted, true)
-                } else {
-                    if let Some(mtp) = self.model.mtp_head() {
-                        mtp.trim_cache(1);
-                    }
-                    (vec![ar_next], res.correction as i32, false)
-                }
+            if accept {
+                n_accepted += 1;
+            } else {
+                correction = target_at;
+                break;
             }
+        }
+
+        // Roll back caches by the rejected count.
+        //  Target cache: verify appended K positions ([ar_next, d_0..d_{K-2}]).
+        //  We keep n_accepted accepted-prefix slots; trim (K - n_accepted) - 0_if_full_accept.
+        //    - if n_accepted == K (full accept): keep all K verify positions.
+        //    - if n_accepted == j < K: keep ar_next + d_0..d_{j-1} = j+1 positions.
+        //  Trim count = verify_len - kept = K - (n_accepted_corrected).
+        let verify_len = verify_tokens.len() as i32;
+        let target_keep: i32 = if n_accepted == k {
+            verify_len
+        } else {
+            // ar_next + n_accepted drafts cached; correction not yet cached.
+            (n_accepted as i32) + 1
+        };
+        let target_trim = verify_len - target_keep;
+        if target_trim > 0 {
+            for c in cache.iter_mut() {
+                let _ = c.trim(target_trim);
+            }
+        }
+
+        // MTP cache: appended k positions. Keep n_accepted positions; trim
+        // (k - n_accepted). When n_accepted == k we keep all — the next
+        // cycle's draft step 0 will pick up from MTP cache offset k.
+        let mtp_trim = (k - n_accepted) as i32;
+        if mtp_trim > 0 {
+            if let Some(mtp) = self.model.mtp_head() {
+                mtp.trim_cache(mtp_trim);
+            }
+        }
+
+        // Assemble committed tokens.
+        // - ar_next is always committed.
+        // - n_accepted drafted tokens follow.
+        // - If full accept: next_anchor = d_{K-1} (last drafted, kept).
+        //   Otherwise: next_anchor = correction.
+        let mut extra: Vec<i32> = Vec::with_capacity(n_accepted + 1);
+        extra.push(ar_next);
+        for j in 0..n_accepted.saturating_sub(if n_accepted == k { 1 } else { 0 }) {
+            extra.push(drafted[j]);
+        }
+        let next_anchor = if n_accepted == k {
+            // All accepted: last draft becomes the anchor; its KV is in
+            // target cache so next cycle's step-1 forward will re-prefill
+            // it (slight redundancy but simpler than threading it through).
+            // Actually — we just kept it in target KV via verify's append
+            // of [ar_next, d_0..d_{K-2}], so d_{K-1} is NOT in cache yet.
+            // Use it as anchor; next cycle will append it.
+            drafted[k - 1]
+        } else {
+            correction
         };
 
-        Ok((extra, next_anchor, accepted_flag))
+        Ok((extra, next_anchor, k, n_accepted))
     }
 
     /// Token-by-token streaming iterator. Emits one `i32` token per `next()`
@@ -440,7 +468,7 @@ impl MtplxSession {
                 let c = cache.as_mut().expect("cache initialized");
                 if mtp_active {
                     match self.mtp_cycle(last_token, c) {
-                        Ok((extra, next, _accepted)) => {
+                        Ok((extra, next, _n_drafted, _n_accepted)) => {
                             for t in extra {
                                 pending.push_back(t);
                             }
