@@ -445,6 +445,16 @@ pub struct Attention {
     pub k_proj: Option<MaybeQuantized<nn::Linear>>,
     #[param]
     pub v_proj: Option<MaybeQuantized<nn::Linear>>,
+    /// Fused Q-K-V projection (opt-in via `GEMMA4_FUSED_QKV=1`).
+    /// Concatenates q/k/v_proj weights along output axis so the forward
+    /// pass does ONE matmul instead of 2-3 separate ones. Output is
+    /// then split via `fused_splits`. Skipped for KV-shared layers and
+    /// when q/k group_size or bits don't match.
+    #[param]
+    pub qkv_fused: Option<MaybeQuantized<nn::Linear>>,
+    /// Per-part output sizes for splitting the fused QKV output:
+    /// `[q_out, k_out]` or `[q_out, k_out, v_out]`.
+    pub fused_splits: Option<Vec<i32>>,
     #[param]
     pub o_proj: MaybeQuantized<nn::Linear>,
     #[param]
@@ -493,13 +503,39 @@ where
 
         let offset = cache.offset();
 
-        let queries = self.q_proj.forward(x)?;
+        let is_shared_kv = shared_kv.is_some();
+
+        // Optional fused Q/K/V projection: one matmul + split, saves 2-3
+        // kernel launches per attention forward. Falls back to separate
+        // q_proj/k_proj/v_proj calls when fused is unavailable.
+        let (raw_q, raw_k_opt, raw_v_opt) = if let Some(qkv) = self.qkv_fused.as_mut() {
+            let fused_out = qkv.forward(x)?;
+            // Split along last axis using cumulative offsets from `fused_splits`.
+            let splits = self.fused_splits.as_ref().expect("fused_splits set when qkv_fused set");
+            let q_end = splits[0];
+            let k_end = q_end + splits[1];
+            let v_end = if splits.len() >= 3 { k_end + splits[2] } else { k_end };
+            let q = fused_out.index((.., .., 0_i32..q_end));
+            let k = if !is_shared_kv {
+                Some(fused_out.index((.., .., q_end..k_end)))
+            } else {
+                None
+            };
+            let v = if !is_shared_kv && splits.len() >= 3 {
+                Some(fused_out.index((.., .., k_end..v_end)))
+            } else {
+                None
+            };
+            (q, k, v)
+        } else {
+            let q = self.q_proj.forward(x)?;
+            (q, None, None)
+        };
+
         let mut queries =
             self.q_norm
-                .forward(&queries.reshape(&[B, L, self.n_heads, self.head_dim])?)?;
+                .forward(&raw_q.reshape(&[B, L, self.n_heads, self.head_dim])?)?;
         queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-
-        let is_shared_kv = shared_kv.is_some();
 
         // Compute new K/V (with RoPE on K) WITHOUT touching the cache yet,
         // so we can opt into the cache's fused-attention fast path
@@ -507,11 +543,19 @@ where
         let pending_new_kv: Option<(Array, Array)> = if is_shared_kv {
             None
         } else {
-            let k_proj = self.k_proj.as_mut().expect("k_proj required for non-shared layer");
-            let raw_keys = k_proj.forward(x)?;
-            let raw_values = match self.v_proj.as_mut() {
-                Some(v_proj) => v_proj.forward(x)?,
-                None => raw_keys.clone(),
+            let raw_keys = if let Some(k) = raw_k_opt {
+                k
+            } else {
+                let k_proj = self.k_proj.as_mut().expect("k_proj required for non-shared layer");
+                k_proj.forward(x)?
+            };
+            let raw_values = if let Some(v) = raw_v_opt {
+                v
+            } else {
+                match self.v_proj.as_mut() {
+                    Some(v_proj) => v_proj.forward(x)?,
+                    None => raw_keys.clone(),
+                }
             };
             let k_norm = self.k_norm.as_mut().expect("k_norm required for non-shared layer");
             let mut new_k =
@@ -1821,6 +1865,90 @@ fn make_mq_linear_optional(
     make_mq_linear(weights, prefix, quant).ok()
 }
 
+/// Fuse 2-3 quantized linears into one by concatenating weight/scales/biases
+/// along the output axis. All inputs must share `group_size`, `bits`, and
+/// input dimension. Used by the fused-QKV opt-in to cut three matmul kernel
+/// launches per attention forward down to one.
+///
+/// Returns a fused `MaybeQuantized<nn::Linear>` and the per-part output
+/// sizes so the caller knows where to split the output (Q | K | V).
+fn fuse_qkv_linears(
+    q: &MaybeQuantized<nn::Linear>,
+    k: &MaybeQuantized<nn::Linear>,
+    v: Option<&MaybeQuantized<nn::Linear>>,
+) -> Result<(MaybeQuantized<nn::Linear>, Vec<i32>), Error> {
+    use mlx_rs::ops::concatenate_axis;
+    match (q, k) {
+        (MaybeQuantized::Quantized(qq), MaybeQuantized::Quantized(qk)) => {
+            if qq.group_size != qk.group_size || qq.bits != qk.bits {
+                return Err(Error::Model(
+                    "fuse_qkv: q/k group_size or bits mismatch".into(),
+                ));
+            }
+            let qw: &Array = qq.inner.weight.as_ref();
+            let kw: &Array = qk.inner.weight.as_ref();
+            let q_out = qw.shape()[0];
+            let k_out = kw.shape()[0];
+            let mut weights: Vec<&Array> = vec![qw, kw];
+            let qs: &Array = qq.scales.as_ref();
+            let ks: &Array = qk.scales.as_ref();
+            let mut scales: Vec<&Array> = vec![qs, ks];
+            let qb: &Array = qq.biases.as_ref();
+            let kb: &Array = qk.biases.as_ref();
+            let mut biases: Vec<&Array> = vec![qb, kb];
+            let mut splits = vec![q_out, k_out];
+            if let Some(MaybeQuantized::Quantized(qv)) = v {
+                if qv.group_size != qq.group_size || qv.bits != qq.bits {
+                    return Err(Error::Model(
+                        "fuse_qkv: v group_size or bits mismatch".into(),
+                    ));
+                }
+                let vw: &Array = qv.inner.weight.as_ref();
+                let vs: &Array = qv.scales.as_ref();
+                let vb: &Array = qv.biases.as_ref();
+                splits.push(vw.shape()[0]);
+                weights.push(vw);
+                scales.push(vs);
+                biases.push(vb);
+            }
+            let fused_w = concatenate_axis(&weights, 0)
+                .map_err(|e| Error::Model(format!("fuse_qkv weight concat: {e}")))?;
+            let fused_s = concatenate_axis(&scales, 0)
+                .map_err(|e| Error::Model(format!("fuse_qkv scales concat: {e}")))?;
+            let fused_b = concatenate_axis(&biases, 0)
+                .map_err(|e| Error::Model(format!("fuse_qkv biases concat: {e}")))?;
+            let inner = make_linear(fused_w);
+            let mut ql = nn::QuantizedLinear {
+                group_size: qq.group_size,
+                bits: qq.bits,
+                scales: Param::new(fused_s),
+                biases: Param::new(fused_b),
+                inner,
+            };
+            mlx_rs::module::ModuleParameters::freeze_parameters(&mut ql, true);
+            Ok((MaybeQuantized::Quantized(ql), splits))
+        }
+        // Original (non-quantized) path: concat .weight along axis 0.
+        (MaybeQuantized::Original(lq), MaybeQuantized::Original(lk)) => {
+            let qw: &Array = lq.weight.as_ref();
+            let kw: &Array = lk.weight.as_ref();
+            let mut weights: Vec<&Array> = vec![qw, kw];
+            let mut splits = vec![qw.shape()[0], kw.shape()[0]];
+            if let Some(MaybeQuantized::Original(lv)) = v {
+                let vw: &Array = lv.weight.as_ref();
+                splits.push(vw.shape()[0]);
+                weights.push(vw);
+            }
+            let fused = concatenate_axis(&weights, 0)
+                .map_err(|e| Error::Model(format!("fuse_qkv concat: {e}")))?;
+            Ok((MaybeQuantized::Original(make_linear(fused)), splits))
+        }
+        _ => Err(Error::Model(
+            "fuse_qkv: q/k must both be Quantized or both Original".into(),
+        )),
+    }
+}
+
 fn make_mq_embedding(
     weights: &HashMap<String, Array>,
     prefix: &str,
@@ -2113,6 +2241,45 @@ pub fn build_model_from_weights(
             args.num_key_value_heads
         };
 
+        // Q/K/V projections (separate). Fused qkv builds below once we
+        // know whether they all exist + match in quant config.
+        let q_proj = make_mq_linear(weights, &format!("{layer_prefix}.self_attn.q_proj"), quant.as_ref())?;
+        let k_proj = if is_kv_shared {
+            None
+        } else {
+            Some(make_mq_linear(
+                weights,
+                &format!("{layer_prefix}.self_attn.k_proj"),
+                quant.as_ref(),
+            )?)
+        };
+        let v_proj = if is_kv_shared {
+            None
+        } else {
+            make_mq_linear_optional(
+                weights,
+                &format!("{layer_prefix}.self_attn.v_proj"),
+                quant.as_ref(),
+            )
+        };
+
+        // Optional fused QKV — opt in via env, skip for kv-shared layers.
+        // Builds the concat once at load time and stores both the fused
+        // linear and the per-part split sizes for runtime splitting.
+        let (qkv_fused, fused_splits) =
+            if std::env::var("GEMMA4_FUSED_QKV").is_ok() && !is_kv_shared {
+                if let Some(k_ref) = k_proj.as_ref() {
+                    match fuse_qkv_linears(&q_proj, k_ref, v_proj.as_ref()) {
+                        Ok((fused, splits)) => (Some(fused), Some(splits)),
+                        Err(_e) => (None, None),
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
         let attention = Attention {
             layer_idx,
             layer_type,
@@ -2126,26 +2293,11 @@ pub fn build_model_from_weights(
                 None
             },
             is_kv_shared,
-            q_proj: make_mq_linear(weights, &format!("{layer_prefix}.self_attn.q_proj"), quant.as_ref())?,
-            // KV-shared layers don't have k/v projection weights
-            k_proj: if is_kv_shared {
-                None
-            } else {
-                Some(make_mq_linear(
-                    weights,
-                    &format!("{layer_prefix}.self_attn.k_proj"),
-                    quant.as_ref(),
-                )?)
-            },
-            v_proj: if is_kv_shared {
-                None
-            } else {
-                make_mq_linear_optional(
-                    weights,
-                    &format!("{layer_prefix}.self_attn.v_proj"),
-                    quant.as_ref(),
-                )
-            },
+            q_proj,
+            k_proj,
+            v_proj,
+            qkv_fused,
+            fused_splits,
             o_proj: make_mq_linear(weights, &format!("{layer_prefix}.self_attn.o_proj"), quant.as_ref())?,
             q_norm: make_rms_norm(
                 get_weight(&weights, &format!("{layer_prefix}.self_attn.q_norm.weight"))?,
