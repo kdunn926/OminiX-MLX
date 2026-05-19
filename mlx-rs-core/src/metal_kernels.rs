@@ -1226,16 +1226,24 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
         uint col = tid & 7u;
         // row 0, col `col` of simdgroup `sg_part`'s 8x8 tile.
         // NOTE: this kernel's correctness test (`online_softmax_simd_matches_reference`)
-        // currently fails with ~13% rel error and sign flips at ~half the
-        // output positions. Tried row-major read (this code) and
-        // column-major read (s_c_dump[sg_part*64 + col*8]) — both fail.
-        // The bug is not a simple layout transposition but interaction
-        // between simdgroup_multiply_accumulate's matrix-tile layout and
-        // our row-0-only A-tile sparsity. Likely needs either Apple's
-        // metal_simdgroup_matrix internals docs or a side-by-side bench
-        // against a known-correct MLX simdgroup_matrix kernel.
-        // Kernel ships gated off (TURBOQUANT_SIMD_MATMUL=1); enable only
-        // for further debugging.
+        // fails with ~13% rel error and sign flips at ~half the output positions.
+        // Root cause (diagnosed 2026-05-18 against tinygrad's working metal_matmul
+        // reference at github.com/tinygrad/tinygrad/blob/3f2d4014/extra/gemm/metal_matmul.py):
+        // simdgroup_matrix expects DENSE 8x8 tiles. Our A-tile is a row-vector
+        // (1x8 real data + 7x8 zero padding), and Apple's per-thread lane→element
+        // mapping inside simdgroup_multiply_accumulate is implementation-defined,
+        // so the zero-padded rows land in lanes that scramble the result.
+        // Two viable fixes:
+        //   (a) Batch 8 query rows at once so A is dense — requires rewriting
+        //       the online-softmax loop to process 8 queries together. Not worth
+        //       it for our decode path where q_len=1.
+        //   (b) Use raw simdgroup ops (simd_shuffle dot products) instead of
+        //       simdgroup_matrix — that's what tq_sdpa_4bit_online (the working
+        //       kernel) already does.
+        // Conclusion: simdgroup_matrix is the wrong tool for row-vector workloads.
+        // Kernel kept gated off (TURBOQUANT_SIMD_MATMUL=1) as a record. Use
+        // tq_sdpa_4bit_online for production. simdgroup_matrix IS the right tool
+        // for dense matmul workloads (MoE expert MLP, large-batch prefill).
         float v = s_c_dump[sg_part * 64u + col];
         float inv_l = 1.0f / s_running_l;
         uint d_global = d_start + sg_part * 8u + col;
