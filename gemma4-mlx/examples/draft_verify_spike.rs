@@ -157,7 +157,16 @@ fn draft_linear(
         // information, RoPE doesn't advance. See `candidate_generator.py::
         // Gemma4AssistantCandidateGenerator.get_candidates`.
         let _ = step;
-        let position_offset = kv_offset - 1;
+        // Default: kv_offset - 1 (matches existing impl). Env knobs:
+        //   MTPLX_PAIR_POS=kv      → kv_offset (one past last cached)
+        //   MTPLX_PAIR_POS=advance → kv_offset - 1 + step (RoPE advances per draft step)
+        //   MTPLX_PAIR_POS=zero    → 0 (no positional info)
+        let position_offset = match std::env::var("MTPLX_PAIR_POS").as_deref() {
+            Ok("kv") => kv_offset,
+            Ok("advance") => kv_offset - 1 + step as i32,
+            Ok("zero") => 0,
+            _ => kv_offset - 1,
+        };
         let aout = pair.assistant.forward(&inputs, position_offset, kv)?;
         eval([&aout.logits, &aout.last_hidden])?;
         let tok = argmax_i32(&aout.logits.index((.., -1, ..)).reshape(&[-1])?)?;
@@ -190,7 +199,16 @@ fn draft_linear_top2(
         // information, RoPE doesn't advance. See `candidate_generator.py::
         // Gemma4AssistantCandidateGenerator.get_candidates`.
         let _ = step;
-        let position_offset = kv_offset - 1;
+        // Default: kv_offset - 1 (matches existing impl). Env knobs:
+        //   MTPLX_PAIR_POS=kv      → kv_offset (one past last cached)
+        //   MTPLX_PAIR_POS=advance → kv_offset - 1 + step (RoPE advances per draft step)
+        //   MTPLX_PAIR_POS=zero    → 0 (no positional info)
+        let position_offset = match std::env::var("MTPLX_PAIR_POS").as_deref() {
+            Ok("kv") => kv_offset,
+            Ok("advance") => kv_offset - 1 + step as i32,
+            Ok("zero") => 0,
+            _ => kv_offset - 1,
+        };
         let aout = pair.assistant.forward(&inputs, position_offset, kv)?;
         eval([&aout.logits, &aout.last_hidden])?;
         let row = aout.logits.index((.., -1, ..)).reshape(&[-1])?;
@@ -508,7 +526,9 @@ fn main() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "Explain in two sentences why the sky appears blue.".to_string());
     let max_new: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(96);
-    let block: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(8);
+    // Default block_size=6 matches the assistant's generation_config.json
+    // (`num_assistant_tokens: 6`) and `mtplx_pair.json`'s tuned setting.
+    let block: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
 
     println!("target_dir : {}", root.display());
     println!("prompt     : {prompt:?}");
@@ -544,14 +564,26 @@ fn main() -> Result<()> {
     let target = load_mtplx_target(&target_dir)?;
     let assistant = load_assistant_model(&assistant_dir)?;
     let layer_types = target.args.layer_types.clone();
-    let last_sliding = layer_types
+    let last_sliding_default = layer_types
         .iter()
         .rposition(|t| t == "sliding_attention")
         .unwrap();
-    let last_full = layer_types
+    let last_full_default = layer_types
         .iter()
         .rposition(|t| t == "full_attention")
         .unwrap();
+    let last_sliding = std::env::var("MTPLX_PAIR_SLIDING_TAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(last_sliding_default);
+    let last_full = std::env::var("MTPLX_PAIR_FULL_TAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(last_full_default);
+    eprintln!(
+        "tap layers: sliding={} (default {}), full={} (default {})",
+        last_sliding, last_sliding_default, last_full, last_full_default
+    );
     let mut pair = Pair {
         target,
         assistant,
