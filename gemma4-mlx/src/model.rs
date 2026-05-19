@@ -28,6 +28,7 @@ use tokenizers::Tokenizer;
 use mlx_rs_core::{
     cache::{KVCache, KeyValueCache},
     error::Error,
+    moe_dense_matmul,
     sampler::{DefaultSampler, Sampler},
     utils::{create_causal_mask, scaled_dot_product_attention, SdpaMask},
 };
@@ -955,6 +956,122 @@ impl Experts {
         output.as_dtype(hidden_dtype)
     }
 
+    /// Expert-major MoE dispatch — phase 4 (#35).
+    ///
+    /// Combines phase 1 CPU bucketing with the phase 3 `moe_dense_matmul`
+    /// Metal kernel (simdgroup_matrix<float,8,8> 4x4 acc tiles). Per
+    /// expert with N_e routed tokens: pad to multiple of 32, gather X,
+    /// transpose gate_up_proj[e] / down_proj[e] for the kernel layout,
+    /// invoke kernel twice (gate_up + down), SwiGLU, scatter back.
+    ///
+    /// Gated at the call site by `GEMMA4_EXPERT_MAJOR_MOE=3`.
+    pub fn forward_topk_expert_major_v3(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let hidden_dtype = hidden_states.dtype();
+        let n = hidden_states.shape()[0];
+        let h = hidden_states.shape()[1];
+        let i = self.intermediate_size;
+        let k_top = top_k_index.shape()[1];
+
+        // Validate K and N alignment for the kernel.
+        if h % 8 != 0 {
+            return Err(Exception::from(
+                "forward_topk_expert_major_v3: hidden_size must be divisible by 8 for moe_dense_matmul",
+            ));
+        }
+        if (2 * i) % 32 != 0 || h % 32 != 0 {
+            return Err(Exception::from(
+                "forward_topk_expert_major_v3: 2*intermediate_size and hidden_size must be divisible by 32",
+            ));
+        }
+
+        let num_experts = self.gate_up_proj.as_ref().shape()[0];
+        let buckets = bucket_by_expert(top_k_index, num_experts)?;
+
+        // Promote to fp32 once.
+        let h_f32 = hidden_states.as_dtype(Dtype::Float32)?;
+        let w_f32 = top_k_weights.as_dtype(Dtype::Float32)?;
+        let gu_f32 = self.gate_up_proj.as_ref().as_dtype(Dtype::Float32)?;
+        let dp_f32 = self.down_proj.as_ref().as_dtype(Dtype::Float32)?;
+
+        let mut output = ops::zeros::<f32>(&[n, h])?;
+        let k_top_arr = array!(k_top);
+        let w_flat = w_f32.reshape(&[-1])?;
+
+        // Per-expert dispatch.
+        for bucket in &buckets {
+            let n_e = bucket.n_tokens;
+            if n_e == 0 {
+                continue;
+            }
+            let e = bucket.expert_id;
+
+            // Gather X for this expert: [N_e, H].
+            let x_e = take_axis(&h_f32, &bucket.token_indices, 0)?;
+
+            // Pad to multiple of 32 rows.
+            let m_padded = ((n_e + 31) / 32) * 32;
+            let pad_rows = m_padded - n_e;
+            let x_pad = if pad_rows > 0 {
+                let zeros = ops::zeros::<f32>(&[pad_rows, h])?;
+                ops::concatenate_axis(&[&x_e, &zeros], 0)?
+            } else {
+                x_e
+            };
+
+            // gate_up_proj[e]: shape [2I, H] → kernel needs [H, 2I].
+            let e_arr = Array::from_slice(&[e], &[1]);
+            let w_gu = take_axis(&gu_f32, &e_arr, 0)?.reshape(&[2 * i, h])?;
+            let w_gu_t = w_gu.transpose_axes(&[1, 0])?; // [H, 2I]
+
+            let m_buf = Array::from_slice(&[n_e], &[1]);
+            let y_padded = moe_dense_matmul(&x_pad, &w_gu_t, &m_buf, h, 2 * i)?;
+            let y_e = y_padded.index((..n_e, ..)); // [N_e, 2I]
+
+            // SwiGLU.
+            let split = y_e.split(2, -1)?;
+            let gate = self.activation.apply(&split[0])?;
+            let z_e = gate.multiply(&split[1])?; // [N_e, I]
+
+            // Pad again for second matmul. I must be divisible by 8.
+            if i % 8 != 0 {
+                return Err(Exception::from(
+                    "forward_topk_expert_major_v3: intermediate_size must be divisible by 8",
+                ));
+            }
+            let z_pad = if pad_rows > 0 {
+                let zeros = ops::zeros::<f32>(&[pad_rows, i])?;
+                ops::concatenate_axis(&[&z_e, &zeros], 0)?
+            } else {
+                z_e
+            };
+
+            // down_proj[e]: shape [H, I] → kernel needs [I, H].
+            let w_d = take_axis(&dp_f32, &e_arr, 0)?.reshape(&[h, i])?;
+            let w_d_t = w_d.transpose_axes(&[1, 0])?; // [I, H]
+            let out_padded = moe_dense_matmul(&z_pad, &w_d_t, &m_buf, i, h)?;
+            let out_e = out_padded.index((..n_e, ..)); // [N_e, H]
+
+            // Apply per-(token, k_slot) routing weights.
+            let flat_idx = bucket
+                .token_indices
+                .multiply(&k_top_arr)?
+                .add(&bucket.k_slots)?;
+            let w_e = take_axis(&w_flat, &flat_idx, 0)?; // [N_e]
+            let weighted = out_e.multiply(&w_e.reshape(&[n_e, 1])?)?;
+
+            // Scatter-add into output.
+            let updates = weighted.reshape(&[n_e, 1, h])?;
+            output = scatter_add_single(&output, &bucket.token_indices, &updates, 0)?;
+        }
+
+        output.as_dtype(hidden_dtype)
+    }
+
     /// Expert-major MoE dispatch (#35 phase 1).
     ///
     /// Buckets routed (token, k_slot) pairs by expert, then runs a single
@@ -1174,6 +1291,7 @@ where
             let moe_out = match mode.as_str() {
                 "1" => experts.forward_topk_expert_major(&moe_in, &top_k_index, &top_k_weights)?,
                 "2" => experts.forward_topk_expert_major_v2(&moe_in, &top_k_index, &top_k_weights)?,
+                "3" => experts.forward_topk_expert_major_v3(&moe_in, &top_k_index, &top_k_weights)?,
                 _ => experts.forward_topk(&moe_in, &top_k_index, &top_k_weights)?,
             };
             let moe_out = moe_out.reshape(&residual.shape())?;

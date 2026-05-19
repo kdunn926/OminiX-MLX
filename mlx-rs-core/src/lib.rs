@@ -38,8 +38,8 @@ pub use memory::{
 };
 pub use metal_kernels::{
     deltanet_recurrence, deltanet_tape_replay, deltanet_with_tape, fused_modulate, fused_swiglu,
-    kv_compact, per_position_rope, tq_compress_4bit, tq_decompress_4bit, tq_qk_score,
-    tq_sdpa_4bit, tq_sdpa_4bit_online, tq_sdpa_4bit_online_simd, TQ_SDPA_MAX_KV,
+    kv_compact, moe_dense_matmul, per_position_rope, tq_compress_4bit, tq_decompress_4bit,
+    tq_qk_score, tq_sdpa_4bit, tq_sdpa_4bit_online, tq_sdpa_4bit_online_simd, TQ_SDPA_MAX_KV,
 };
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{
