@@ -239,6 +239,261 @@ mod tests {
     }
 
     #[test]
+    fn online_softmax_sdpa_matches_reference() {
+        // Validates tq_sdpa_4bit_online against the CPU reference at
+        // a kv_len ABOVE the prior s_scores[1024] cap (so we know the
+        // streaming softmax handles multi-tile runs correctly).
+        use crate::metal_kernels::{tq_compress_4bit, tq_decompress_4bit, tq_sdpa_4bit_online};
+        let d = 64i32;
+        let kv = 200i32; // > 1024 would explode test runtime; 200 still > 64=TILE_KV so multi-tile
+        let h_q = 2i32;
+        let h_kv = 1i32;
+        let kv_repeat = h_q / h_kv;
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let seed = 99u64;
+
+        let mut k_data = Vec::with_capacity((h_kv * kv * d) as usize);
+        for v in 0..(h_kv * kv) {
+            for i in 0..d {
+                k_data.push(((v as f32) * 0.08 + (i as f32) * 0.04).sin() * 0.6);
+            }
+        }
+        let mut v_data = Vec::with_capacity((h_kv * kv * d) as usize);
+        for v in 0..(h_kv * kv) {
+            for i in 0..d {
+                v_data.push(((v as f32) * 0.05 + (i as f32) * 0.07).cos() * 0.4);
+            }
+        }
+        let mut q_data = Vec::with_capacity((h_q * d) as usize);
+        for h in 0..h_q {
+            for i in 0..d {
+                q_data.push(((h as f32) * 0.17 + (i as f32) * 0.03).sin() * 0.5);
+            }
+        }
+        let k_arr = mlx_rs::Array::from_slice(&k_data, &[1, h_kv, kv, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let v_arr = mlx_rs::Array::from_slice(&v_data, &[1, h_kv, kv, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let q_arr = mlx_rs::Array::from_slice(&q_data, &[1, h_q, 1, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+
+        // Compress K.
+        let signs_vec = cached_signs(d, seed);
+        let signs = mlx_rs::Array::from_slice(&signs_vec, &[d]);
+        let boundaries = mlx_rs::Array::from_slice(&BOUNDARIES_4BIT, &[15]);
+        let centroids = mlx_rs::Array::from_slice(&CENTROIDS_4BIT, &[16]);
+        let (packed, sigma, mean) = tq_compress_4bit(&k_arr, &signs, &boundaries).unwrap();
+        let packed = packed.reshape(&[1, h_kv, kv, d / 8]).unwrap();
+        let sigma = sigma.reshape(&[1, h_kv, kv]).unwrap();
+        let mean = mean.reshape(&[1, h_kv, kv]).unwrap();
+        let k_recon = tq_decompress_4bit(
+            &packed, &sigma, &mean, &signs, &centroids,
+            &[1, h_kv, kv, d], mlx_rs::Dtype::Float32,
+        ).unwrap();
+        mlx_rs::transforms::eval([&k_recon, &q_arr]).unwrap();
+
+        // Compress V via stock mlx 8-bit per-group.
+        let v_group_size = 32i32;
+        let v_bits = 8i32;
+        let v_flat = v_arr.reshape(&[h_kv * kv, d]).unwrap();
+        let (vq, vs, vb) = mlx_rs::ops::quantize(&v_flat, v_group_size, v_bits, None::<&str>).unwrap();
+        let packed_v_cols = vq.shape()[1];
+        let n_groups = d / v_group_size;
+        let vq = vq.reshape(&[1, h_kv, kv, packed_v_cols]).unwrap();
+        let vs = vs.reshape(&[1, h_kv, kv, n_groups]).unwrap();
+        let vb = vb.reshape(&[1, h_kv, kv, n_groups]).unwrap();
+        let v_recon = mlx_rs::ops::dequantize(
+            &vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
+            &vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            &vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            v_group_size, v_bits, None::<&str>,
+        ).unwrap();
+        mlx_rs::transforms::eval([&v_recon]).unwrap();
+
+        // CPU reference.
+        let k_slice = k_recon.as_slice::<f32>();
+        let v_slice = v_recon.as_slice::<f32>();
+        let q_slice = q_arr.as_slice::<f32>();
+        let mut ref_out = vec![0f32; (h_q * d) as usize];
+        for hq in 0..h_q {
+            let hkv = hq / kv_repeat;
+            let mut scores = vec![0f32; kv as usize];
+            for k in 0..kv {
+                let mut acc = 0f32;
+                for i in 0..d {
+                    acc += q_slice[(hq * d + i) as usize]
+                         * k_slice[((hkv * kv + k) * d + i) as usize];
+                }
+                scores[k as usize] = acc * scale;
+            }
+            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0f32;
+            let mut exps = vec![0f32; kv as usize];
+            for k in 0..kv {
+                let e = (scores[k as usize] - mx).exp();
+                exps[k as usize] = e;
+                sum += e;
+            }
+            for e in exps.iter_mut() { *e /= sum; }
+            for k in 0..kv {
+                for i in 0..d {
+                    ref_out[(hq * d + i) as usize] +=
+                        exps[k as usize] * v_slice[((hkv * kv + k) * d + i) as usize];
+                }
+            }
+        }
+
+        // Online-softmax fused path.
+        let fused = tq_sdpa_4bit_online(
+            &q_arr, &packed, &sigma, &mean,
+            &vq, &vs, &vb,
+            &signs, &centroids,
+            None, scale, kv_repeat, v_group_size,
+        ).unwrap();
+        mlx_rs::transforms::eval([&fused]).unwrap();
+        let fused_slice = fused.as_slice::<f32>();
+
+        let mut worst = 0f32;
+        let mut worst_pos = 0;
+        for i in 0..ref_out.len() {
+            let abs = (ref_out[i] - fused_slice[i]).abs();
+            if abs < 0.01 { continue; }
+            let rel = abs / ref_out[i].abs().max(1.0);
+            if rel > worst { worst = rel; worst_pos = i; }
+        }
+        assert!(
+            worst < 0.01,
+            "online vs ref rel-error at {worst_pos} = {worst}; ref={} fused={}",
+            ref_out[worst_pos], fused_slice[worst_pos],
+        );
+    }
+
+    #[test]
+    fn online_softmax_simd_matches_reference() {
+        // Same shape as `online_softmax_sdpa_matches_reference` but
+        // exercises the simdgroup_matrix V matmul kernel.
+        use crate::metal_kernels::{tq_compress_4bit, tq_decompress_4bit, tq_sdpa_4bit_online_simd};
+        let d = 64i32;
+        let kv = 200i32;
+        let h_q = 2i32;
+        let h_kv = 1i32;
+        let kv_repeat = h_q / h_kv;
+        let scale = 1.0f32 / (d as f32).sqrt();
+        let seed = 99u64;
+
+        let mut k_data = Vec::with_capacity((h_kv * kv * d) as usize);
+        for v in 0..(h_kv * kv) {
+            for i in 0..d {
+                k_data.push(((v as f32) * 0.08 + (i as f32) * 0.04).sin() * 0.6);
+            }
+        }
+        let mut v_data = Vec::with_capacity((h_kv * kv * d) as usize);
+        for v in 0..(h_kv * kv) {
+            for i in 0..d {
+                v_data.push(((v as f32) * 0.05 + (i as f32) * 0.07).cos() * 0.4);
+            }
+        }
+        let mut q_data = Vec::with_capacity((h_q * d) as usize);
+        for h in 0..h_q {
+            for i in 0..d {
+                q_data.push(((h as f32) * 0.17 + (i as f32) * 0.03).sin() * 0.5);
+            }
+        }
+        let k_arr = mlx_rs::Array::from_slice(&k_data, &[1, h_kv, kv, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let v_arr = mlx_rs::Array::from_slice(&v_data, &[1, h_kv, kv, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let q_arr = mlx_rs::Array::from_slice(&q_data, &[1, h_q, 1, d])
+            .as_dtype(mlx_rs::Dtype::Float32).unwrap();
+
+        let signs_vec = cached_signs(d, seed);
+        let signs = mlx_rs::Array::from_slice(&signs_vec, &[d]);
+        let boundaries = mlx_rs::Array::from_slice(&BOUNDARIES_4BIT, &[15]);
+        let centroids = mlx_rs::Array::from_slice(&CENTROIDS_4BIT, &[16]);
+        let (packed, sigma, mean) = tq_compress_4bit(&k_arr, &signs, &boundaries).unwrap();
+        let packed = packed.reshape(&[1, h_kv, kv, d / 8]).unwrap();
+        let sigma = sigma.reshape(&[1, h_kv, kv]).unwrap();
+        let mean = mean.reshape(&[1, h_kv, kv]).unwrap();
+        let k_recon = tq_decompress_4bit(
+            &packed, &sigma, &mean, &signs, &centroids,
+            &[1, h_kv, kv, d], mlx_rs::Dtype::Float32,
+        ).unwrap();
+        mlx_rs::transforms::eval([&k_recon, &q_arr]).unwrap();
+
+        let v_group_size = 32i32;
+        let v_bits = 8i32;
+        let v_flat = v_arr.reshape(&[h_kv * kv, d]).unwrap();
+        let (vq, vs, vb) = mlx_rs::ops::quantize(&v_flat, v_group_size, v_bits, None::<&str>).unwrap();
+        let packed_v_cols = vq.shape()[1];
+        let n_groups = d / v_group_size;
+        let vq = vq.reshape(&[1, h_kv, kv, packed_v_cols]).unwrap();
+        let vs = vs.reshape(&[1, h_kv, kv, n_groups]).unwrap();
+        let vb = vb.reshape(&[1, h_kv, kv, n_groups]).unwrap();
+        let v_recon = mlx_rs::ops::dequantize(
+            &vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
+            &vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            &vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            v_group_size, v_bits, None::<&str>,
+        ).unwrap();
+        mlx_rs::transforms::eval([&v_recon]).unwrap();
+
+        let k_slice = k_recon.as_slice::<f32>();
+        let v_slice = v_recon.as_slice::<f32>();
+        let q_slice = q_arr.as_slice::<f32>();
+        let mut ref_out = vec![0f32; (h_q * d) as usize];
+        for hq in 0..h_q {
+            let hkv = hq / kv_repeat;
+            let mut scores = vec![0f32; kv as usize];
+            for k in 0..kv {
+                let mut acc = 0f32;
+                for i in 0..d {
+                    acc += q_slice[(hq * d + i) as usize]
+                         * k_slice[((hkv * kv + k) * d + i) as usize];
+                }
+                scores[k as usize] = acc * scale;
+            }
+            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0f32;
+            let mut exps = vec![0f32; kv as usize];
+            for k in 0..kv {
+                let e = (scores[k as usize] - mx).exp();
+                exps[k as usize] = e;
+                sum += e;
+            }
+            for e in exps.iter_mut() { *e /= sum; }
+            for k in 0..kv {
+                for i in 0..d {
+                    ref_out[(hq * d + i) as usize] +=
+                        exps[k as usize] * v_slice[((hkv * kv + k) * d + i) as usize];
+                }
+            }
+        }
+
+        let fused = tq_sdpa_4bit_online_simd(
+            &q_arr, &packed, &sigma, &mean,
+            &vq, &vs, &vb,
+            &signs, &centroids,
+            None, scale, kv_repeat, v_group_size,
+        ).unwrap();
+        mlx_rs::transforms::eval([&fused]).unwrap();
+        let fused_slice = fused.as_slice::<f32>();
+
+        let mut worst = 0f32;
+        let mut worst_pos = 0;
+        for i in 0..ref_out.len() {
+            let abs = (ref_out[i] - fused_slice[i]).abs();
+            if abs < 0.01 { continue; }
+            let rel = abs / ref_out[i].abs().max(1.0);
+            if rel > worst { worst = rel; worst_pos = i; }
+        }
+        assert!(
+            worst < 0.01,
+            "simd online vs ref rel-error at {worst_pos} = {worst}; ref={} fused={}",
+            ref_out[worst_pos], fused_slice[worst_pos],
+        );
+    }
+
+    #[test]
     fn fused_sdpa_matches_reference() {
         // Validates fused SDPA against a CPU reference implementation
         // (softmax(Q·K_recon^T * scale) @ V) on a small GQA toy.

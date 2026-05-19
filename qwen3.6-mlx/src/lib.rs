@@ -157,6 +157,52 @@ impl<'a> Generate<'a> {
         }
     }
 
+    /// Spike: TurboQuant 4-bit K + 8-bit V cache. Uses the fused
+    /// online-softmax SDPA path via `KeyValueCache::try_fused_attention`.
+    pub fn new_turboquant_kv(model: &'a mut Model, temp: f32, prompt: &'a Array) -> Self {
+        let cache = model.new_cache(KVCacheMode::TurboQuant);
+        Self {
+            model,
+            cache,
+            temp,
+            state: GenerateState::Prefill { prompt },
+            prefetched: None,
+            token_count: 0,
+        }
+    }
+
+    /// Build a Generate with a pre-populated cache (e.g. from a
+    /// prompt-cache prefix load). Caller wraps each loaded `KVCache`
+    /// in `HybridCache::KV(...)` and supplies the suffix prompt.
+    pub fn new_with_cache(
+        model: &'a mut Model,
+        cache: Vec<HybridCache>,
+        temp: f32,
+        prompt: &'a Array,
+    ) -> Self {
+        Self {
+            model,
+            cache,
+            temp,
+            state: GenerateState::Prefill { prompt },
+            prefetched: None,
+            token_count: 0,
+        }
+    }
+
+    /// Consume the iterator and return the populated cache vector.
+    /// Used by the prompt-cache feature to persist the post-prefill
+    /// KV state after generation completes.
+    pub fn into_cache(self) -> Vec<HybridCache> {
+        self.cache
+    }
+
+    /// Borrow the cache vector. Useful for inspecting cached offsets or
+    /// snapshotting mid-stream.
+    pub fn cache(&self) -> &[HybridCache] {
+        &self.cache
+    }
+
     fn compute_next(&mut self, y: &Array) -> Result<Array, Exception> {
         let inputs = y.index((.., NewAxis)); // [B, 1]
         let logits = self.model.forward(&inputs, &mut self.cache)?;
@@ -183,22 +229,37 @@ impl Iterator for Generate<'_> {
             GenerateState::Prefill { prompt } => {
                 let prompt = *prompt;
                 // Chunked prefill keeps peak memory bounded while still filling
-                // KV/recurrent caches across the full prompt.
-                const PREFILL_CHUNK: i32 = 64;
+                // KV/recurrent caches across the full prompt. Chunk size is
+                // env-tunable via QWEN36_PREFILL_CHUNK (default 64). Same
+                // shape as the gemma4 path so the env knobs match.
+                let prefill_chunk: i32 = std::env::var("QWEN36_PREFILL_CHUNK")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&n: &i32| n > 0)
+                    .unwrap_or(64);
                 let seq_len = prompt.shape()[1];
                 // Chunked prefill: only the final chunk needs full vocab logits;
                 // earlier chunks just populate the cache, so use forward_last_logits
                 // (cheap `[B, vocab]` slice) for them too — the throwaway logits
-                // are immediately discarded.
-                let logits = if seq_len > PREFILL_CHUNK {
+                // are immediately discarded. Per-chunk eval mode is env-tunable:
+                //   QWEN36_SKIP_CHUNK_EVAL=1 — omit chunk-boundary eval entirely.
+                //   QWEN36_ASYNC_PREFILL=1   — use async_eval to overlap.
+                let skip_chunk_eval = std::env::var("QWEN36_SKIP_CHUNK_EVAL").is_ok();
+                let async_prefill = std::env::var("QWEN36_ASYNC_PREFILL").is_ok();
+                let logits = if seq_len > prefill_chunk {
                     let mut pos = 0;
                     let mut last_logits = None;
                     while pos < seq_len {
-                        let end = (pos + PREFILL_CHUNK).min(seq_len);
+                        let end = (pos + prefill_chunk).min(seq_len);
                         let chunk = prompt.index((.., pos..end));
                         let logits = tri!(self.model.forward_last_logits(&chunk, &mut self.cache));
-                        // Materialize and free intermediates between chunks.
-                        tri!(eval([&logits]));
+                        if !skip_chunk_eval {
+                            if async_prefill {
+                                tri!(async_eval([&logits]));
+                            } else {
+                                tri!(eval([&logits]));
+                            }
+                        }
                         last_logits = Some(logits);
                         pos = end;
                     }
@@ -221,13 +282,30 @@ impl Iterator for Generate<'_> {
             }
             GenerateState::Decode => {
                 let current = self.prefetched.take()?;
+                // QWEN36_PROFILE_DECODE=1 logs per-step compute_next timing
+                // every 16 tokens.
+                let profile = std::env::var("QWEN36_PROFILE_DECODE").is_ok();
+                let t0 = profile.then(std::time::Instant::now);
                 let next_y = tri!(self.compute_next(&current));
                 let _ = mlx_rs::transforms::async_eval([&next_y]);
+                if let Some(t0) = t0 {
+                    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    if self.token_count % 16 == 0 {
+                        eprintln!(
+                            "[qwen36-profile] tok={} next={:.2}ms",
+                            self.token_count, ms
+                        );
+                    }
+                }
 
                 self.prefetched = Some(next_y);
                 self.token_count += 1;
 
-                if self.token_count % 256 == 0 {
+                let cache_clear_interval: usize = std::env::var("QWEN36_CACHE_CLEAR_INTERVAL")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(256);
+                if cache_clear_interval > 0 && self.token_count % cache_clear_interval == 0 {
                     unsafe {
                         mlx_sys::mlx_clear_cache();
                     }

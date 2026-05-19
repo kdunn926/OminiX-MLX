@@ -49,7 +49,7 @@ use mlx_rs::{
     ops::concatenate_axis,
     Array,
 };
-use mlx_rs_core::cache::KVCache;
+use mlx_rs_core::cache::{KVCache, KeyValueCache};
 
 use crate::cache::HybridCache;
 use crate::config::ModelArgs;
@@ -80,6 +80,11 @@ pub struct MtpHead {
     pub norm: nn::RmsNorm,
     /// MTP transformer blocks. Empty in stub mode.
     pub layers: Vec<TransformerBlock>,
+    /// Persistent KV cache per MTP layer, retained across draft steps
+    /// within a cycle so attention sees prior draft positions (matches
+    /// llama.cpp PR #22673 `ctx_dft` semantics). Lazily allocated on
+    /// first forward; reset between cycles via `reset_cache`.
+    draft_caches: Vec<HybridCache>,
 }
 
 impl MtpHead {
@@ -114,15 +119,62 @@ impl MtpHead {
         let cat = concatenate_axis(&[&h_norm, &e_norm], -1)?;
         let mut m = self.fc.forward(&cat)?;
 
-        // Each MTP block runs over the input positions with a fresh KV cache
-        // and no explicit mask (single-position decode is the typical case).
-        for layer in self.layers.iter_mut() {
-            let mut cache = vec![HybridCache::KV(KVCache::new())];
-            let cache_slot = &mut cache[0];
+        // Lazy-allocate persistent caches the first time we draft. Each
+        // MTP layer gets its own KVCache that grows across draft steps
+        // within a single cycle.
+        if self.draft_caches.is_empty() {
+            for _ in 0..self.layers.len() {
+                self.draft_caches.push(HybridCache::KV(KVCache::new()));
+            }
+        }
+
+        // Each MTP block runs over the input positions with its persistent
+        // KV cache; position offset comes from the cache automatically so
+        // RoPE rotates each draft token at its correct sequence position.
+        // No explicit mask: T=1 decode + cache-offset attention is correct.
+        for (layer, cache_slot) in self.layers.iter_mut().zip(self.draft_caches.iter_mut()) {
             m = layer.forward(&m, None, cache_slot)?;
         }
 
         self.norm.forward(&m)
+    }
+
+    /// Reset the draft KV caches at the start of a new generation. Called
+    /// by the speculative session when a fresh prompt arrives so the next
+    /// draft cycle starts at position 0 inside the MTP head.
+    pub fn reset_cache(&mut self) {
+        for c in self.draft_caches.iter_mut() {
+            if let HybridCache::KV(kv) = c {
+                *kv = KVCache::new();
+            }
+        }
+    }
+
+    /// Trim the draft KV caches by `n_drop` positions. Called after the
+    /// target rejects some drafted tokens; keeps the draft KV in sync with
+    /// what the target actually committed.
+    pub fn trim_cache(&mut self, n_drop: i32) {
+        if n_drop <= 0 {
+            return;
+        }
+        for c in self.draft_caches.iter_mut() {
+            if let HybridCache::KV(kv) = c {
+                kv.trim(n_drop);
+            }
+        }
+    }
+
+    /// Current cumulative position of the MTP head's KV cache. 0 right
+    /// after a `reset_cache`; grows by 1 on each `forward(T=1)` call.
+    pub fn draft_offset(&self) -> i32 {
+        self.draft_caches
+            .iter()
+            .next()
+            .and_then(|c| match c {
+                HybridCache::KV(kv) => Some(kv.offset()),
+                _ => None,
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -243,6 +295,7 @@ fn load_mtp_head_from_weights(
         pre_fc_norm_hidden,
         norm,
         layers,
+        draft_caches: Vec::new(),
     }))
 }
 

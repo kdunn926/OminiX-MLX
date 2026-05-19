@@ -188,8 +188,51 @@ fn main() -> Result<()> {
             run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
         }
         _ => {
-            let mut cache: Vec<KVCache> = Vec::new();
-            run_decode(&mut model, &mut cache, &prompt_arr, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
+            // Prompt-cache prefix: when GEMMA4_PROMPT_CACHE_DIR is set,
+            // try to load a previously-saved KV state for the longest
+            // matching prefix of this prompt and skip prefilling that
+            // portion. After generation, save the post-prompt KV so
+            // future runs with the same prompt prefix start warm.
+            // bf16-KVCache only — TQ / Quantized caches don't support
+            // safetensors save/load yet.
+            let cache_dir = std::env::var("GEMMA4_PROMPT_CACHE_DIR").ok();
+            let (mut cache, prefix_skipped, suffix_prompt) = if let Some(ref d) = cache_dir {
+                match KVCache::try_load_kv_caches(&prompt_ids, d) {
+                    Ok(Some((caches, n_cached))) => {
+                        println!(
+                            "prompt-cache: HIT — reusing {} cached tokens, prefilling {} suffix",
+                            n_cached,
+                            prompt_ids.len() - n_cached
+                        );
+                        let suffix_slice = &prompt_ids[n_cached..];
+                        let suffix_arr = Array::from(suffix_slice).index(NewAxis);
+                        (caches, n_cached, suffix_arr)
+                    }
+                    Ok(None) => {
+                        println!("prompt-cache: miss — prefilling and saving");
+                        (Vec::<KVCache>::new(), 0usize, prompt_arr.clone())
+                    }
+                    Err(e) => {
+                        eprintln!("prompt-cache: load error ({e}); falling back to full prefill");
+                        (Vec::<KVCache>::new(), 0usize, prompt_arr.clone())
+                    }
+                }
+            } else {
+                (Vec::<KVCache>::new(), 0usize, prompt_arr.clone())
+            };
+            run_decode(&mut model, &mut cache, &suffix_prompt, temp, max_new, &t_gen, &mut t_first, &mut emitted)?;
+            // Save after a *successful* full-prompt prefill (i.e. when
+            // we didn't hit the cache and produced the full KV state).
+            // Skip writeback on cache hits to avoid disk churn.
+            if let Some(d) = cache_dir {
+                if prefix_skipped == 0 {
+                    if let Err(e) = KVCache::save_kv_caches(&cache, &prompt_ids, &d) {
+                        eprintln!("prompt-cache: save error: {e}");
+                    } else {
+                        println!("prompt-cache: saved {} tokens worth of KV state to {d}", prompt_ids.len());
+                    }
+                }
+            }
         }
     }
     let total = t_gen.elapsed();

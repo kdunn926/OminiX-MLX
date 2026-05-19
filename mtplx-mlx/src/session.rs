@@ -60,6 +60,22 @@ pub struct SessionMetrics {
     pub total_tokens: usize,
     pub mtp_cycles: usize,
     pub ar_fallback_steps: usize,
+    /// Total draft tokens proposed by the MTP head across all cycles.
+    /// For K=1 cycles (the current implementation), this equals `mtp_cycles`.
+    pub mtp_drafted: usize,
+    /// Total draft tokens that matched the target's argmax (greedy) or
+    /// passed the speculative-accept probability ratio (sampling).
+    pub mtp_accepted: usize,
+}
+
+impl SessionMetrics {
+    pub fn mtp_acceptance_rate(&self) -> f64 {
+        if self.mtp_drafted > 0 {
+            self.mtp_accepted as f64 / self.mtp_drafted as f64
+        } else {
+            0.0
+        }
+    }
 }
 
 impl SessionMetrics {
@@ -119,9 +135,22 @@ impl MtplxSession {
         eos: &HashSet<u32>,
     ) -> Result<(Vec<i32>, SessionMetrics), MtpError> {
         let mut metrics = SessionMetrics::default();
+        // Reset the MTP head's persistent draft KV cache at the start of
+        // every generation so the head's attention starts at position 0
+        // for the new sequence (rather than carrying state from a prior
+        // request in the same process).
+        if let Some(mtp) = self.model.mtp_head() {
+            mtp.reset_cache();
+        }
         let mut cache: Vec<HybridCache> = self
             .model
-            .new_cache(qwen3_6_mlx::KVCacheMode::Standard);
+            .new_cache(if std::env::var("TURBO_KV").is_ok() {
+                qwen3_6_mlx::KVCacheMode::TurboQuant
+            } else if std::env::var("QUANTIZE_KV").is_ok() {
+                qwen3_6_mlx::KVCacheMode::Quantized
+            } else {
+                qwen3_6_mlx::KVCacheMode::Standard
+            });
 
         // --- prefill ---
         let prefill_start = Instant::now();
@@ -146,8 +175,13 @@ impl MtplxSession {
         while metrics.total_tokens < self.cfg.max_tokens {
             if self.mtp_active {
                 metrics.mtp_cycles += 1;
-                let (accepted, next) =
+                metrics.mtp_drafted += 1; // K=1 per cycle
+                let (accepted, next, draft_accepted) =
                     self.mtp_cycle(next_id, &mut cache)?;
+                if draft_accepted {
+                    metrics.mtp_accepted += 1;
+                }
+                let _ = &accepted;
                 for tok in &accepted {
                     produced.push(*tok);
                     metrics.total_tokens += 1;
@@ -207,7 +241,7 @@ impl MtplxSession {
         &mut self,
         last_token: i32,
         cache: &mut Vec<HybridCache>,
-    ) -> Result<(Vec<i32>, i32), MtpError> {
+    ) -> Result<(Vec<i32>, i32, bool), MtpError> {
         // Step 1: target forward on `last_token`, keep both the last
         // hidden state and the logits.
         let in_arr = Array::from_slice(&[last_token], &[1, 1]);
@@ -270,15 +304,16 @@ impl MtplxSession {
         //     bonus sampled from target distribution).
         //   * Reject: drop the draft, next_anchor = correction (greedy:
         //     target's argmax; spec: residual `(p-q)+` sample).
-        let (extra, next_anchor) = match self.cfg.acceptance {
+        let (extra, next_anchor, accepted_flag) = match self.cfg.acceptance {
             AcceptanceMode::Greedy => {
                 let target_after_ar = argmax_id(&verify_logits)?;
                 if target_after_ar == drafted {
-                    // Accept: ar_next is the extra, drafted becomes
-                    // the next anchor (caller pushes both).
-                    (vec![ar_next], drafted)
+                    (vec![ar_next], drafted, true)
                 } else {
-                    (vec![ar_next], target_after_ar)
+                    if let Some(mtp) = self.model.mtp_head() {
+                        mtp.trim_cache(1);
+                    }
+                    (vec![ar_next], target_after_ar, false)
                 }
             }
             AcceptanceMode::Speculative => {
@@ -291,20 +326,126 @@ impl MtplxSession {
                     default_rng,
                 )?;
                 if res.all_accepted {
-                    // Accept: ar_next is the extra, drafted is the
-                    // committed draft → anchor for next cycle. The
-                    // Leviathan-Chen bonus is dropped here because
-                    // anchoring on it would skip a verification step
-                    // (the bonus has no KV-cache entry yet).
                     let _bonus = res.correction;
-                    (vec![ar_next], drafted)
+                    (vec![ar_next], drafted, true)
                 } else {
-                    (vec![ar_next], res.correction as i32)
+                    if let Some(mtp) = self.model.mtp_head() {
+                        mtp.trim_cache(1);
+                    }
+                    (vec![ar_next], res.correction as i32, false)
                 }
             }
         };
 
-        Ok((extra, next_anchor))
+        Ok((extra, next_anchor, accepted_flag))
+    }
+
+    /// Token-by-token streaming iterator. Emits one `i32` token per `next()`
+    /// call. Internally each MTP cycle produces 1-2 tokens which are buffered;
+    /// callers see a clean one-at-a-time stream regardless.
+    ///
+    /// Parameters mirror `SpeculativeConfig` but are passed explicitly so
+    /// callers (e.g. OminiX-API) can derive them from the per-request fields
+    /// without rebuilding the session. Only greedy acceptance (T=0) is
+    /// supported; `max_tokens` overrides `cfg.max_tokens`.
+    pub fn generate_iter(
+        &mut self,
+        prompt_ids: Vec<i32>,
+        eos: HashSet<u32>,
+        max_tokens: usize,
+    ) -> impl Iterator<Item = Result<i32, MtpError>> + '_ {
+        let mtp_active = self.mtp_active;
+        let mut cache: Option<Vec<HybridCache>> = None;
+        let mut initialized = false;
+        let mut finished = max_tokens == 0;
+        let mut emitted = 0usize;
+        let mut pending: std::collections::VecDeque<i32> = std::collections::VecDeque::new();
+        let mut last_token: i32 = 0;
+
+        std::iter::from_fn(move || {
+            loop {
+                // Drain pending buffer first.
+                if let Some(tok) = pending.pop_front() {
+                    emitted += 1;
+                    last_token = tok;
+                    if eos.contains(&(tok as u32)) || emitted >= max_tokens {
+                        finished = true;
+                        pending.clear();
+                    }
+                    return Some(Ok(tok));
+                }
+
+                if finished {
+                    return None;
+                }
+
+                // Prefill on first call.
+                if !initialized {
+                    if let Some(mtp) = self.model.mtp_head() {
+                        mtp.reset_cache();
+                    }
+                    let mut c = self.model.new_cache(if std::env::var("TURBO_KV").is_ok() {
+                qwen3_6_mlx::KVCacheMode::TurboQuant
+            } else if std::env::var("QUANTIZE_KV").is_ok() {
+                qwen3_6_mlx::KVCacheMode::Quantized
+            } else {
+                qwen3_6_mlx::KVCacheMode::Standard
+            });
+                    let prompt_arr =
+                        Array::from_slice(&prompt_ids, &[1, prompt_ids.len() as i32]);
+                    let logits = match self.model.forward_last_logits(&prompt_arr, &mut c) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            finished = true;
+                            return Some(Err(e.into()));
+                        }
+                    };
+                    let first = match argmax_id(&logits) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            finished = true;
+                            return Some(Err(e));
+                        }
+                    };
+                    cache = Some(c);
+                    initialized = true;
+                    pending.push_back(first);
+                    continue;
+                }
+
+                // Decode: one MTP cycle or one AR step.
+                let c = cache.as_mut().expect("cache initialized");
+                if mtp_active {
+                    match self.mtp_cycle(last_token, c) {
+                        Ok((extra, next, _accepted)) => {
+                            for t in extra {
+                                pending.push_back(t);
+                            }
+                            pending.push_back(next);
+                        }
+                        Err(e) => {
+                            finished = true;
+                            return Some(Err(e));
+                        }
+                    }
+                } else {
+                    let in_arr = Array::from_slice(&[last_token], &[1, 1]);
+                    match self.model.forward_last_logits(&in_arr, c) {
+                        Ok(logits) => match argmax_id(&logits) {
+                            Ok(id) => pending.push_back(id),
+                            Err(e) => {
+                                finished = true;
+                                return Some(Err(e));
+                            }
+                        },
+                        Err(e) => {
+                            finished = true;
+                            return Some(Err(e.into()));
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 

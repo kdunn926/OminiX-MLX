@@ -1,5 +1,5 @@
 use mlx_rs::{error::Exception, Array};
-use mlx_rs_core::cache::{KVCache, KeyValueCache, QuantizedKVCache};
+use mlx_rs_core::cache::{KVCache, KeyValueCache, QuantizedKVCache, TurboQuantKVCache};
 
 /// Recurrent state for DeltaNet layers.
 ///
@@ -39,6 +39,9 @@ impl Default for RecurrentState {
 pub enum HybridCache {
     KV(KVCache),
     QuantizedKV(QuantizedKVCache),
+    /// Spike: TurboQuant 4-bit K + 8-bit V cache with fused single-dispatch
+    /// SDPA path. Wired via `KVCacheMode::TurboQuant`.
+    TurboQuantKV(TurboQuantKVCache),
     Recurrent(RecurrentState),
 }
 
@@ -47,6 +50,7 @@ impl HybridCache {
         match self {
             HybridCache::KV(kv) => kv.offset(),
             HybridCache::QuantizedKV(qkv) => qkv.offset(),
+            HybridCache::TurboQuantKV(tq) => tq.offset(),
             HybridCache::Recurrent(rec) => rec.step,
         }
     }
@@ -80,6 +84,10 @@ impl HybridCache {
                 Err(Exception::custom(
                     "HybridCache::trim_gdn: QuantizedKVCache trim is not yet implemented",
                 ))
+            }
+            HybridCache::TurboQuantKV(tq) => {
+                tq.trim(n_drop)?;
+                Ok(())
             }
             HybridCache::Recurrent(rec) => {
                 let snap = snapshot.ok_or_else(|| {

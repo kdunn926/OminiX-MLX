@@ -121,12 +121,15 @@ fn main() -> Result<()> {
                 &eos_tokens,
             )?;
             println!(
-                "DFlash: prefill_s={:.3} decode_tok_s={:.2} acceptance_ratio={:.3} avg_block_len={:.2} total_tokens={}",
+                "DFlash: prefill_s={:.3} decode_tok_s={:.2} acceptance_ratio={:.3} avg_block_len={:.2} total_tokens={} | adaptive: Large={} Reduced={} Probe={}",
                 dflash_stats.prefill_s,
                 dflash_stats.decode_tok_s,
                 metrics.acceptance_ratio,
                 metrics.avg_block_len,
-                dflash_stats.total_tokens
+                dflash_stats.total_tokens,
+                metrics.cycles_large,
+                metrics.cycles_reduced,
+                metrics.cycles_probe,
             );
             let speedup = if ar_stats.decode_tok_s > 0.0 {
                 dflash_stats.decode_tok_s / ar_stats.decode_tok_s
@@ -164,12 +167,15 @@ fn main() -> Result<()> {
                 &eos_tokens,
             )?;
             println!(
-                "DFlash: prefill_s={:.3} decode_tok_s={:.2} acceptance_ratio={:.3} avg_block_len={:.2} total_tokens={}",
+                "DFlash: prefill_s={:.3} decode_tok_s={:.2} acceptance_ratio={:.3} avg_block_len={:.2} total_tokens={} | adaptive: Large={} Reduced={} Probe={}",
                 dflash_stats.prefill_s,
                 dflash_stats.decode_tok_s,
                 metrics.acceptance_ratio,
                 metrics.avg_block_len,
-                dflash_stats.total_tokens
+                dflash_stats.total_tokens,
+                metrics.cycles_large,
+                metrics.cycles_reduced,
+                metrics.cycles_probe,
             );
             let speedup = if ar_stats.decode_tok_s > 0.0 {
                 dflash_stats.decode_tok_s / ar_stats.decode_tok_s
@@ -194,7 +200,17 @@ fn run_autoregressive(
     let mut ttft = None;
     let mut total_tokens = 0usize;
 
-    for token in Generate::new(model, temp, prompt).take(max_tokens) {
+    let iter: Box<dyn Iterator<Item = Result<mlx_rs::Array, mlx_rs::error::Exception>>> =
+        if std::env::var("TURBO_KV").is_ok() {
+            eprintln!("kv_backend: turboquant");
+            Box::new(Generate::new_turboquant_kv(model, temp, prompt).take(max_tokens))
+        } else if std::env::var("QUANTIZE_KV").is_ok() {
+            eprintln!("kv_backend: quantized");
+            Box::new(Generate::new_quantized_kv(model, temp, prompt).take(max_tokens))
+        } else {
+            Box::new(Generate::new(model, temp, prompt).take(max_tokens))
+        };
+    for token in iter {
         let token = token?;
         if ttft.is_none() {
             ttft = Some(start.elapsed().as_secs_f64());
@@ -504,7 +520,9 @@ fn run_gemma4(
             println!("{note}");
             let vocab_size = model.args.vocab_size as u32;
             // No target_layer_ids — mock draft does not consume hidden states.
-            let target = Gemma4TargetAdapter::with_dflash(model, args.temp, Vec::new());
+            let target = <Gemma4TargetAdapter<gemma4_mlx::KVCache>>::with_dflash(
+                model, args.temp, Vec::new(),
+            );
             let draft = MockDraftAdapter::new(vocab_size);
             let mut session = DFlashSession::new(target, draft, SpeculativeCycleConfig::default());
             let (dflash_stats, metrics) = run_dflash_session(
@@ -540,8 +558,46 @@ fn run_gemma4(
             let lm_head_weight = model
                 .get_lm_head_weight()
                 .map_err(|e| anyhow!(e.to_string()))?;
-            let mut target =
-                Gemma4TargetAdapter::with_dflash(model, args.temp, target_layer_ids);
+            let turbo_kv = std::env::var("TURBO_KV").is_ok();
+            if turbo_kv && args.ddtree.enabled {
+                return Err(anyhow!(
+                    "TURBO_KV is not supported with --ddtree (TurboQuantKVCache lacks compact())"
+                ));
+            }
+            if turbo_kv {
+                eprintln!("kv_backend: turboquant (gemma4 dflash linear)");
+                let target = <Gemma4TargetAdapter<mlx_rs_core::cache::TurboQuantKVCache>>::with_dflash(
+                    model, args.temp, target_layer_ids,
+                );
+                let draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
+                let spec_config = SpeculativeCycleConfig {
+                    block_len: block_size,
+                    ..Default::default()
+                };
+                let mut session = DFlashSession::new(target, draft, spec_config);
+                let (dflash_stats, metrics) = run_dflash_session(
+                    &mut session,
+                    prompt_ids,
+                    args.max_tokens,
+                    args.temp,
+                    &eos_tokens,
+                )?;
+                println!(
+                    "DFlash(gemma4+TQ): prefill_s={:.3} decode_tok_s={:.2} acceptance_ratio={:.3} avg_block_len={:.2} total_tokens={} | adaptive: Large={} Reduced={} Probe={}",
+                    dflash_stats.prefill_s,
+                    dflash_stats.decode_tok_s,
+                    metrics.acceptance_ratio,
+                    metrics.avg_block_len,
+                    dflash_stats.total_tokens,
+                    metrics.cycles_large,
+                    metrics.cycles_reduced,
+                    metrics.cycles_probe,
+                );
+                return Ok(());
+            }
+            let mut target = <Gemma4TargetAdapter<gemma4_mlx::KVCache>>::with_dflash(
+                model, args.temp, target_layer_ids,
+            );
             let mut draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
             let (dflash_stats, metrics) = if args.ddtree.enabled {
                 println!(

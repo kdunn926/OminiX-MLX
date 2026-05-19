@@ -81,6 +81,7 @@ impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Apply RoPE with cache offset
+        let mut fused_attn_out: Option<Array> = None;
         if let Some(cache) = cache.as_mut() {
             let q_input = nn::RopeInputBuilder::new(&queries)
                 .offset(cache.offset())
@@ -91,9 +92,34 @@ impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
                 .build()?;
             keys = self.rope.forward(k_input)?;
 
-            let (k, v) = cache.update_and_fetch(keys, values)?;
-            keys = k;
-            values = v;
+            // Spike: try the cache's fused TurboQuant attention path
+            // for decode steps (L=1). On hit we get attn_out directly
+            // and skip update_and_fetch + SDPA. q is [B, Hq, 1, D];
+            // GatedAttention stores queries as [B, Hq, L, head_dim]
+            // already so the shape matches the trait contract.
+            let kv_repeat = self.n_heads as i32 / self.n_kv_heads as i32;
+            if L == 1 {
+                let mask_arr = match mask {
+                    Some(AttentionMask::Array(m)) => Some(m),
+                    _ => None,
+                };
+                if let Some(out) = cache.try_fused_attention(
+                    &queries,
+                    keys.clone(),
+                    values.clone(),
+                    self.scale,
+                    mask_arr,
+                    kv_repeat,
+                )? {
+                    fused_attn_out = Some(out);
+                }
+            }
+
+            if fused_attn_out.is_none() {
+                let (k, v) = cache.update_and_fetch(keys, values)?;
+                keys = k;
+                values = v;
+            }
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
             keys = self.rope.forward(nn::RopeInput::new(&keys))?;
@@ -107,11 +133,16 @@ impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
             None => None,
         };
 
-        let attn_output = scaled_dot_product_attention::<KVCache>(
-            queries, keys, values, None, self.scale, sdpa_mask,
-        )?
-        .transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[B, L, -1])?; // [B, L, n_heads * head_dim]
+        let attn_output = if let Some(out) = fused_attn_out {
+            out.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[B, L, -1])?
+        } else {
+            scaled_dot_product_attention::<KVCache>(
+                queries, keys, values, None, self.scale, sdpa_mask,
+            )?
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[B, L, -1])?
+        }; // [B, L, n_heads * head_dim]
 
         // Apply output gate: output * sigmoid(gate)
         let gated = attn_output.multiply(nn::sigmoid(gate)?)?;

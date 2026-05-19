@@ -24,6 +24,7 @@
 use mlx_rs::{error::Exception, ops::concatenate_axis, Array};
 
 use gemma4_mlx::{KVCache, Model};
+use mlx_rs_core::cache::{KeyValueCache, TurboQuantKVCache};
 use mlx_rs::{argmax_axis, ops::indexing::IndexOp};
 
 use crate::engine::spec_epoch::TargetModel;
@@ -32,9 +33,9 @@ use crate::engine::spec_epoch::TargetModel;
 ///
 /// Holds the model, its KV cache, target capture layer ids, and the
 /// verify-snapshot fields needed to roll back on partial acceptance.
-pub struct Gemma4TargetAdapter {
+pub struct Gemma4TargetAdapter<C: KeyValueCache + Default = KVCache> {
     model: Model,
-    cache: Vec<KVCache>,
+    cache: Vec<C>,
     target_layer_ids: Vec<usize>,
     step: usize,
     _temp: f32,
@@ -59,7 +60,7 @@ pub struct Gemma4TargetAdapter {
     verify_segment_count_pre: usize,
 }
 
-impl Gemma4TargetAdapter {
+impl<C: KeyValueCache + Default> Gemma4TargetAdapter<C> {
     /// Construct a Gemma4 target adapter with DFlash hidden-capture wiring.
     ///
     /// `target_layer_ids` corresponds to the draft model's
@@ -83,9 +84,81 @@ impl Gemma4TargetAdapter {
         }
     }
 
+    fn fresh_cache(model: &Model) -> Vec<C> {
+        let num_slots = *model.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
+        gemma4_mlx::init_cache::<C>(num_slots)
+    }
+
+    fn append_target_hidden(&mut self, captures: Array) -> Result<(), Exception> {
+        let seg_len = captures.shape()[1] as usize;
+        let prev_total = self.target_hidden_positions.last().copied().unwrap_or(0);
+        self.target_hidden_segments.push(captures);
+        self.target_hidden_positions.push(prev_total + seg_len);
+        self.target_hidden_full_cache = None;
+        // Cap the number of retained hidden-state segments to bound
+        // memory growth across long generations. The drafter reads
+        // `last_target_hidden` which concats all segments — capping
+        // drops the oldest. Sweep 6 on Qwen3.6-27B + 100-token DFlash
+        // showed cap=8 is identical in throughput AND acceptance to
+        // unbounded retention (acceptance 0.265 in both). Larger caps
+        // (32, 128) regressed slightly due to list-management overhead.
+        // Default 8; `DFLASH_MAX_HIDDEN_SEGS=0` disables the cap.
+        let cap_default: usize = 8;
+        let cap_opt: Option<usize> = std::env::var("DFLASH_MAX_HIDDEN_SEGS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .or(Some(cap_default))
+            .filter(|&n| n > 0);
+        if let Some(cap) = cap_opt {
+            while self.target_hidden_segments.len() > cap {
+                self.target_hidden_segments.remove(0);
+                self.target_hidden_positions.remove(0);
+            }
+        }
+        Ok(())
+    }
+
+    fn truncate_latest_segment_to(&mut self, n_keep: usize) -> Result<(), Exception> {
+        if n_keep == 0 {
+            self.target_hidden_segments.pop();
+            self.target_hidden_positions.pop();
+            self.target_hidden_full_cache = None;
+            return Ok(());
+        }
+        let Some(seg) = self.target_hidden_segments.last_mut() else {
+            return Ok(());
+        };
+        let seg_len = seg.shape()[1] as usize;
+        if n_keep >= seg_len {
+            return Ok(());
+        }
+        *seg = seg.index((.., ..n_keep as i32, ..));
+        let prev_total = if self.target_hidden_positions.len() >= 2 {
+            self.target_hidden_positions[self.target_hidden_positions.len() - 2]
+        } else {
+            0
+        };
+        let last = self.target_hidden_positions.last_mut().unwrap();
+        *last = prev_total + n_keep;
+        self.target_hidden_full_cache = None;
+        Ok(())
+    }
+
+    fn rebuild_full_hidden(&self) -> Result<Option<Array>, Exception> {
+        if self.target_hidden_segments.is_empty() {
+            return Ok(None);
+        }
+        if self.target_hidden_segments.len() == 1 {
+            return Ok(Some(self.target_hidden_segments[0].clone()));
+        }
+        let refs: Vec<&Array> = self.target_hidden_segments.iter().collect();
+        Ok(Some(concatenate_axis(&refs, 1)?))
+    }
 }
 
-impl crate::engine::ddtree::GemmaTreeTarget for Gemma4TargetAdapter {
+// DDTree only supports the plain `KVCache` adapter — it relies on
+// `cache.compact(...)` which TurboQuant doesn't implement.
+impl crate::engine::ddtree::GemmaTreeTarget for Gemma4TargetAdapter<KVCache> {
     fn verify_tree_call(
         &mut self,
         tokens: &Array,
@@ -114,7 +187,22 @@ impl crate::engine::ddtree::GemmaTreeTarget for Gemma4TargetAdapter {
     }
 }
 
-impl Gemma4TargetAdapter {
+/// Convenience constructor for the TurboQuant KV variant. Mirrors
+/// `Gemma4TargetAdapter::<KVCache>::with_dflash` but allocates
+/// `TurboQuantKVCache` per layer so the fused online-softmax SDPA path
+/// can engage. Linear DFlash only (no DDTree).
+impl Gemma4TargetAdapter<TurboQuantKVCache> {
+    pub fn with_dflash_turboquant(
+        model: Model,
+        temp: f32,
+        target_layer_ids: Vec<usize>,
+    ) -> Self {
+        <Gemma4TargetAdapter<TurboQuantKVCache>>::with_dflash(model, temp, target_layer_ids)
+    }
+}
+
+// DDTree-specific impl (compact, verify_tree, etc.). KVCache only.
+impl Gemma4TargetAdapter<KVCache> {
     /// Compact every layer's KV cache by keeping only the positions in
     /// `keep_indices` (offsets into the appended window starting at
     /// `past_length`). Drives interior-slot deletion for DDTree's tree
@@ -203,66 +291,14 @@ impl Gemma4TargetAdapter {
         Ok(logits)
     }
 
-    fn fresh_cache(model: &Model) -> Vec<KVCache> {
-        let num_slots = *model.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
-        gemma4_mlx::init_cache::<KVCache>(num_slots)
-    }
-
-    fn append_target_hidden(&mut self, captures: Array) -> Result<(), Exception> {
-        let seg_len = captures.shape()[1] as usize;
-        let prev_total = self.target_hidden_positions.last().copied().unwrap_or(0);
-        self.target_hidden_segments.push(captures);
-        self.target_hidden_positions.push(prev_total + seg_len);
-        // Invalidate the fully-concat cache.
-        self.target_hidden_full_cache = None;
-        Ok(())
-    }
-
     fn drop_segments_after(&mut self, keep_segments: usize) {
         self.target_hidden_segments.truncate(keep_segments);
         self.target_hidden_positions.truncate(keep_segments);
         self.target_hidden_full_cache = None;
     }
-
-    fn truncate_latest_segment_to(&mut self, n_keep: usize) -> Result<(), Exception> {
-        if n_keep == 0 {
-            self.target_hidden_segments.pop();
-            self.target_hidden_positions.pop();
-            self.target_hidden_full_cache = None;
-            return Ok(());
-        }
-        let Some(seg) = self.target_hidden_segments.last_mut() else {
-            return Ok(());
-        };
-        let seg_len = seg.shape()[1] as usize;
-        if n_keep >= seg_len {
-            return Ok(());
-        }
-        *seg = seg.index((.., ..n_keep as i32, ..));
-        let prev_total = if self.target_hidden_positions.len() >= 2 {
-            self.target_hidden_positions[self.target_hidden_positions.len() - 2]
-        } else {
-            0
-        };
-        let last = self.target_hidden_positions.last_mut().unwrap();
-        *last = prev_total + n_keep;
-        self.target_hidden_full_cache = None;
-        Ok(())
-    }
-
-    fn rebuild_full_hidden(&self) -> Result<Option<Array>, Exception> {
-        if self.target_hidden_segments.is_empty() {
-            return Ok(None);
-        }
-        if self.target_hidden_segments.len() == 1 {
-            return Ok(Some(self.target_hidden_segments[0].clone()));
-        }
-        let refs: Vec<&Array> = self.target_hidden_segments.iter().collect();
-        Ok(Some(concatenate_axis(&refs, 1)?))
-    }
 }
 
-impl TargetModel for Gemma4TargetAdapter {
+impl<C: KeyValueCache + Default> TargetModel for Gemma4TargetAdapter<C> {
     fn prefill(&mut self, prompt: &Array) -> Result<Array, Exception> {
         // Reset cache, step, hidden accumulator, and verify state.
         self.cache = Self::fresh_cache(&self.model);
@@ -274,7 +310,14 @@ impl TargetModel for Gemma4TargetAdapter {
         self.verify_step = 0;
         self.verify_segment_count_pre = 0;
 
-        const PREFILL_CHUNK: i32 = 64;
+        // Same env knob as the AR path: GEMMA4_PREFILL_CHUNK tunes the
+        // per-chunk token count. Default 64 matches the AR path's
+        // tested sweet spot (chunk=128 thrashes MoE expert gather).
+        let PREFILL_CHUNK: i32 = std::env::var("GEMMA4_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &i32| n > 0)
+            .unwrap_or(64);
         let seq_len = prompt.shape()[1];
 
         if seq_len <= PREFILL_CHUNK {
@@ -309,15 +352,31 @@ impl TargetModel for Gemma4TargetAdapter {
                     &self.target_layer_ids,
                 )?
             } else {
-                let (per_pos_logits, captures) = self.model.forward_with_hidden_capture(
+                // For non-last chunks the logits are discarded — use the
+                // `last_only` variant which collapses the LM head matmul
+                // to a single position. On vocab=262k Gemma4 this drops
+                // ~33 MB of unused per-position logits per chunk and
+                // ~2-3x the prefill cost (the LM head dominates per-chunk
+                // compute when full per-position logits are materialised
+                // but never read).
+                let (last_logits, captures) = self.model.forward_last_logits_with_hidden_capture(
                     &chunk,
                     &mut self.cache,
                     &self.target_layer_ids,
                 )?;
-                // Force eval to free per-chunk intermediates before the
-                // next chunk starts.
-                mlx_rs::transforms::eval([&per_pos_logits, &captures])?;
-                (per_pos_logits, captures)
+                // Per-chunk eval frees expert-gather intermediates but
+                // synchronizes the GPU. GEMMA4_SKIP_CHUNK_EVAL=1 omits
+                // it entirely (faster on machines with enough wired
+                // memory); GEMMA4_ASYNC_PREFILL=1 uses async_eval to
+                // overlap the eval wait with the next chunk's launch.
+                if std::env::var("GEMMA4_SKIP_CHUNK_EVAL").is_err() {
+                    if std::env::var("GEMMA4_ASYNC_PREFILL").is_ok() {
+                        mlx_rs::transforms::async_eval([&last_logits, &captures])?;
+                    } else {
+                        mlx_rs::transforms::eval([&last_logits, &captures])?;
+                    }
+                }
+                (last_logits, captures)
             };
             self.append_target_hidden(captures)?;
             if is_last {
@@ -376,7 +435,7 @@ impl TargetModel for Gemma4TargetAdapter {
         let n_drop = (verify_len - n_keep) as i32;
         if n_drop > 0 {
             for cache in self.cache.iter_mut() {
-                cache.trim(n_drop);
+                cache.trim_kv(n_drop)?;
             }
         }
         self.step = self.verify_step + n_keep;

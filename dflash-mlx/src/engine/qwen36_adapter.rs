@@ -103,7 +103,16 @@ impl Qwen36TargetAdapter {
 
     pub fn with_dflash(model: Model, temp: f32, target_layer_ids: Vec<usize>) -> Self {
         install_verify_qmm_hook();
-        let cache = model.new_cache(KVCacheMode::Standard);
+        // Spike: opt into TurboQuant KV via TURBO_KV=1. The DFlash verify
+        // path drives only L=1 decode steps when running outside of the
+        // multi-token verify burst; multi-token verify (L > 1) falls
+        // back to the standard SDPA path inside `GatedAttention`.
+        let kv_cache_mode = if std::env::var("TURBO_KV").is_ok() {
+            KVCacheMode::TurboQuant
+        } else {
+            KVCacheMode::Standard
+        };
+        let cache = model.new_cache(kv_cache_mode);
         Self {
             model,
             cache,
@@ -111,7 +120,7 @@ impl Qwen36TargetAdapter {
             verify_inputs: None,
             verify_step: 0,
             step: 0,
-            kv_cache_mode: KVCacheMode::Standard,
+            kv_cache_mode,
             _temp: temp,
             target_layer_ids,
             target_hidden_accumulated: None,
@@ -328,7 +337,11 @@ impl Qwen36TargetAdapter {
 
 impl TargetModel for Qwen36TargetAdapter {
     fn prefill(&mut self, prompt: &Array) -> Result<Array, Exception> {
-        const PREFILL_CHUNK: i32 = 64;
+        let PREFILL_CHUNK: i32 = std::env::var("QWEN36_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &i32| n > 0)
+            .unwrap_or(64);
 
         self.cache = self.model.new_cache(self.kv_cache_mode);
         self.verify_snapshot = None;
@@ -356,7 +369,16 @@ impl TargetModel for Qwen36TargetAdapter {
                     let end = (pos + PREFILL_CHUNK).min(seq_len);
                     let chunk = prompt.index((.., pos..end));
                     let logits = self.model.forward_last_logits(&chunk, &mut self.cache)?;
-                    eval([&logits])?;
+                    // Same chunk-eval gating as qwen3.6 AR path:
+                    //   QWEN36_SKIP_CHUNK_EVAL=1 — omit
+                    //   QWEN36_ASYNC_PREFILL=1   — use async_eval
+                    if std::env::var("QWEN36_SKIP_CHUNK_EVAL").is_err() {
+                        if std::env::var("QWEN36_ASYNC_PREFILL").is_ok() {
+                            mlx_rs::transforms::async_eval([&logits])?;
+                        } else {
+                            eval([&logits])?;
+                        }
+                    }
                     last_logits = Some(logits);
                     pos = end;
                 }

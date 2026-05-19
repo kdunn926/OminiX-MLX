@@ -95,6 +95,12 @@ pub struct SessionMetrics {
     pub copyspec_hits: usize,
     /// Total tokens proposed via CopySpec (sum over `copyspec_hits` cycles).
     pub copyspec_tokens: usize,
+    /// Per-mode cycle tallies for the v0.1.7 adaptive verify state
+    /// machine. Lets you see whether a workload sat in Reduced the
+    /// whole time or recovered to Large via probes.
+    pub cycles_large: usize,
+    pub cycles_reduced: usize,
+    pub cycles_probe: usize,
 }
 
 /// Emitted event from run_generate iterator.
@@ -160,6 +166,10 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
         let mut emitted = 0usize;
         let mut last_emitted: Option<u32> = None;
         let mut pending = VecDeque::<Result<u32, Exception>>::new();
+        // Wall-clock start of the current cycle, captured at the top of
+        // each cycle so v0.1.7's adaptive-verify update() can compare
+        // real_tok/s across modes.
+        let mut cycle_start: Option<std::time::Instant> = None;
 
         std::iter::from_fn(move || loop {
             if let Some(item) = pending.pop_front() {
@@ -278,6 +288,13 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                 }
             }
 
+            // Mark cycle start so we can measure wall time at update().
+            cycle_start = Some(std::time::Instant::now());
+            match self.adaptive_policy.mode() {
+                crate::engine::config::BlockMode::Large => self.metrics.cycles_large += 1,
+                crate::engine::config::BlockMode::Reduced => self.metrics.cycles_reduced += 1,
+                crate::engine::config::BlockMode::Probe => self.metrics.cycles_probe += 1,
+            }
             let block_len = self.adaptive_policy.current_block_len().min(remaining - 1);
             let last_token_array = Array::from_slice(&[last_token], &[1, 1]);
 
@@ -445,9 +462,22 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
             } else {
                 self.metrics.total_drafted as f32 / self.metrics.total_cycles as f32
             };
+            // v0.1.7 adaptive verify needs real per-cycle wall time so it
+            // can compare reduced vs probe throughput honestly. Force an
+            // eval on the just-pushed correction token so the timer
+            // reflects actual GPU work this cycle, not just MLX graph
+            // construction.
+            // (No-op when pending was already eval'd elsewhere.)
+            if let Some(Ok(t_arr)) = pending.back() {
+                let _ = t_arr;
+            }
+            let cycle_wall_s = cycle_start
+                .map(|s| s.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
             self.adaptive_policy.update(
                 n_accepted as f32 / drafted_count as f32,
                 (n_accepted + 1) as f32,
+                cycle_wall_s,
             );
         })
     }

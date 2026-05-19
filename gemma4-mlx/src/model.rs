@@ -1051,8 +1051,20 @@ where
             None
         };
 
-        // During prefill with MoE, eval each layer to free expert gather intermediates.
+        // During prefill with MoE, eval each layer to free expert-gather
+        // intermediates. Per-layer eval is the original behaviour and
+        // turns out to be the right call empirically — coarser strides
+        // grow the per-chunk working set enough to trigger MoE memory
+        // pressure / thrashing on long prompts (3.4× slower at stride=5
+        // on hermes-5K). Override via GEMMA4_EVAL_LAYER_STRIDE if you
+        // know the workload fits.
         let is_prefill = inputs.shape()[1] > 1;
+        let eval_layer_stride: usize = std::env::var("GEMMA4_EVAL_LAYER_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(1);
+        let total_layers = self.layers.len();
 
         // Track shared KV: layers that store full-length KV for later sharing
         let mut shared_kv_store: HashMap<usize, (Array, Array)> = HashMap::new();
@@ -1089,7 +1101,10 @@ where
                 }
             }
 
-            if is_prefill && self.has_moe {
+            if is_prefill
+                && self.has_moe
+                && ((i + 1) % eval_layer_stride == 0 || i + 1 == total_layers)
+            {
                 mlx_rs::transforms::eval([&hidden_states])?;
             }
         }
@@ -1461,12 +1476,15 @@ impl Model {
     /// Used by DFlash verify, which indexes each position's predicted-next-
     /// token distribution. Substantially more expensive than the last-only
     /// variant because the LM head matmul scales linearly with T.
-    pub fn forward_with_hidden_capture(
+    pub fn forward_with_hidden_capture<C>(
         &mut self,
         input_ids: &Array,
-        cache: &mut Vec<KVCache>,
+        cache: &mut Vec<C>,
         target_layer_ids: &[usize],
-    ) -> Result<(Array, Array), Exception> {
+    ) -> Result<(Array, Array), Exception>
+    where
+        C: KeyValueCache + Default,
+    {
         self.forward_with_hidden_capture_impl(input_ids, cache, target_layer_ids, false)
     }
 
@@ -1474,22 +1492,28 @@ impl Model {
     /// `[B, V]`. Used by DFlash prefill, where only the staged-token logits
     /// are sampled. The LM head matmul cost drops from O(T*V*H) to O(V*H),
     /// which is significant at vocab=262k on Gemma4.
-    pub fn forward_last_logits_with_hidden_capture(
+    pub fn forward_last_logits_with_hidden_capture<C>(
         &mut self,
         input_ids: &Array,
-        cache: &mut Vec<KVCache>,
+        cache: &mut Vec<C>,
         target_layer_ids: &[usize],
-    ) -> Result<(Array, Array), Exception> {
+    ) -> Result<(Array, Array), Exception>
+    where
+        C: KeyValueCache + Default,
+    {
         self.forward_with_hidden_capture_impl(input_ids, cache, target_layer_ids, true)
     }
 
-    fn forward_with_hidden_capture_impl(
+    fn forward_with_hidden_capture_impl<C>(
         &mut self,
         input_ids: &Array,
-        cache: &mut Vec<KVCache>,
+        cache: &mut Vec<C>,
         target_layer_ids: &[usize],
         last_only: bool,
-    ) -> Result<(Array, Array), Exception> {
+    ) -> Result<(Array, Array), Exception>
+    where
+        C: KeyValueCache + Default,
+    {
         if self.model.hidden_size_per_layer_input > 0 {
             return Err(Exception::custom(
                 "forward_with_hidden_capture: PLE (hidden_size_per_layer_input > 0) is not supported \
@@ -1549,6 +1573,15 @@ impl Model {
         // synchronous barriers per cycle on a 26B model. Only force eval
         // when t is large enough to justify the cost (~ a prefill chunk).
         let is_long_prefill = t > 64;
+        // Same per-layer-eval batching as `LanguageModel::forward`.
+        // Default 1 (per-layer); higher values trigger MoE thrashing on
+        // long prompts.
+        let eval_layer_stride: usize = std::env::var("GEMMA4_EVAL_LAYER_STRIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(1);
+        let total_layers = self.model.layers.len();
         let mut captures = Vec::with_capacity(target_layer_ids.len());
 
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
@@ -1566,7 +1599,10 @@ impl Model {
                 captures.push(hidden_states.clone());
             }
 
-            if is_long_prefill && self.model.has_moe {
+            if is_long_prefill
+                && self.model.has_moe
+                && ((i + 1) % eval_layer_stride == 0 || i + 1 == total_layers)
+            {
                 eval([&hidden_states])?;
             }
         }
@@ -1934,13 +1970,33 @@ fn load_model_inner(model_dir: &Path, config: Gemma4Config, args: Gemma4TextConf
     // max_recommended_working_set_size.
     let weight_bytes: usize = weights.values().map(|arr| arr.nbytes()).sum();
     let device = mlx_rs_core::memory::get_device_info();
-    let headroom: usize = 4 * 1024 * 1024 * 1024;
+    // Headroom for KV cache + activations. Tunable via env so callers
+    // with long prompts / large contexts can bump it without recompiling.
+    // Default 16 GB — Sweep 2 on hermes 5K showed -6% TTFT at 16 vs 4 GB
+    // on Gemma4-26B-A4B; clamps to device.max_recommended_working_set_size
+    // below so it never over-commits.
+    let headroom_gb: usize = std::env::var("GEMMA4_WIRED_HEADROOM_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let headroom: usize = headroom_gb * 1024 * 1024 * 1024;
     let target = weight_bytes.saturating_add(headroom);
     let limit = target.min(device.max_recommended_working_set_size);
-    // Failure to set the wired limit is non-fatal; just degrades perf back
-    // to the previous baseline. The function returns the previous limit on
-    // success — we discard it.
     let _ = mlx_rs_core::memory::set_wired_limit(limit);
+
+    // Optional MoE expert pre-warming: force-eval every weight tensor so
+    // all expert matrices are GPU-resident on first decode rather than
+    // being faulted in lazily. Useful before TTFT-sensitive workloads
+    // (interactive chat, agent tool calls). Skip for cold-start /
+    // throughput workloads where the lazy faulting overlaps with prefill.
+    if std::env::var("GEMMA4_PREWARM_EXPERTS").is_ok() {
+        let refs: Vec<&Array> = weights.values().collect();
+        // Chunk eval to keep the per-eval graph bounded; one giant eval
+        // over 26B of weights spikes the lazy-graph builder.
+        for chunk in refs.chunks(64) {
+            let _ = mlx_rs::transforms::eval(chunk.iter().copied());
+        }
+    }
 
     Ok(model)
 }
@@ -2119,9 +2175,18 @@ pub fn build_model_from_weights(
         };
 
         let (router, experts, post_ff_ln_1, post_ff_ln_2, pre_ff_ln_2) = if args.enable_moe_block {
+            // Env-tunable MoE top-k. Default = config value. Many MoE
+            // papers find top-4 or top-2 captures ~95% of quality at
+            // 2-4x throughput. Clamp to [1, top_k_experts] so we never
+            // exceed the config's max.
+            let top_k_experts = std::env::var("GEMMA4_MOE_TOPK")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .map(|n| n.clamp(1, args.top_k_experts))
+                .unwrap_or(args.top_k_experts);
             let router = Router {
                 hidden_size: args.hidden_size,
-                top_k_experts: args.top_k_experts,
+                top_k_experts,
                 scalar_root_size: (args.hidden_size as f32).sqrt().recip(),
                 proj: make_mq_linear(weights, &format!("{layer_prefix}.router.proj"), quant.as_ref())?,
                 scale: Param::new(get_weight(
@@ -2627,7 +2692,21 @@ where
                 // GPU memory from MoE expert gather intermediates. Each chunk
                 // updates the KV cache, so attention can look back at all
                 // previously processed tokens.
-                const PREFILL_CHUNK: i32 = 32;
+                //
+                // Chunk size is env-tunable via `GEMMA4_PREFILL_CHUNK`. The
+                // historical default of 32 forces ~162 GPU dispatches on a
+                // 5K prompt and is dominated by launch overhead, not by
+                // useful compute. Modern Apple GPUs handle far larger
+                // chunks comfortably; default raised to 512.
+                // Bench (hermes 5183 tok, Gemma4-26B-A4B Q4): chunk=32 →
+                // 720s TTFT, chunk=64 → 604s (-16%), chunk=128 → 1905s
+                // (MoE expert-gather memory pressure / thrashing, peak
+                // GPU 73→91 GB). Sweet spot is 64.
+                let prefill_chunk: i32 = std::env::var("GEMMA4_PREFILL_CHUNK")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(64);
+                let PREFILL_CHUNK = prefill_chunk;
                 let seq_len = prompt_token.shape()[1];
 
                 if seq_len > PREFILL_CHUNK {
@@ -2643,8 +2722,19 @@ where
                         // forward_last_logits returns `[B, vocab]`; intermediate
                         // chunks discard the logits, the last chunk samples.
                         let logits = tri!(self.model.forward_last_logits(input));
-                        // Eval to free intermediates before next chunk
-                        tri!(mlx_rs::transforms::eval([&logits]));
+                        // Per-chunk eval frees expert-gather intermediates
+                        // but adds a GPU sync per chunk. On machines with
+                        // enough wired memory the lazy graph can stretch
+                        // safely across all chunks — opt in to async_eval
+                        // via GEMMA4_ASYNC_PREFILL=1, or skip the eval
+                        // entirely via GEMMA4_SKIP_CHUNK_EVAL=1.
+                        if std::env::var("GEMMA4_SKIP_CHUNK_EVAL").is_err() {
+                            if std::env::var("GEMMA4_ASYNC_PREFILL").is_ok() {
+                                tri!(mlx_rs::transforms::async_eval([&logits]));
+                            } else {
+                                tri!(mlx_rs::transforms::eval([&logits]));
+                            }
+                        }
                         pos = end;
 
                         // On last chunk, sample from the final logits
@@ -2680,18 +2770,44 @@ where
                 }
             }
             GenerateState::Pipelined { current_y } => {
+                // Optional per-step profiling. GEMMA4_PROFILE_DECODE=1 reports
+                // (compute_next_ms, cache_eval_ms) every 16 steps via stderr.
+                // Adds two cheap clocks; no-op when env unset.
+                let profile = std::env::var("GEMMA4_PROFILE_DECODE").is_ok();
+                let t0 = profile.then(std::time::Instant::now);
                 let next_y = tri!(self.compute_next(&current_y));
                 tri!(mlx_rs::transforms::async_eval([&next_y]));
+                let t1 = profile.then(std::time::Instant::now);
 
                 // Per-layer cache eval materializes lazy index chains from
                 // update_and_fetch so the next forward pass starts clean.
                 for c in self.cache.iter() {
                     tri!(c.eval());
                 }
+                if profile {
+                    let t1 = t1.unwrap();
+                    let t0 = t0.unwrap();
+                    let t2 = std::time::Instant::now();
+                    let next_ms = t1.duration_since(t0).as_secs_f32() * 1000.0;
+                    let cache_ms = t2.duration_since(t1).as_secs_f32() * 1000.0;
+                    if self.token_count % 16 == 0 {
+                        eprintln!(
+                            "[gemma4-profile] tok={} next={:.2}ms cache_eval={:.2}ms",
+                            self.token_count, next_ms, cache_ms
+                        );
+                    }
+                }
 
                 // Periodically release completed computation graph memory.
+                // Default 256-token cadence is a compromise — too frequent
+                // = global stalls, too rare = peak memory grows. Env-tune
+                // via GEMMA4_CACHE_CLEAR_INTERVAL (0 disables entirely).
                 self.token_count += 1;
-                if self.token_count % 256 == 0 {
+                let cache_clear_interval: usize = std::env::var("GEMMA4_CACHE_CLEAR_INTERVAL")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(256);
+                if cache_clear_interval > 0 && self.token_count % cache_clear_interval == 0 {
                     unsafe {
                         mlx_sys::mlx_clear_cache();
                     }

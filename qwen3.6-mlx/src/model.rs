@@ -11,7 +11,7 @@ use mlx_rs::{
 };
 
 use mlx_rs_core::{
-    cache::{KVCache, QuantizedKVCache},
+    cache::{KVCache, QuantizedKVCache, TurboQuantKVCache},
     error::Error,
     utils::initialize_rope,
 };
@@ -70,6 +70,12 @@ impl TransformerBlock {
                     mask,
                     cache: Some(qkv_cache),
                 })?,
+            (AttentionLayer::FullAttention(attn), HybridCache::TurboQuantKV(tq_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(tq_cache),
+                })?,
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
                 let L = normed.shape()[1];
                 if L > 1 {
@@ -103,6 +109,9 @@ pub enum KVCacheMode {
     Standard,
     /// Mixed-precision cache: K=q8, V=q4.
     Quantized,
+    /// Spike: TurboQuant 4-bit K + 8-bit V cache with fused SDPA via
+    /// `KeyValueCache::try_fused_attention` (online softmax, V-tile cache).
+    TurboQuant,
 }
 
 pub struct Qwen36TextModel {
@@ -142,7 +151,28 @@ impl Model {
                     match mode {
                         KVCacheMode::Standard => HybridCache::KV(KVCache::new()),
                         KVCacheMode::Quantized => {
-                            HybridCache::QuantizedKV(QuantizedKVCache::default())
+                            // Allow overriding k_bits / v_bits / group_size via env
+                            // so callers can match llama.cpp configs like
+                            // `--cache-type-k q4_0 --cache-type-v q4_0` (k=4, v=4,
+                            // group_size=32). Defaults stay at K=q8 V=q4 gs=64.
+                            let k_bits: i32 = std::env::var("KV_K_BITS")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(8);
+                            let v_bits: i32 = std::env::var("KV_V_BITS")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(4);
+                            let group_size: i32 = std::env::var("KV_GROUP_SIZE")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(64);
+                            HybridCache::QuantizedKV(QuantizedKVCache::new(
+                                group_size, k_bits, v_bits, 256,
+                            ))
+                        }
+                        KVCacheMode::TurboQuant => {
+                            HybridCache::TurboQuantKV(TurboQuantKVCache::new())
                         }
                     }
                 } else {
@@ -161,13 +191,19 @@ impl Model {
         inputs: &Array,
         cache: &mut Vec<HybridCache>,
     ) -> Result<(Array, Array), Exception> {
-        let h = self.forward_hidden(inputs, cache)?;
-        let last = h.index((.., -1, ..));
-        // Keep a [B, 1, H] shape (not [B, H]) so the MTP head's RMSNorm
-        // and downstream attention see a 3D input matching the host.
-        let last_3d = last.index((.., mlx_rs::ops::indexing::NewAxis, ..));
-        let logits = self.apply_lm_head(&last)?;
-        Ok((last_3d, logits))
+        // MTP draft heads are trained on the PRE-norm hidden state
+        // (matches llama.cpp PR #22673 `llama_get_embeddings_pre_norm_ith`).
+        // Passing post-norm hidden shifts the input distribution and
+        // tanks draft acceptance — empirically observed 0.17-0.36 on
+        // hermes with post-norm vs llama.cpp's 0.72-0.83 with pre-norm.
+        let h_pre = self.forward_pre_norm_hidden(inputs, cache)?;
+        let last_pre = h_pre.index((.., -1, ..));
+        let last_pre_3d = last_pre.index((.., mlx_rs::ops::indexing::NewAxis, ..));
+        // LM head consumes post-norm.
+        let h_post = self.text_model.norm.forward(&h_pre)?;
+        let last_post = h_post.index((.., -1, ..));
+        let logits = self.apply_lm_head(&last_post)?;
+        Ok((last_pre_3d, logits))
     }
 
     /// Run the transformer and project only the last sequence position through
@@ -339,20 +375,29 @@ impl Model {
         inputs: &Array,
         cache: &mut Vec<HybridCache>,
     ) -> Result<Array, Exception> {
+        let h = self.forward_pre_norm_hidden(inputs, cache)?;
+        self.text_model.norm.forward(&h)
+    }
+
+    /// Returns the hidden state immediately AFTER the last transformer block
+    /// but BEFORE the final RMSNorm. This is the input distribution the MTP
+    /// draft head was trained on (mirroring llama.cpp's
+    /// `llama_get_embeddings_pre_norm_ith`). Feeding the post-norm output
+    /// shifts the distribution and tanks draft acceptance.
+    pub fn forward_pre_norm_hidden(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<Array, Exception> {
         let mut h = self.text_model.embed_tokens.forward(inputs)?;
 
         let T = h.shape()[1];
-        // Causal-only prefill: pass the SDPA causal-mode marker through to attention
-        // instead of materializing an O(T^2) explicit mask array. The KV-offset is
-        // handled inside MLX's fused SDPA when paired with the cache offset.
         let mask = if T > 1 {
             Some(mlx_rs_core::utils::AttentionMask::Causal)
         } else {
             None
         };
 
-        // Lazily allocate standard caches; callers that want quantized caches
-        // should pre-populate via `model.new_cache(KVCacheMode::Quantized)`.
         if cache.is_empty() {
             for layer_type in &self.text_model.layer_types {
                 if layer_type == "full_attention" {
@@ -367,7 +412,7 @@ impl Model {
             h = layer.forward(&h, mask.as_ref(), c)?;
         }
 
-        self.text_model.norm.forward(&h)
+        Ok(h)
     }
 }
 
@@ -651,7 +696,31 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     );
 
     let weights = load_all_weights(model_dir)?;
-    build_model_from_weights(&weights, &args)
+    let model = build_model_from_weights(&weights, &args)?;
+
+    // Mirror gemma4-mlx: wire the model weight pages into Metal so they
+    // stay resident across decode steps. Headroom for KV + activations
+    // is env-tunable via QWEN36_WIRED_HEADROOM_GB (default 4).
+    let weight_bytes: usize = weights.values().map(|arr| arr.nbytes()).sum();
+    let device = mlx_rs_core::memory::get_device_info();
+    let headroom_gb: usize = std::env::var("QWEN36_WIRED_HEADROOM_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let headroom: usize = headroom_gb * 1024 * 1024 * 1024;
+    let target = weight_bytes.saturating_add(headroom);
+    let limit = target.min(device.max_recommended_working_set_size);
+    let _ = mlx_rs_core::memory::set_wired_limit(limit);
+
+    // Optional MoE expert pre-warming via QWEN36_PREWARM_EXPERTS=1.
+    if std::env::var("QWEN36_PREWARM_EXPERTS").is_ok() {
+        let refs: Vec<&Array> = weights.values().collect();
+        for chunk in refs.chunks(64) {
+            let _ = mlx_rs::transforms::eval(chunk.iter().copied());
+        }
+    }
+
+    Ok(model)
 }
 
 pub struct VlModel {
@@ -908,9 +977,16 @@ pub(crate) fn load_ffn_block(
         let num_experts = tc
             .num_experts
             .ok_or_else(|| Error::Model("MoE config missing num_experts".to_string()))?;
-        let top_k = tc
+        let config_top_k = tc
             .num_experts_per_tok
             .ok_or_else(|| Error::Model("MoE config missing num_experts_per_tok".to_string()))?;
+        // Env-tunable MoE top-k. Default = config value. Clamp so we
+        // never exceed the trained-for top-k.
+        let top_k = std::env::var("QWEN36_MOE_TOPK")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|n| n.clamp(1, config_top_k))
+            .unwrap_or(config_top_k);
 
         let gate = MaybeQuantized::Quantized(make_quantized_linear(
             weights,

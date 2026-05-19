@@ -56,6 +56,30 @@ pub trait KeyValueCache {
     fn eval(&self) -> Result<(), Exception> {
         Ok(())
     }
+
+    /// Drop the last `n_drop` tokens from the cache. Used by speculative
+    /// decoding rollback when the target rejects some drafted positions.
+    /// Default impl returns an error; caches with O(1) trim support
+    /// (`KVCache`, `TurboQuantKVCache`) override this.
+    fn trim_kv(&mut self, _n_drop: i32) -> Result<(), Exception> {
+        Err(Exception::custom(
+            "KeyValueCache::trim_kv: this cache impl does not support trim",
+        ))
+    }
+
+    /// Compact the cache to keep only positions in `keep_indices` from
+    /// the latest `past_length` window. Used by tree-shaped speculative
+    /// decoding (DDTree) to drop rejected branches. Default impl errors;
+    /// only `KVCache` supports this today.
+    fn compact_kv(
+        &mut self,
+        _past_length: i32,
+        _keep_indices: &Array,
+    ) -> Result<(), Exception> {
+        Err(Exception::custom(
+            "KeyValueCache::compact_kv: this cache impl does not support compact",
+        ))
+    }
 }
 
 impl<T> KeyValueCache for &'_ mut T
@@ -268,6 +292,147 @@ impl KVCache {
         self.offset -= dropped;
     }
 
+    /// Save the cache's K/V state (sliced to `offset`) to a safetensors
+    /// file. Used by the prompt-cache prefix feature so a pre-filled KV
+    /// state for a long system prompt can be reused across requests.
+    ///
+    /// Metadata: `offset` is encoded so the loader knows the cached
+    /// length without inspecting tensor shapes.
+    pub fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> Result<(), Exception> {
+        use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
+        let (k, v) = match (self.keys.as_ref(), self.values.as_ref()) {
+            (Some(k), Some(v)) => (k, v),
+            _ => return Err(Exception::custom("KVCache::save_to_path: cache is empty")),
+        };
+        let k_sliced = k.index((Ellipsis, ..self.offset, ..));
+        let v_sliced = v.index((Ellipsis, ..self.offset, ..));
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("offset".to_string(), self.offset.to_string());
+        meta.insert("step".to_string(), self.step.to_string());
+        mlx_rs::Array::save_safetensors(
+            [("k", &k_sliced), ("v", &v_sliced)],
+            Some(&meta),
+            path.as_ref(),
+        )
+        .map_err(|e| Exception::custom(format!("save_safetensors: {e}")))?;
+        Ok(())
+    }
+
+    /// Save a Vec<KVCache> (one per layer slot) + the corresponding
+    /// prompt-token sequence to a directory. Used by the prompt-cache
+    /// prefix feature to persist a pre-filled KV state for a long
+    /// system prompt so it can be reused across requests.
+    pub fn save_kv_caches(
+        caches: &[KVCache],
+        tokens: &[i32],
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<(), Exception> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Exception::custom(format!("create_dir_all {}: {e}", dir.display())))?;
+        for (i, c) in caches.iter().enumerate() {
+            if c.offset == 0 {
+                // Cache was never written (e.g. a layer that isn't a
+                // KV-storing slot). Skip — the loader treats absent
+                // files as empty.
+                continue;
+            }
+            c.save_to_path(dir.join(format!("cache_{i}.safetensors")))?;
+        }
+        let manifest = serde_json::json!({
+            "tokens": tokens,
+            "n_caches": caches.len(),
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest)
+                .map_err(|e| Exception::custom(format!("manifest serialize: {e}")))?,
+        )
+        .map_err(|e| Exception::custom(format!("write manifest: {e}")))?;
+        Ok(())
+    }
+
+    /// Try to load a prompt-prefix KV cache for `prompt_tokens`. Returns
+    /// `Some((caches, n_cached_tokens))` when the cached prefix matches.
+    /// The caller should then prefill only `prompt_tokens[n_cached..]`.
+    pub fn try_load_kv_caches(
+        prompt_tokens: &[i32],
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Option<(Vec<KVCache>, usize)>, Exception> {
+        let dir = dir.as_ref();
+        let manifest_path = dir.join("manifest.json");
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&manifest_path)
+            .map_err(|e| Exception::custom(format!("read manifest: {e}")))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Exception::custom(format!("manifest parse: {e}")))?;
+        let cached_tokens: Vec<i32> = manifest
+            .get("tokens")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_i64().map(|n| n as i32)).collect())
+            .unwrap_or_default();
+        let n = cached_tokens.len();
+        if n == 0 || prompt_tokens.len() < n {
+            return Ok(None);
+        }
+        if prompt_tokens[..n] != cached_tokens[..] {
+            return Ok(None);
+        }
+        // Leave at least 1 token in the suffix so the caller still has
+        // something to prefill + sample from. Degenerate-case guard for
+        // the bench scenario where the prompt is identical run-to-run.
+        let n = n.min(prompt_tokens.len() - 1);
+        if n == 0 {
+            return Ok(None);
+        }
+        let n_caches = manifest
+            .get("n_caches")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let mut caches = Vec::with_capacity(n_caches);
+        for i in 0..n_caches {
+            let path = dir.join(format!("cache_{i}.safetensors"));
+            let mut cache = if path.exists() {
+                KVCache::load_from_path(&path)?
+            } else {
+                // Absent slot: empty cache (skipped during save).
+                KVCache::new()
+            };
+            // Trim to the (possibly degenerate-case-capped) prefix length.
+            let cache_offset = cache.offset();
+            if cache_offset > n as i32 {
+                cache.trim(cache_offset - n as i32);
+            }
+            caches.push(cache);
+        }
+        Ok(Some((caches, n)))
+    }
+
+    /// Restore a KVCache from a file produced by `save_to_path`.
+    pub fn load_from_path(path: impl AsRef<std::path::Path>) -> Result<Self, Exception> {
+        let map = mlx_rs::Array::load_safetensors(path.as_ref())
+            .map_err(|e| Exception::custom(format!("load_safetensors: {e}")))?;
+        let keys = map
+            .get("k")
+            .cloned()
+            .ok_or_else(|| Exception::custom("KVCache::load_from_path: missing 'k'"))?;
+        let values = map
+            .get("v")
+            .cloned()
+            .ok_or_else(|| Exception::custom("KVCache::load_from_path: missing 'v'"))?;
+        let kshape = keys.shape();
+        let offset = kshape[kshape.len() - 2];
+        Ok(Self {
+            keys: Some(keys),
+            values: Some(values),
+            offset,
+            step: 256,
+            reserved: 0,
+        })
+    }
+
     /// Materialize lazy computation graphs for cached arrays.
     pub fn eval(&self) -> Result<(), Exception> {
         let mut arrays: Vec<&Array> = Vec::new();
@@ -373,6 +538,19 @@ impl KeyValueCache for KVCache {
     fn eval(&self) -> Result<(), Exception> {
         KVCache::eval(self)
     }
+
+    fn trim_kv(&mut self, n_drop: i32) -> Result<(), Exception> {
+        self.trim(n_drop);
+        Ok(())
+    }
+
+    fn compact_kv(
+        &mut self,
+        past_length: i32,
+        keep_indices: &Array,
+    ) -> Result<(), Exception> {
+        self.compact(past_length, keep_indices)
+    }
 }
 
 // ============================================================================
@@ -473,6 +651,83 @@ impl TurboQuantKVCache {
         self.v_bits = bits;
         self.v_group_size = group_size;
         self
+    }
+
+    /// Drop the last `n_drop` tokens from the cache (O(1) slice on each
+    /// underlying array). Used by speculative-decoding rollback when the
+    /// target rejects some drafted positions. Compressed-bulk tokens are
+    /// dropped first; if `n_drop` exceeds the bulk size, the sink is
+    /// trimmed too.
+    pub fn trim(&mut self, n_drop: i32) -> Result<(), Exception> {
+        if n_drop <= 0 || self.offset == 0 {
+            return Ok(());
+        }
+        let n_drop = n_drop.min(self.offset);
+        let n_sink_cur = self
+            .sink_keys
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let n_bulk_cur = self.offset - n_sink_cur;
+        let drop_bulk = n_drop.min(n_bulk_cur);
+        let drop_sink = n_drop - drop_bulk;
+
+        if drop_bulk > 0 {
+            let keep_bulk = n_bulk_cur - drop_bulk;
+            if keep_bulk == 0 {
+                self.packed_keys = None;
+                self.key_sigma = None;
+                self.key_mean = None;
+                self.quant_v = None;
+                self.v_scales = None;
+                self.v_biases = None;
+            } else {
+                self.packed_keys = self
+                    .packed_keys
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk, ..)));
+                self.key_sigma = self
+                    .key_sigma
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk)));
+                self.key_mean = self
+                    .key_mean
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk)));
+                self.quant_v = self
+                    .quant_v
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk, ..)));
+                self.v_scales = self
+                    .v_scales
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk, ..)));
+                self.v_biases = self
+                    .v_biases
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk, ..)));
+            }
+        }
+
+        if drop_sink > 0 {
+            let keep_sink = n_sink_cur - drop_sink;
+            if keep_sink == 0 {
+                self.sink_keys = None;
+                self.sink_values = None;
+            } else {
+                self.sink_keys = self
+                    .sink_keys
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_sink, ..)));
+                self.sink_values = self
+                    .sink_values
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_sink, ..)));
+            }
+        }
+
+        self.offset -= n_drop;
+        Ok(())
     }
 
     /// Reconstruct the full keys tensor `[B, H, offset, D]` at the
@@ -586,6 +841,10 @@ impl KeyValueCache for TurboQuantKVCache {
 
     fn max_size(&self) -> Option<i32> {
         None
+    }
+
+    fn trim_kv(&mut self, n_drop: i32) -> Result<(), Exception> {
+        TurboQuantKVCache::trim(self, n_drop)
     }
 
     fn reset(&mut self) {
@@ -777,13 +1036,11 @@ impl KeyValueCache for TurboQuantKVCache {
             && n_bulk >= fused_min
             && n_bulk <= crate::metal_kernels::TQ_SDPA_MAX_KV;
         if bulk_ok {
+            // FAST PATH A: bounded-kv (≤ TQ_SDPA_MAX_KV=1024) shared-mem-scores kernel.
+            // Lowest latency at short contexts.
             let packed = self.packed_keys.as_ref().unwrap();
             let sigma = self.key_sigma.as_ref().unwrap();
             let mean = self.key_mean.as_ref().unwrap();
-            // V is now dequantised INSIDE the kernel; pass the packed
-            // tensors directly instead of materialising a BF16 V tensor
-            // first. Saves the v-dequant dispatch + the temporary
-            // [B, Hkv, KV, D] BF16 buffer.
             let pv = self.quant_v.as_ref().unwrap();
             let vs = self.v_scales.as_ref().unwrap();
             let vb = self.v_biases.as_ref().unwrap();
@@ -794,6 +1051,51 @@ impl KeyValueCache for TurboQuantKVCache {
                 q, packed, sigma, mean, pv, vs, vb,
                 &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
             )?;
+            return Ok(Some(out));
+        }
+        // FAST PATH B: online-softmax kernel for kv > TQ_SDPA_MAX_KV.
+        // Single Metal dispatch processes kv in 64-element tiles with
+        // flash-attention v2 streaming softmax, V dequantised once per
+        // tile into threadgroup memory (s_v_tile[64*64]) so the 64
+        // output threads read V from shared.  hermes_chat_simple bench
+        // (5183 tok, Gemma4-26B-A4B) lands at 4.5 tok/s decode vs 3.1
+        // partial-fuse and 1.8 BF16 baseline. Default ON; disable with
+        // TURBOQUANT_ONLINE=0.
+        let online_enabled = std::env::var("TURBOQUANT_ONLINE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if online_enabled
+            && n_sink == 0
+            && n_bulk >= fused_min
+            && d % 64 == 0
+            && self.packed_keys.is_some()
+        {
+            let packed = self.packed_keys.as_ref().unwrap();
+            let sigma = self.key_sigma.as_ref().unwrap();
+            let mean = self.key_mean.as_ref().unwrap();
+            let pv = self.quant_v.as_ref().unwrap();
+            let vs = self.v_scales.as_ref().unwrap();
+            let vb = self.v_biases.as_ref().unwrap();
+            let signs_vec = cached_signs(d, self.seed);
+            let signs = Array::from_slice(&signs_vec, &[d]);
+            let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+            // NOTE: TURBOQUANT_SIMD_MATMUL is experimental — the
+            // simdgroup_matrix V-matmul kernel currently fails its
+            // correctness test (online_softmax_simd_matches_reference,
+            // ~13% rel error with sign flips, suspected layout issue in
+            // simdgroup_load/store rescale round-trip). Leave gated off
+            // by default until fixed.
+            let out = if std::env::var("TURBOQUANT_SIMD_MATMUL").is_ok() {
+                crate::metal_kernels::tq_sdpa_4bit_online_simd(
+                    q, packed, sigma, mean, pv, vs, vb,
+                    &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
+                )?
+            } else {
+                crate::metal_kernels::tq_sdpa_4bit_online(
+                    q, packed, sigma, mean, pv, vs, vb,
+                    &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
+                )?
+            };
             return Ok(Some(out));
         }
 

@@ -45,6 +45,7 @@ members = [
     "gpt-sovits-mlx",
     "step-audio2-mlx",
     "glm-4.7-flash-mlx",
+    "glm-ocr-mlx",
     "moxin-vlm-mlx",
     "minicpm-sala-mlx",
     "qwen3-asr-mlx",
