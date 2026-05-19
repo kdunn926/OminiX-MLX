@@ -122,6 +122,69 @@ Knob finalized at the call site:
 - `=2` → v2 GPU bucketing (correctness-equivalent to forward_topk;
   produces the layout Phase 3 needs)
 
+### Phase 3 — LANDED, kernel correct, no speedup
+
+Phases 3-6 (`9dfd86a`, `0981756`, `1efb9ac`, `a02db78`, `69d86cf`) shipped:
+- `moe_dense_matmul` (fp32, simdgroup_matrix<float,8,8>, bit-exact parity)
+- `moe_dense_matmul_bf16` (bf16, same kernel logic, ~5e-2 abs tol)
+- `forward_topk_expert_major_v3`: CPU bucketing + fp32 kernel
+- `forward_topk_expert_major_v4`: GPU bucketing + fp32 kernel
+- `forward_topk_expert_major_v5`: GPU bucketing + bf16 kernel
+
+All five expert-major variants land at the same wall time as
+`forward_topk` (~3.4 tok/s decode on gemma-4-26B-A4B-it).
+
+**Diagnosis:** the bottleneck is **per-expert kernel-launch overhead**.
+With 64 experts × 64 MoE layers = 4096 kernel launches per decode step,
+at ~100µs Metal launch overhead each, that's ~400ms/token just in
+launches — accounting for ~100% of the 294ms/token decode time.
+
+### Phase 7 (FUTURE) — single batched all-experts kernel launch
+
+This is the only remaining lever and requires:
+
+1. **GPU input packing.** Currently each expert's bucket is processed
+   separately, requiring per-expert padding within the per-launch call.
+   Move to a global packed layout `[M_total_padded, H]` where each
+   expert's contiguous block is padded to a multiple of 32 rows at
+   construction time. Compute `padded_starts[E]` via cumsum on GPU;
+   scatter sorted tokens into the packed layout.
+
+2. **Per-block expert metadata.** Build `block_expert_id[M_total_padded/32]`
+   on GPU — a lookup table saying which expert each 32-row block belongs
+   to. Build it from `padded_starts` via a `searchsorted`-style pattern
+   or a per-block arange comparison.
+
+3. **New kernel variant `moe_dense_matmul_batched`.** Accepts:
+   - `packed_x: [M_total_padded, H]`
+   - `weights: [E, N, K]` (gate_up_proj or down_proj)
+   - `block_expert_id: [M_total_padded/32]`
+   - `expert_counts: [E]` (for bounds masking padded rows)
+   Each threadgroup reads its expert id from the lookup table, computes
+   the per-expert weight offset (`e * N * K`), and runs the same
+   simdgroup_matrix 4×4 acc-tile pattern. Single Metal launch covers
+   all experts.
+
+4. **Scatter back.** After the matmul, scatter from packed layout back
+   to per-token output positions, masking out padded rows.
+
+**Expected impact**: 4096 launches/step → 2 launches/step (one for
+gate_up + one for down_proj per MoE layer = 128 launches/step
+total). Should reclaim the ~400ms/token launch overhead. Realistic
+target: 2-3× decode speedup on Gemma4-26B-A4B-it MoE workloads.
+
+**Cost**: ~300 LOC of GPU bucketing + new kernel + dispatch wrapper.
+Same complexity tier as the original phase 3 kernel implementation.
+
+Files to touch:
+- `mlx-rs-core/src/metal_kernels.rs`: add `moe_dense_matmul_batched`
+  kernel + dispatch wrapper. Parallel to `moe_dense_matmul_bf16`.
+- `gemma4-mlx/src/model.rs`: add `forward_topk_expert_major_v6` using
+  the batched kernel. Gate at `GEMMA4_EXPERT_MAJOR_MOE=6`.
+
+This is the single highest-leverage remaining task for Gemma4 MoE
+prefill/decode performance.
+
 ### Phase 3 — Dense Metal kernel (½–1 day)
 
 Replace the `x_e @ w_gu` matmul with a custom Metal kernel using
