@@ -61,7 +61,7 @@ use anyhow::{anyhow, Result};
 use mlx_rs::{
     argmax_axis,
     module::Module,
-    ops::indexing::{IndexOp, NewAxis},
+    ops::{indexing::{IndexOp, NewAxis}, softmax_axis},
     transforms::eval,
     Array, Dtype,
 };
@@ -135,6 +135,317 @@ fn topk_ids(row_logits: &Array, k: usize) -> Result<Vec<i32>> {
     let mut indexed: Vec<(usize, f32)> = slice.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     Ok(indexed.into_iter().take(k).map(|(i, _)| i as i32).collect())
+}
+
+// ============================================================================
+// Stochastic sampling + Leviathan-Chen acceptance (gated by MTPLX_PAIR_TEMP>0).
+// ============================================================================
+
+/// Splitmix64 RNG returning fp32 in [0,1). Seeded from MTPLX_PAIR_SEED
+/// (default = wall clock) so runs are reproducible when set.
+struct Lcg { state: u64 }
+impl Lcg {
+    fn from_env() -> Self {
+        let seed = std::env::var("MTPLX_PAIR_SEED")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+            });
+        Self { state: seed.wrapping_add(1) }
+    }
+    fn next_f32(&mut self) -> f32 {
+        let mut x = self.state.wrapping_add(0x9E3779B97F4A7C15);
+        self.state = x;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+        x ^= x >> 31;
+        ((x >> 40) as f32) / ((1u64 << 24) as f32)
+    }
+}
+
+/// Read MTPLX_PAIR_TEMP. 0.0 (or unset / unparseable) means greedy.
+fn pair_temp() -> f32 {
+    std::env::var("MTPLX_PAIR_TEMP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0_f32)
+}
+
+/// Softmax a single `[1, vocab]` row of logits with temperature T (must be > 0)
+/// in fp32. Returns the row as a contiguous Vec<f32>.
+fn softmax_row_fp32(row_logits: &Array, temp: f32) -> Result<Vec<f32>> {
+    let f32_row = row_logits.as_dtype(Dtype::Float32)?;
+    let scaled = if (temp - 1.0).abs() < f32::EPSILON {
+        f32_row
+    } else {
+        let inv = Array::from_slice(&[1.0_f32 / temp], &[1]);
+        mlx_rs::ops::multiply(&f32_row, &inv)?
+    };
+    let sm = softmax_axis(&scaled, -1, Some(true))?;
+    eval([&sm])?;
+    let mut row = sm.as_slice::<f32>().to_vec();
+    let k = pair_top_k();
+    if k > 0 {
+        truncate_top_k_inplace(&mut row, k);
+    }
+    Ok(row)
+}
+
+/// Read MTPLX_PAIR_TOP_K. 0 (or unset) means no truncation.
+fn pair_top_k() -> usize {
+    std::env::var("MTPLX_PAIR_TOP_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0_usize)
+}
+
+/// Truncate `probs` to its top-`k` entries (in place), zero out the rest,
+/// and renormalize so it sums to 1. Both the drafter (for sampling) and
+/// the verifier (for the Leviathan-Chen p/q rows) must apply the same
+/// truncation so that the residual `(p-q)+` distribution stays on a
+/// shared support. Per HF assistant generation_config.json: top_k=64.
+fn truncate_top_k_inplace(probs: &mut [f32], k: usize) {
+    if k == 0 || k >= probs.len() {
+        return;
+    }
+    // Partial-sort: collect (idx, prob) pairs and select_nth_unstable_by.
+    let mut indexed: Vec<(usize, f32)> = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .collect();
+    let pivot = k.saturating_sub(1).min(indexed.len() - 1);
+    indexed.select_nth_unstable_by(pivot, |a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // Indices in indexed[..=pivot] are the top-k; zero out the rest.
+    let mut keep = vec![false; probs.len()];
+    for &(idx, _) in indexed.iter().take(k) {
+        keep[idx] = true;
+    }
+    let mut s = 0.0_f32;
+    for i in 0..probs.len() {
+        if keep[i] {
+            s += probs[i];
+        } else {
+            probs[i] = 0.0;
+        }
+    }
+    if s > 0.0 {
+        let inv = 1.0 / s;
+        for p in probs.iter_mut() {
+            *p *= inv;
+        }
+    }
+}
+
+/// Inverse-CDF categorical sample from a normalized probability row.
+fn sample_categorical(probs: &[f32], rng: &mut Lcg) -> i32 {
+    let u = rng.next_f32();
+    let mut acc = 0.0_f32;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if u < acc {
+            return i as i32;
+        }
+    }
+    (probs.len() - 1) as i32
+}
+
+/// Stochastic recurrent drafter: samples each step from softmax(logits/T).
+/// Returns (drafted_tokens, draft_q_rows). `draft_q_rows[i]` is the
+/// fp32 probability row used to sample drafted[i] (length = vocab).
+fn draft_linear_stochastic(
+    pair: &mut Pair,
+    kv: &SharedKvStates,
+    kv_offset: i32,
+    seed_token: i32,
+    seed_hidden: Array,
+    n: usize,
+    temp: f32,
+    rng: &mut Lcg,
+) -> Result<(Vec<i32>, Vec<Vec<f32>>)> {
+    let mut prev_arr = Array::from(&[seed_token][..]).index(NewAxis);
+    let mut prev_embed = scaled_token_embed(&mut pair.target, &prev_arr)?;
+    let mut recurrent = seed_hidden;
+    let mut tokens = Vec::with_capacity(n);
+    let mut q_rows: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for step in 0..n {
+        let inputs = build_inputs_embeds(&prev_embed, &recurrent)?;
+        let position_offset = match std::env::var("MTPLX_PAIR_POS").as_deref() {
+            Ok("kv") => kv_offset,
+            Ok("advance") => kv_offset - 1 + step as i32,
+            Ok("zero") => 0,
+            _ => kv_offset - 1,
+        };
+        let aout = pair.assistant.forward(&inputs, position_offset, kv)?;
+        eval([&aout.logits, &aout.last_hidden])?;
+        let row = aout.logits.index((.., -1, ..)).reshape(&[-1])?;
+        let probs = softmax_row_fp32(&row, temp)?;
+        let tok = sample_categorical(&probs, rng);
+        tokens.push(tok);
+        q_rows.push(probs);
+        prev_arr = Array::from(&[tok][..]).index(NewAxis);
+        prev_embed = scaled_token_embed(&mut pair.target, &prev_arr)?;
+        recurrent = aout.last_hidden;
+    }
+    Ok((tokens, q_rows))
+}
+
+/// Leviathan-Chen verify: probability-ratio accept w/ `(p-q)+` residual
+/// sample on reject. `prev_logits_last` is target's prediction for the
+/// position drafted[0] occupies; `target_logits` is the verify forward's
+/// per-position logits with shape `[1, N, vocab]` (so `target_logits[i]`
+/// predicts what comes AFTER drafted[i], i.e. drafted[i+1]). `draft_q_rows`
+/// are the drafter's per-step probability rows. Returns
+/// (n_accepted, correction_token).
+fn lc_acceptance(
+    prev_logits_last: &Array,
+    target_logits: &Array,
+    drafted: &[i32],
+    draft_q_rows: &[Vec<f32>],
+    temp: f32,
+    rng: &mut Lcg,
+) -> Result<(usize, i32)> {
+    let n = drafted.len();
+    if n == 0 {
+        // No drafts → bonus is target's argmax at prev_logits_last (fallback).
+        return Ok((0, argmax_i32(&prev_logits_last.reshape(&[-1])?)?));
+    }
+    // Build p_rows: row 0 = softmax(prev_logits_last / T); row i (i>=1) =
+    // softmax(target_logits[i-1] / T).
+    let mut p_rows: Vec<Vec<f32>> = Vec::with_capacity(n + 1);
+    let p0 = softmax_row_fp32(&prev_logits_last.reshape(&[-1])?, temp)?;
+    p_rows.push(p0);
+    for i in 0..n {
+        let row = target_logits.index((.., i as i32, ..)).reshape(&[-1])?;
+        p_rows.push(softmax_row_fp32(&row, temp)?);
+    }
+    // Walk-accept with rejection sampling.
+    let mut accepted = 0usize;
+    for i in 0..n {
+        let t = drafted[i] as usize;
+        let p = &p_rows[i];
+        let q = &draft_q_rows[i];
+        if t >= p.len() || t >= q.len() {
+            return Err(anyhow!("draft token {t} out of vocab"));
+        }
+        let p_t = p[t];
+        let q_t = q[t];
+        let ratio = if q_t > 0.0 { p_t / q_t } else { f32::INFINITY };
+        let u = rng.next_f32();
+        if u < ratio.min(1.0) {
+            accepted += 1;
+            continue;
+        }
+        // Reject: sample from (p - q)+ normalized.
+        let mut s = 0.0_f32;
+        let mut residual = vec![0.0_f32; p.len()];
+        for j in 0..p.len() {
+            let d = p[j] - q[j];
+            if d > 0.0 {
+                residual[j] = d;
+                s += d;
+            }
+        }
+        let correction = if s > 0.0 {
+            // Inverse-CDF on residual.
+            let u2 = rng.next_f32() * s;
+            let mut acc = 0.0_f32;
+            let mut idx = p.len() - 1;
+            for (j, &r) in residual.iter().enumerate() {
+                acc += r;
+                if u2 < acc {
+                    idx = j;
+                    break;
+                }
+            }
+            idx as i32
+        } else {
+            // Defensive: residual is all-zero (p == q at all j); fall back
+            // to sampling from p.
+            let s_p: f32 = p.iter().sum();
+            let u2 = rng.next_f32() * s_p;
+            let mut acc = 0.0_f32;
+            let mut idx = p.len() - 1;
+            for (j, &pp) in p.iter().enumerate() {
+                acc += pp;
+                if u2 < acc {
+                    idx = j;
+                    break;
+                }
+            }
+            idx as i32
+        };
+        return Ok((accepted, correction));
+    }
+    // All accepted: bonus from p_rows[n] (i.e. target after drafted[n-1]).
+    let p_bonus = &p_rows[n];
+    let s_p: f32 = p_bonus.iter().sum();
+    let u = rng.next_f32() * s_p;
+    let mut acc = 0.0_f32;
+    let mut idx = p_bonus.len() - 1;
+    for (j, &pp) in p_bonus.iter().enumerate() {
+        acc += pp;
+        if u < acc {
+            idx = j;
+            break;
+        }
+    }
+    Ok((accepted, idx as i32))
+}
+
+/// Verify variant using Leviathan-Chen acceptance. Side-effect identical
+/// to `verify_chain`: target cache grows by accepted+1 (accepted prefix +
+/// bonus). Returns (n_accepted, bonus_token, last_hidden_for_bonus).
+fn verify_chain_lc(
+    pair: &mut Pair,
+    cache: &mut Vec<KVCache>,
+    prev_logits_last: &Array,
+    drafted: &[i32],
+    draft_q_rows: &[Vec<f32>],
+    temp: f32,
+    rng: &mut Lcg,
+) -> Result<(usize, i32, Array)> {
+    let n = drafted.len();
+    let in_arr = Array::from(drafted).index(NewAxis);
+    let hidden = pair.target.model.forward(ModelInput {
+        inputs: &in_arr,
+        mask: None,
+        cache,
+    })?;
+    eval([&hidden])?;
+    let logits = pair.target.forward_via_hidden(&hidden)?;
+    eval([&logits])?;
+    let (accepted, correction) = lc_acceptance(
+        prev_logits_last,
+        &logits,
+        drafted,
+        draft_q_rows,
+        temp,
+        rng,
+    )?;
+    // Trim cache to accepted positions, then commit `correction` via a
+    // 1-token target forward to install its K/V + grab its hidden.
+    let to_drop = (n as i32) - (accepted as i32);
+    if to_drop > 0 {
+        for c in cache.iter_mut() {
+            c.trim(to_drop);
+        }
+    }
+    let corr_arr = Array::from(&[correction][..]).index(NewAxis);
+    let corr_hidden = pair.target.model.forward(ModelInput {
+        inputs: &corr_arr,
+        mask: None,
+        cache,
+    })?;
+    eval([&corr_hidden])?;
+    let h_b = corr_hidden
+        .index((.., -1, ..))
+        .reshape(&[1, 1, pair.target.args.hidden_size])?;
+    Ok((accepted, correction, h_b))
 }
 
 /// Run the recurrent drafter for `n` steps. Returns the drafted token ids.
@@ -376,11 +687,39 @@ fn run_mode(
     let mut stats: Vec<CycleStats> = Vec::new();
     let t0 = std::time::Instant::now();
 
+    let temp = pair_temp();
+    let mut rng = Lcg::from_env();
+    if temp > 0.0 {
+        eprintln!("  [LC] stochastic draft + Leviathan-Chen acceptance at T={temp:.3}");
+    }
+
     while emitted.len() < max_new {
         let kv = build_shared_kv(&cache, pair.last_sliding, pair.last_full)?;
         let kv_offset = kv.sliding_k.shape()[2];
 
         let (drafted, accepted, bonus, new_seed_hidden) = match mode {
+            Mode::Linear if temp > 0.0 => {
+                let (d, q_rows) = draft_linear_stochastic(
+                    pair,
+                    &kv,
+                    kv_offset,
+                    seed_token,
+                    seed_hidden.clone(),
+                    block,
+                    temp,
+                    &mut rng,
+                )?;
+                let (acc, bonus, h) = verify_chain_lc(
+                    pair,
+                    &mut cache,
+                    &prev_logits,
+                    &d,
+                    &q_rows,
+                    temp,
+                    &mut rng,
+                )?;
+                (d, acc, bonus, h)
+            }
             Mode::Linear => {
                 let d = draft_linear(pair, &kv, kv_offset, seed_token, seed_hidden.clone(), block)?;
                 if std::env::var("SPIKE_DEBUG").is_ok() && stats.is_empty() {
