@@ -190,6 +190,10 @@ fn softmax_row_fp32(row_logits: &Array, temp: f32) -> Result<Vec<f32>> {
     if k > 0 {
         truncate_top_k_inplace(&mut row, k);
     }
+    let p = pair_top_p();
+    if p > 0.0 && p < 1.0 {
+        truncate_top_p_inplace(&mut row, p);
+    }
     Ok(row)
 }
 
@@ -199,6 +203,69 @@ fn pair_top_k() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0_usize)
+}
+
+/// Read MTPLX_PAIR_TOP_P. 0.0 (or unset / >=1.0) means no nucleus truncation.
+fn pair_top_p() -> f32 {
+    std::env::var("MTPLX_PAIR_TOP_P")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0_f32)
+}
+
+/// Nucleus (top-p) truncation: keep the smallest set of tokens whose
+/// cumulative probability mass is >= `p`, zero out the rest, renormalize.
+/// Applied after `truncate_top_k_inplace` (if any) — only non-zero
+/// entries are considered, which keeps the sort cheap on 262k-vocab.
+/// Per HF assistant generation_config.json: top_p=0.95.
+fn truncate_top_p_inplace(probs: &mut [f32], p: f32) {
+    if p <= 0.0 || p >= 1.0 {
+        return;
+    }
+    // Collect (idx, prob) for non-zero entries only.
+    let mut nz: Vec<(usize, f32)> = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, v)| *v > 0.0)
+        .collect();
+    if nz.is_empty() {
+        return;
+    }
+    // Sort descending by probability.
+    nz.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Walk cumsum, keep up to (and including) the first index where
+    // cumsum >= p. Always keep at least the top-1 to avoid empty support.
+    let total: f32 = nz.iter().map(|(_, v)| *v).sum();
+    let target = p * total;
+    let mut acc = 0.0_f32;
+    let mut last_kept = 0usize;
+    for (i, (_, v)) in nz.iter().enumerate() {
+        acc += *v;
+        last_kept = i;
+        if acc >= target {
+            break;
+        }
+    }
+    // Mark which original indices to keep.
+    let mut keep = vec![false; probs.len()];
+    for &(idx, _) in nz.iter().take(last_kept + 1) {
+        keep[idx] = true;
+    }
+    let mut s = 0.0_f32;
+    for i in 0..probs.len() {
+        if keep[i] {
+            s += probs[i];
+        } else {
+            probs[i] = 0.0;
+        }
+    }
+    if s > 0.0 {
+        let inv = 1.0 / s;
+        for q in probs.iter_mut() {
+            *q *= inv;
+        }
+    }
 }
 
 /// Truncate `probs` to its top-`k` entries (in place), zero out the rest,
