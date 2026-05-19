@@ -14,6 +14,7 @@ use mlx_rs::{
     nn,
     ops::{
         self,
+        argsort_axis,
         indexing::{scatter_add_single, take_along_axis, take_axis, IndexOp, NewAxis},
     },
     quantization::MaybeQuantized,
@@ -864,6 +865,96 @@ impl Experts {
         weighted.sum_axis(1, false)?.as_dtype(hidden_dtype)
     }
 
+    /// Expert-major MoE dispatch — phase 2 (#35).
+    ///
+    /// Computes bucketing entirely on GPU (no CPU sync): flatten
+    /// `top_k_index`, argsort to get a permutation that groups identical
+    /// experts contiguously, gather X / W in sorted order, run a single
+    /// batched matmul, then scatter back to per-token positions.
+    ///
+    /// With stock MLX matmul this is **structurally equivalent in cost
+    /// to `forward_topk`** — the matmul is the same per-(token,k_slot)
+    /// shape either way, and we add argsort + extra gathers on top. It
+    /// is not a speedup. It is the *enabling layer* for phase 3: a custom
+    /// Metal kernel will replace the row-wise matmul with a per-expert
+    /// dense `[N_e, H] @ [H, 2I]` tile-reuse kernel (simdgroup_matrix),
+    /// fed from this exact sorted layout.
+    ///
+    /// Gated at the call site by `GEMMA4_EXPERT_MAJOR_MOE=2`. v1
+    /// (CPU-bucketed) at `=1`, default token-major at `=0`.
+    pub fn forward_topk_expert_major_v2(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let hidden_dtype = hidden_states.dtype();
+        let n = hidden_states.shape()[0];
+        let h = hidden_states.shape()[1];
+        let i = self.intermediate_size;
+        let k_top = top_k_index.shape()[1];
+        let n_k = n * k_top;
+
+        // ── GPU bucketing: sort the (token, k_slot) pairs by expert id. ──
+        let flat_experts = top_k_index.reshape(&[-1])?.as_dtype(Dtype::Int32)?;
+        let sort_order = argsort_axis(&flat_experts, -1)?.as_dtype(Dtype::Int32)?;
+        let sorted_experts = take_axis(&flat_experts, &sort_order, 0)?;
+        // Recover (token_idx, k_slot) from the sort order: a position p in
+        // the flat layout corresponds to token p / k_top and k_slot p % k_top.
+        // We don't materialize a [n_k] arange — instead derive them from
+        // sort_order directly: sort_order[i] is the flat position p, so
+        //   sorted_token_indices[i] = sort_order[i] / k_top
+        //   sorted_k_slots[i]       = sort_order[i] % k_top
+        let k_arr = array!(k_top);
+        let sorted_token_indices = sort_order.divide(&k_arr)?.as_dtype(Dtype::Int32)?;
+        let sorted_k_slots = sort_order.remainder(&k_arr)?.as_dtype(Dtype::Int32)?;
+        let _ = sorted_experts; // currently unused by stock-matmul path; phase 3 will consume it
+
+        // ── Promote to fp32 once. ──
+        let h_f32 = hidden_states.as_dtype(Dtype::Float32)?;
+        let w_f32 = top_k_weights.as_dtype(Dtype::Float32)?;
+        let gu_f32 = self.gate_up_proj.as_ref().as_dtype(Dtype::Float32)?;
+        let dp_f32 = self.down_proj.as_ref().as_dtype(Dtype::Float32)?;
+
+        // ── Gather X in sorted order: [n_k, H]. ──
+        let x_sorted = take_axis(&h_f32, &sorted_token_indices, 0)?;
+
+        // ── Gather gate_up_proj per row using sorted expert ids: [n_k, 2I, H]. ──
+        // (sorted_experts contains the i32 expert id at each sorted position.)
+        // We re-derive sorted_experts via take(flat_experts, sort_order).
+        let sorted_experts_for_gather = take_axis(&flat_experts, &sort_order, 0)?;
+        let gu_sorted = take_axis(&gu_f32, &sorted_experts_for_gather, 0)?;
+
+        // ── Batched per-row matmul: [n_k, 1, H] @ [n_k, H, 2I] = [n_k, 1, 2I]. ──
+        let x_3d = x_sorted.reshape(&[n_k, 1, h])?;
+        let gu_t = gu_sorted.transpose_axes(&[0, 2, 1])?;
+        let y = x_3d.matmul(&gu_t)?.reshape(&[n_k, 2 * i])?;
+
+        // ── SwiGLU-style activation: split, gate * up. ──
+        let split = y.split(2, -1)?;
+        let gate = self.activation.apply(&split[0])?;
+        let z = gate.multiply(&split[1])?; // [n_k, I]
+
+        // ── Gather down_proj per row: [n_k, H, I]. ──
+        let dp_sorted = take_axis(&dp_f32, &sorted_experts_for_gather, 0)?;
+        let dp_t = dp_sorted.transpose_axes(&[0, 2, 1])?;
+        let z_3d = z.reshape(&[n_k, 1, i])?;
+        let out = z_3d.matmul(&dp_t)?.reshape(&[n_k, h])?;
+
+        // ── Gather routing weights for each (sorted_token_idx, sorted_k_slot). ──
+        let flat_idx = sorted_token_indices.multiply(&k_arr)?.add(&sorted_k_slots)?;
+        let w_flat = w_f32.reshape(&[-1])?;
+        let w_sorted = take_axis(&w_flat, &flat_idx, 0)?.reshape(&[n_k, 1])?;
+        let weighted = out.multiply(&w_sorted)?;
+
+        // ── Scatter back to per-token output. ──
+        let mut output = ops::zeros::<f32>(&[n, h])?;
+        let updates = weighted.reshape(&[n_k, 1, h])?;
+        output = scatter_add_single(&output, &sorted_token_indices, &updates, 0)?;
+
+        output.as_dtype(hidden_dtype)
+    }
+
     /// Expert-major MoE dispatch (#35 phase 1).
     ///
     /// Buckets routed (token, k_slot) pairs by expert, then runs a single
@@ -1079,13 +1170,11 @@ where
                 .experts
                 .as_mut()
                 .expect("MoE layer missing experts");
-            let moe_out = if std::env::var("GEMMA4_EXPERT_MAJOR_MOE")
-                .map(|v| v == "1")
-                .unwrap_or(false)
-            {
-                experts.forward_topk_expert_major(&moe_in, &top_k_index, &top_k_weights)?
-            } else {
-                experts.forward_topk(&moe_in, &top_k_index, &top_k_weights)?
+            let mode = std::env::var("GEMMA4_EXPERT_MAJOR_MOE").unwrap_or_default();
+            let moe_out = match mode.as_str() {
+                "1" => experts.forward_topk_expert_major(&moe_in, &top_k_index, &top_k_weights)?,
+                "2" => experts.forward_topk_expert_major_v2(&moe_in, &top_k_index, &top_k_weights)?,
+                _ => experts.forward_topk(&moe_in, &top_k_index, &top_k_weights)?,
             };
             let moe_out = moe_out.reshape(&residual.shape())?;
             let moe_out = self
