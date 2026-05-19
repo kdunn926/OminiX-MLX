@@ -85,6 +85,14 @@ struct Pair {
 
 fn scaled_token_embed(model: &mut Model, ids: &Array) -> Result<Array> {
     let embed = model.model.embed_tokens.forward(ids)?;
+    // MTPLX_PAIR_NO_EMBED_SCALE=1 skips the Gemma sqrt(H) embed scaling
+    // for the previous-token embed fed to the assistant. The assistant
+    // may or may not have been trained against the scaled-embed
+    // convention — A/B to find out.
+    let skip_scale = std::env::var("MTPLX_PAIR_NO_EMBED_SCALE").is_ok();
+    if skip_scale {
+        return Ok(embed.as_dtype(Dtype::Bfloat16)?);
+    }
     let scale = if model.model.embed_scale.dtype() == embed.dtype() {
         model.model.embed_scale.clone()
     } else {
@@ -314,11 +322,27 @@ fn run_mode(
 
     // Prefill.
     let prompt_arr = Array::from(prompt_ids).index(NewAxis);
-    let prefill_hidden = pair.target.model.forward(ModelInput {
-        inputs: &prompt_arr,
-        mask: None,
-        cache: &mut cache,
-    })?;
+    // MTPLX_PAIR_PRE_NORM_SEED=1 routes through `forward_with_hidden_capture`
+    // tapping the LAST decoder layer, which yields the hidden state AFTER
+    // the final layer's MLP but BEFORE the final RMSNorm — i.e. pre-norm.
+    // Default (off) preserves prior post-norm seed behaviour to allow A/B.
+    let use_pre_norm = std::env::var("MTPLX_PAIR_PRE_NORM_SEED").is_ok();
+    let prefill_hidden = if use_pre_norm {
+        let n = pair.target.args.num_hidden_layers as usize;
+        let (_logits, captures) = pair.target.forward_with_hidden_capture(
+            &prompt_arr,
+            &mut cache,
+            &[n - 1],
+        )?;
+        // captures is [B, T, H] of the last layer's output, pre-norm.
+        captures
+    } else {
+        pair.target.model.forward(ModelInput {
+            inputs: &prompt_arr,
+            mask: None,
+            cache: &mut cache,
+        })?
+    };
     eval([&prefill_hidden])?;
     let last_h = prefill_hidden
         .index((.., -1, ..))

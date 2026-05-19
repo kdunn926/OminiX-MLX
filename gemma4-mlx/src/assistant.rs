@@ -664,7 +664,20 @@ pub fn build_inputs_embeds(
     prev_token_embed: &Array,
     recurrent_hidden: &Array,
 ) -> Result<Array, Exception> {
-    ops::concatenate_axis(&[prev_token_embed, recurrent_hidden], -1)
+    // Concat order: (recurrent_hidden, prev_token_embed). The previous
+    // ordering (prev_token_embed first) produced acceptance ~1% on the
+    // gemma4-27B-MTPLX-Optimized-Speed pair, identical to the Qwen3.6
+    // MTP concat-order bug — pre_projection's weight matrix expects
+    // recurrent first, embed second. Toggle via MTPLX_PAIR_CONCAT_ORDER=embed_first
+    // to A/B against the prior bug-for-bug behaviour.
+    let recurrent_first = std::env::var("MTPLX_PAIR_CONCAT_ORDER")
+        .map(|v| v.as_str() != "embed_first")
+        .unwrap_or(true);
+    if recurrent_first {
+        ops::concatenate_axis(&[recurrent_hidden, prev_token_embed], -1)
+    } else {
+        ops::concatenate_axis(&[prev_token_embed, recurrent_hidden], -1)
+    }
 }
 
 /// Quick sample: argmax of last position. Caller can swap in temp/top-k if
