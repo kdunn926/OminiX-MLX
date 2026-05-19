@@ -33,6 +33,17 @@ Apple Silicon).
 | Qwen3.6-27B-MTPLX-Optimized | bench_mtplx (K=2, **MTP fixes**) | fp16 — concat order + ar_next embed | 5035 | 50.2 | 56.7 | **15.37** (acceptance **0.860**) | — | 25.87 |
 | Qwen3.6-27B-MTPLX-Optimized | bench_mtplx (K=2, **multi-step drafting**) | fp16 — 2 MTP forwards per cycle, batch verify | 5035 | 50.2 | 55.9 | **17.61** (acceptance 0.569) | — | — |
 | Qwen3.6-27B-MTPLX-Optimized | bench_mtplx (K=4, multi-step) | fp16 — 4 MTP forwards per cycle | 5035 | 50.9 | 58.4 | 13.42 (acceptance 0.333) | — | — |
+| Gemma4-26B-A4B-it | mtplx AR (Fused QKV OFF, baseline) | BF16 | 5183 | — | 660.98 | 0.4 (5 decode) | — | 68.6 |
+| Gemma4-26B-A4B-it | mtplx AR (Fused QKV ON, `GEMMA4_FUSED_QKV=1`) | BF16 | 5183 | — | 700.82 | 0.4 (5 decode) | — | 69.6 | +6% TTFT regression — keep off for long context |
+
+## Gemma4 paired-model speculation — sliding-window mask A/B (hermes 5K-tok concat)
+
+| Variant | Linear tok/s | Tree2 tok/s | Acceptance (Linear) | Wall (96 tok) |
+|---|---|---|---|---|
+| Sliding-window mask ON (b1d4e82, default) | 2.06 | 0.98 | 0/576 | 46.6s + 98.0s |
+| Sliding-window mask OFF (`MTPLX_PAIR_NO_SLIDING_MASK=1`) | 2.05 | 0.97 | 0/576 | 46.9s + 99.4s |
+
+Sliding-window mask is **neutral on acceptance** for this prompt (no regression, no win). Greedy-vs-greedy on out-of-distribution hermes-style prompts produces 0% acceptance for *distributional* reasons — the drafter's argmax never aligns with the target's. Real acceptance lift requires stochastic draft sampling + spec-decode rejection math (see `docs/35-expert-major-moe-design.md`-adjacent #36 follow-up).
 
 ⭐ = headline winner for that model.
 
