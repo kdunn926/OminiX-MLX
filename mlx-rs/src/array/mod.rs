@@ -305,6 +305,70 @@ impl Array {
         unsafe { mlx_sys::mlx_array_nbytes(self.as_ptr()) }
     }
 
+    /// Raw byte pointer + length of the array's underlying storage.
+    ///
+    /// On Apple Silicon (Metal backend), MLX allocates unified-memory
+    /// `MTLBuffer`s and exposes them as CPU-addressable pointers. The
+    /// pointer returned here is the start of that buffer, suitable for:
+    ///
+    /// * Constructing an `MLMultiArray` with a no-op deallocator on the
+    ///   Core ML side (zero-copy CPU read).
+    /// * Wrapping as a `CVPixelBuffer` via `CVPixelBufferCreateWithBytes`
+    ///   for video-pipeline interop.
+    /// * Forwarding to an `IOSurface` for true GPU→ANE handoff without a
+    ///   CPU roundtrip — but that path also requires the upstream
+    ///   `MTLBuffer` handle (not exposed by mlx-c today). See module
+    ///   docs in `ane-vit-spike/RESULTS.md` for the deferred IOSurface
+    ///   plan.
+    ///
+    /// # Safety
+    ///
+    /// * The returned pointer is valid only while the [`Array`] is alive
+    ///   and not yet re-evaluated (lazy graph re-eval may relocate the
+    ///   underlying buffer). Call `eval()` first to materialize the
+    ///   array before using the pointer.
+    /// * The caller must not write through the pointer; treat as
+    ///   read-only.
+    /// * Returns `None` when the array has no materialized backing (rare;
+    ///   e.g. uninitialized scalar before any compute).
+    pub fn raw_data_bytes(&self) -> Option<(*const u8, usize)> {
+        use std::os::raw::c_void;
+        let nbytes = self.nbytes();
+        if nbytes == 0 {
+            return None;
+        }
+        let ptr: *const c_void = unsafe {
+            match self.dtype() {
+                crate::Dtype::Bool => mlx_sys::mlx_array_data_bool(self.as_ptr()) as *const c_void,
+                crate::Dtype::Uint8 => mlx_sys::mlx_array_data_uint8(self.as_ptr()) as *const c_void,
+                crate::Dtype::Uint16 => mlx_sys::mlx_array_data_uint16(self.as_ptr()) as *const c_void,
+                crate::Dtype::Uint32 => mlx_sys::mlx_array_data_uint32(self.as_ptr()) as *const c_void,
+                crate::Dtype::Uint64 => mlx_sys::mlx_array_data_uint64(self.as_ptr()) as *const c_void,
+                crate::Dtype::Int8 => mlx_sys::mlx_array_data_int8(self.as_ptr()) as *const c_void,
+                crate::Dtype::Int16 => mlx_sys::mlx_array_data_int16(self.as_ptr()) as *const c_void,
+                crate::Dtype::Int32 => mlx_sys::mlx_array_data_int32(self.as_ptr()) as *const c_void,
+                crate::Dtype::Int64 => mlx_sys::mlx_array_data_int64(self.as_ptr()) as *const c_void,
+                crate::Dtype::Float16 => mlx_sys::mlx_array_data_float16(self.as_ptr()) as *const c_void,
+                crate::Dtype::Float32 => mlx_sys::mlx_array_data_float32(self.as_ptr()) as *const c_void,
+                crate::Dtype::Float64 => mlx_sys::mlx_array_data_float64(self.as_ptr()) as *const c_void,
+                crate::Dtype::Bfloat16 => mlx_sys::mlx_array_data_bfloat16(self.as_ptr()) as *const c_void,
+                _ => return None,
+            }
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        Some((ptr as *const u8, nbytes))
+    }
+
+    /// Convenience: like [`raw_data_bytes`] but typed as `*const u32`,
+    /// useful when forwarding the unified-memory buffer into a Core ML
+    /// MLMultiArray that expects a 32-bit element view (the caller
+    /// re-interprets per the array's actual `dtype()`).
+    pub fn metal_buffer_ptr(&self) -> Option<*const u32> {
+        self.raw_data_bytes().map(|(p, _)| p as *const u32)
+    }
+
     /// The array’s dimension.
     pub fn ndim(&self) -> usize {
         unsafe { mlx_sys::mlx_array_ndim(self.as_ptr()) }
