@@ -89,27 +89,38 @@ Files to touch:
 - Use `argsort` + `cumsum` on flattened `top_k_index` to compute offsets
   without per-expert Python-side loops.
 
-### Phase 2 — Per-expert MLX dispatch (½ day)
+### Phase 1 + 2 — Status: LANDED, no speedup yet, by design
 
-Implement Step 2 using *existing* MLX matmul (no custom kernel yet) to
-validate the algorithm:
+Phase 1 (`7b98d9f`) — `forward_topk_expert_major` with CPU bucketing
+behind `GEMMA4_EXPERT_MAJOR_MOE=1`. Validated correct; ~1.6× slower
+than `forward_topk` due to per-layer GPU→CPU sync forced by reading
+`top_k_index` to a Vec for the bucket loop.
 
-```rust
-for bucket in buckets {
-    let x_e = hidden_states.gather(bucket.token_indices);   // [N_e, H]
-    let w_gu = self.gate_up_proj.index(bucket.expert_id);   // [2I, H]
-    let y_e = x_e.matmul(&w_gu.transpose())?;               // [N_e, 2I]
-    // ...
-}
-```
+Phase 2 (`65e999e`) — `forward_topk_expert_major_v2` with GPU
+bucketing (argsort + take, no CPU sync) behind
+`GEMMA4_EXPERT_MAJOR_MOE=2`. Validated correct; performance
+equivalent to `forward_topk`. **No speedup achieved, by design.**
 
-Validate against `forward_topk` argmax-match on a small prefill chunk.
-If outputs match within fp16 tolerance, the bucketing/scatter logic is
-correct independent of any kernel work.
+**Empirical lesson:** stock MLX matmul on the sorted layout is
+structurally equivalent in cost to `forward_topk`. MLX's `take_axis`
++ batched matmul fuses into the same per-row vector-matrix kernel
+regardless of whether the input rows are in token-major or
+expert-sorted order. The Phase 1 design assumption that "per-expert
+MLX dispatch validates the algorithm and shows the speedup" was
+incorrect: stock MLX matmul cannot exploit "many tokens share one
+expert weight matrix" without a custom kernel that uses tile reuse.
 
-**Skip-gate**: if `N_e < EXPERT_MAJOR_MIN_TOKENS` (default 8) for a
-given expert, fall back to the existing per-token path for that
-expert. Decode (N_e ≤ 1) always falls back.
+Phase 2's actual deliverable is the **sorted input layout**:
+`(sorted_token_indices, sorted_k_slots, sorted_experts)` produced
+entirely on GPU. This is the input format for the Phase 3 custom
+Metal kernel.
+
+Knob finalized at the call site:
+- unset / `=0` → `forward_topk` (token-major, fastest with stock MLX)
+- `=1` → v1 CPU bucketing (slower; kept as a per-bucket gate
+  reference for the kernel work)
+- `=2` → v2 GPU bucketing (correctness-equivalent to forward_topk;
+  produces the layout Phase 3 needs)
 
 ### Phase 3 — Dense Metal kernel (½–1 day)
 
