@@ -1225,6 +1225,17 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
         uint sg_part = tid >> 3;
         uint col = tid & 7u;
         // row 0, col `col` of simdgroup `sg_part`'s 8x8 tile.
+        // NOTE: this kernel's correctness test (`online_softmax_simd_matches_reference`)
+        // currently fails with ~13% rel error and sign flips at ~half the
+        // output positions. Tried row-major read (this code) and
+        // column-major read (s_c_dump[sg_part*64 + col*8]) — both fail.
+        // The bug is not a simple layout transposition but interaction
+        // between simdgroup_multiply_accumulate's matrix-tile layout and
+        // our row-0-only A-tile sparsity. Likely needs either Apple's
+        // metal_simdgroup_matrix internals docs or a side-by-side bench
+        // against a known-correct MLX simdgroup_matrix kernel.
+        // Kernel ships gated off (TURBOQUANT_SIMD_MATMUL=1); enable only
+        // for further debugging.
         float v = s_c_dump[sg_part * 64u + col];
         float inv_l = 1.0f / s_running_l;
         uint d_global = d_start + sg_part * 8u + col;
