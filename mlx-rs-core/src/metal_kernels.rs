@@ -3890,11 +3890,248 @@ pub fn moe_dense_matmul_bf16(
     }
 }
 
+// ============================================================================
+// MoE dense matmul kernel — batched all-experts variant (#35 phase 7).
+// ============================================================================
+const MOE_DENSE_MATMUL_BATCHED_KERNEL: &str = r#"
+    uint bx = threadgroup_position_in_grid.x;
+    uint by = threadgroup_position_in_grid.y;
+    uint row_base = bx * 32u;
+    uint col_base = by * 32u;
+    if (col_base >= uint(N_)) return;
+    int e = block_expert_id[bx];
+    if (e < 0) return;
+    uint w_off = uint(e) * uint(N_) * uint(K_);
+
+    simdgroup_matrix<bfloat, 8, 8> acc[4][4];
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++)
+            acc[i][j] = simdgroup_matrix<bfloat, 8, 8>(bfloat(0.0));
+
+    simdgroup_matrix<bfloat, 8, 8> a_tile[4];
+    simdgroup_matrix<bfloat, 8, 8> b_tile[4];
+
+    for (uint k = 0; k < uint(K_); k += 8u) {
+        simdgroup_load(a_tile[0], A + (row_base + 0u)  * uint(K_) + k, uint(K_));
+        simdgroup_load(a_tile[1], A + (row_base + 8u)  * uint(K_) + k, uint(K_));
+        simdgroup_load(a_tile[2], A + (row_base + 16u) * uint(K_) + k, uint(K_));
+        simdgroup_load(a_tile[3], A + (row_base + 24u) * uint(K_) + k, uint(K_));
+
+        simdgroup_load(b_tile[0], B + w_off + k * uint(N_) + col_base +  0u, uint(N_));
+        simdgroup_load(b_tile[1], B + w_off + k * uint(N_) + col_base +  8u, uint(N_));
+        simdgroup_load(b_tile[2], B + w_off + k * uint(N_) + col_base + 16u, uint(N_));
+        simdgroup_load(b_tile[3], B + w_off + k * uint(N_) + col_base + 24u, uint(N_));
+
+        for (uint i = 0; i < 4; i++) {
+            for (uint j = 0; j < 4; j++) {
+                simdgroup_multiply_accumulate(acc[i][j], a_tile[i], b_tile[j], acc[i][j]);
+            }
+        }
+    }
+
+    for (uint i = 0; i < 4; i++) {
+        for (uint j = 0; j < 4; j++) {
+            uint r = row_base + i * 8u;
+            uint c = col_base + j * 8u;
+            simdgroup_store(acc[i][j], C + r * uint(N_) + c, uint(N_));
+        }
+    }
+"#;
+
+static MOE_DENSE_MATMUL_BATCHED_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_moe_dense_matmul_batched_kernel() -> MetalKernel {
+    unsafe {
+        let a = CString::new("A").unwrap();
+        let b = CString::new("B").unwrap();
+        let block_expert_id = CString::new("block_expert_id").unwrap();
+        let out = CString::new("C").unwrap();
+
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, a.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, b.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, block_expert_id.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, out.as_ptr());
+
+        let source = CString::new(MOE_DENSE_MATMUL_BATCHED_KERNEL).unwrap();
+        let header = CString::new(
+            "#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n",
+        )
+        .unwrap();
+        let name = CString::new("moe_dense_matmul_batched").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Single-launch batched MoE matmul (#35 phase 7).
+///
+/// `a`: `[M_total_padded, K]` bf16 — caller-packed input, zero-padded between
+/// expert buckets so padded rows produce zero output naturally.
+/// `b`: `[E, K, N]` bf16 — per-expert weight matrices, *pre-transposed* by
+/// the caller from `[E, N, K]` to `[E, K, N]`.
+/// `block_expert_id`: `[M_total_padded / 32]` i32 — for each 32-row block,
+/// which expert id it belongs to. Use `-1` to skip a block entirely.
+pub fn moe_dense_matmul_batched(
+    a: &Array,
+    b: &Array,
+    block_expert_id: &Array,
+    k: i32,
+    n: i32,
+) -> Result<Array, Exception> {
+    if k % 8 != 0 {
+        return Err(Exception::custom(format!(
+            "moe_dense_matmul_batched: K must be divisible by 8; got {k}"
+        )));
+    }
+    if n % 32 != 0 {
+        return Err(Exception::custom(format!(
+            "moe_dense_matmul_batched: N must be divisible by 32; got {n}"
+        )));
+    }
+    let a_shape = a.shape();
+    if a_shape.len() != 2 || a_shape[1] != k {
+        return Err(Exception::custom(format!(
+            "moe_dense_matmul_batched: A must be [M_total_padded, K={k}]; got {a_shape:?}"
+        )));
+    }
+    let m_total_padded = a_shape[0];
+    if m_total_padded % 32 != 0 {
+        return Err(Exception::custom(format!(
+            "moe_dense_matmul_batched: M_total_padded must be divisible by 32; got {m_total_padded}"
+        )));
+    }
+    let b_shape = b.shape();
+    if b_shape.len() != 3 || b_shape[1] != k || b_shape[2] != n {
+        return Err(Exception::custom(format!(
+            "moe_dense_matmul_batched: B must be [E, K={k}, N={n}]; got {b_shape:?}"
+        )));
+    }
+    let id_shape = block_expert_id.shape();
+    if id_shape.len() != 1 || id_shape[0] != m_total_padded / 32 {
+        return Err(Exception::custom(format!(
+            "moe_dense_matmul_batched: block_expert_id must be [{}]; got {id_shape:?}",
+            m_total_padded / 32
+        )));
+    }
+    if a.dtype() != mlx_rs::Dtype::Bfloat16 || b.dtype() != mlx_rs::Dtype::Bfloat16 {
+        return Err(Exception::custom(format!(
+            "moe_dense_matmul_batched: A and B must be bf16; got A={:?} B={:?}",
+            a.dtype(),
+            b.dtype()
+        )));
+    }
+    if block_expert_id.dtype() != mlx_rs::Dtype::Int32 {
+        return Err(Exception::custom(
+            "moe_dense_matmul_batched: block_expert_id must be int32",
+        ));
+    }
+
+    let kernel = MOE_DENSE_MATMUL_BATCHED_KERNEL_HANDLE
+        .get_or_init(create_moe_dense_matmul_batched_kernel);
+
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        for (name, value) in [("K_", k), ("N_", n)] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, m_total_padded, n / 32, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
+
+        let out_shape: [i32; 2] = [m_total_padded, n];
+        let bf16_dtype: u32 = mlx_rs::Dtype::Bfloat16.into();
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, out_shape.as_ptr(), out_shape.len(), bf16_dtype,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, a.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, b.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, block_expert_id.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("moe_dense_matmul_batched kernel failed"));
+        }
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+        Ok(Array::from_ptr(result))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_rs::ops::indexing::IndexOp;
     use mlx_rs::Array;
+
+    /// Batched kernel parity: 2 experts × 32 rows × (K=64, N=128).
+    #[test]
+    fn moe_dense_matmul_batched_matches_reference() {
+        let e_total = 2_i32;
+        let rows_per_expert = 32_i32;
+        let m_total = rows_per_expert * e_total;
+        let k = 64_i32;
+        let n = 128_i32;
+
+        let a_data: Vec<f32> = (0..m_total * k).map(|i| ((i as f32) * 0.013).cos()).collect();
+        let b_data: Vec<f32> = (0..e_total * k * n).map(|i| ((i as f32) * 0.017).sin()).collect();
+        let a_f32 = Array::from_slice(&a_data, &[m_total, k]);
+        let b_f32 = Array::from_slice(&b_data, &[e_total, k, n]);
+        let a = a_f32.as_dtype(mlx_rs::Dtype::Bfloat16).unwrap();
+        let b = b_f32.as_dtype(mlx_rs::Dtype::Bfloat16).unwrap();
+
+        let a_e0 = a.index((..32, ..));
+        let a_e1 = a.index((32..64, ..));
+        let b_e0 = b.index((0, .., ..));
+        let b_e1 = b.index((1, .., ..));
+        let ref_e0 = a_e0.matmul(&b_e0).unwrap();
+        let ref_e1 = a_e1.matmul(&b_e1).unwrap();
+        let reference = mlx_rs::ops::concatenate_axis(&[&ref_e0, &ref_e1], 0).unwrap();
+        mlx_rs::transforms::eval([&reference]).unwrap();
+
+        let block_id = Array::from_slice(&[0_i32, 1_i32], &[2]);
+        let result = moe_dense_matmul_batched(&a, &b, &block_id, k, n).unwrap();
+        mlx_rs::transforms::eval([&result]).unwrap();
+
+        let ref_f32 = reference.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let res_f32 = result.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&ref_f32, &res_f32]).unwrap();
+        let r = ref_f32.as_slice::<f32>();
+        let q = res_f32.as_slice::<f32>();
+        let mut max_abs = 0.0_f32;
+        for (a, b) in r.iter().zip(q.iter()) {
+            max_abs = max_abs.max((a - b).abs());
+        }
+        assert!(
+            max_abs < 5e-2,
+            "batched kernel max_abs={max_abs:.6} exceeds bf16 tolerance"
+        );
+    }
 
     /// MoE dense matmul kernel parity test: smallest valid shapes
     /// (M=32, K=8, N=32). Compares against `mlx_rs::ops::matmul(A, B)`
