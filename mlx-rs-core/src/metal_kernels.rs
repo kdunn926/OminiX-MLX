@@ -3977,8 +3977,9 @@ fn create_moe_dense_matmul_batched_kernel() -> MetalKernel {
 ///
 /// `a`: `[M_total_padded, K]` bf16 — caller-packed input, zero-padded between
 /// expert buckets so padded rows produce zero output naturally.
-/// `b`: `[E, K, N]` bf16 — per-expert weight matrices, *pre-transposed* by
-/// the caller from `[E, N, K]` to `[E, K, N]`.
+/// `b`: `[E, K, N]` bf16 — per-expert weight matrices, *pre-transposed*
+/// by the caller from `[E, N, K]` to `[E, K, N]`. Pre-transpose can be
+/// done once at model load (phase 8 follow-up).
 /// `block_expert_id`: `[M_total_padded / 32]` i32 — for each 32-row block,
 /// which expert id it belongs to. Use `-1` to skip a block entirely.
 pub fn moe_dense_matmul_batched(
@@ -4099,6 +4100,7 @@ mod tests {
         let n = 128_i32;
 
         let a_data: Vec<f32> = (0..m_total * k).map(|i| ((i as f32) * 0.013).cos()).collect();
+        // B layout: [E, K, N] (caller pre-transposed).
         let b_data: Vec<f32> = (0..e_total * k * n).map(|i| ((i as f32) * 0.017).sin()).collect();
         let a_f32 = Array::from_slice(&a_data, &[m_total, k]);
         let b_f32 = Array::from_slice(&b_data, &[e_total, k, n]);
