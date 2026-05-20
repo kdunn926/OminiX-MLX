@@ -762,6 +762,15 @@ pub struct Experts {
     pub down_proj: Param<Array>,
 
     pub activation: GemmaActivation,
+
+    /// Phase 8 cache (#35): pre-transposed `[E, K, N]` bf16 views of
+    /// `gate_up_proj` ([E, 2I, H] → [E, H, 2I]) and `down_proj`
+    /// ([E, H, I] → [E, I, H]). Populated lazily on first v6 call.
+    /// Memory cost: gate_up_proj_kt ≈ 10.8 GB and down_proj_kt ≈ 10.8 GB
+    /// on Gemma4-26B-A4B-it. Used only by `forward_topk_expert_major_v6`;
+    /// other paths read `gate_up_proj` / `down_proj` directly.
+    pub gate_up_proj_kt: Option<Array>,
+    pub down_proj_kt: Option<Array>,
 }
 
 /// One group of (token, k_slot) pairs that all route to the same expert.
@@ -987,6 +996,40 @@ impl Experts {
         let num_experts = self.gate_up_proj.as_ref().shape()[0];
         let n_k = n * k_top;
 
+        // ── Decode skip-gate: v6 pads each bucket to 32 rows. For n=1
+        // (decode) this means 32× redundant FLOPS per bucket vs the
+        // token-major forward_topk (which does no padding). Threshold
+        // ensures we only engage when there are enough tokens per
+        // expert that the dense matmul amortizes the padding cost.
+        // Tunable via EXPERT_MAJOR_MIN_PROMPT_TOKENS (default 256).
+        let min_tokens: i32 = std::env::var("EXPERT_MAJOR_MIN_PROMPT_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
+        if n < min_tokens {
+            return self.forward_topk(hidden_states, top_k_index, top_k_weights);
+        }
+
+        // ── Phase 8 lazy cache: pre-transpose weights once. ──
+        if self.gate_up_proj_kt.is_none() {
+            let gu_kt = self
+                .gate_up_proj
+                .as_ref()
+                .as_dtype(Dtype::Bfloat16)?
+                .transpose_axes(&[0, 2, 1])?; // [E, 2I, H] → [E, H, 2I]
+            eval([&gu_kt])?; // materialize once
+            self.gate_up_proj_kt = Some(gu_kt);
+        }
+        if self.down_proj_kt.is_none() {
+            let dp_kt = self
+                .down_proj
+                .as_ref()
+                .as_dtype(Dtype::Bfloat16)?
+                .transpose_axes(&[0, 2, 1])?; // [E, H, I] → [E, I, H]
+            eval([&dp_kt])?;
+            self.down_proj_kt = Some(dp_kt);
+        }
+
         // ── GPU bucketing ──
         let flat_experts = top_k_index.reshape(&[-1])?.as_dtype(Dtype::Int32)?;
         let sort_order = argsort_axis(&flat_experts, -1)?.as_dtype(Dtype::Int32)?;
@@ -1079,17 +1122,11 @@ impl Experts {
         )?
         .as_dtype(Dtype::Bfloat16)?;
 
-        // ── Pre-transpose weights: gate_up_proj [E, 2I, H] → [E, H, 2I]. ──
-        let gu_t = self
-            .gate_up_proj
-            .as_ref()
-            .as_dtype(Dtype::Bfloat16)?
-            .transpose_axes(&[0, 2, 1])?; // [E, H, 2I]
-
-        // ── Batched matmul gate_up: packed_x @ gu_t = [M_total_padded, 2I] ──
+        // ── Cached [E, H, 2I] view, materialized once at first call. ──
+        let gu_t = self.gate_up_proj_kt.as_ref().unwrap();
         let y_packed = moe_dense_matmul_batched(
             &packed_x,
-            &gu_t,
+            gu_t,
             &block_expert_id,
             h,
             2 * i,
@@ -1101,17 +1138,11 @@ impl Experts {
         let z_packed = gate.multiply(&split[1])?
             .as_dtype(Dtype::Bfloat16)?; // [M_total_padded, I]
 
-        // ── Pre-transpose down_proj [E, H, I] → [E, I, H]. ──
-        let dp_t = self
-            .down_proj
-            .as_ref()
-            .as_dtype(Dtype::Bfloat16)?
-            .transpose_axes(&[0, 2, 1])?; // [E, I, H]
-
-        // ── Batched matmul down ──
+        // ── Cached [E, I, H] view. ──
+        let dp_t = self.down_proj_kt.as_ref().unwrap();
         let out_packed = moe_dense_matmul_batched(
             &z_packed,
-            &dp_t,
+            dp_t,
             &block_expert_id,
             i,
             h,
@@ -3193,6 +3224,8 @@ pub fn build_model_from_weights(
                     &format!("{layer_prefix}.experts.down_proj"),
                 )?),
                 activation,
+                gate_up_proj_kt: None,
+                down_proj_kt: None,
             };
 
             (
