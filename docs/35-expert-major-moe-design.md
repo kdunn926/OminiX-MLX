@@ -282,7 +282,66 @@ The phase 7 (batched single-launch) + phase 8 (pre-transpose cache)
 **validated end-to-end** on the workload it was designed for: long
 prefill on MoE models.
 
-#### Phase 9 (FUTURE FOLLOW-UP) — optimization not validation
+#### Phase 9 follow-up — chunk-size sweep + skinny path + Qwen3.6
+
+**Chunk-size sweep on Gemma4-26B-A4B-it hermes 5K prefill:**
+
+| chunk | default forward_topk | v6           | v6 speedup |
+|-------|---------------------|--------------|------------|
+| 64    | 537.40s             | **46.66s**   | **11.5×**  |
+| 128   | (DNF / slower)      | 27.10s       | ≥20×       |
+| 256   | (DNF / slower)      | 16.66s       | ≥30×       |
+
+Larger chunks consistently better for v6 (more amortization per launch).
+Default `GEMMA4_PREFILL_CHUNK=64` is sub-optimal — should be raised
+in conjunction with v6.
+
+**v7 (skinny-path variant)** at `=7` — splits experts into fat
+(n_e ≥ 32) and skinny (<32). Fat → kernel, skinny → MLX matmul.
+Designed to eliminate v6's padding-to-32 FLOPs waste on tiny buckets.
+
+Empirically v7 is **2.5-2.7× slower than v6** across all chunks:
+
+| chunk | v6     | v7      |
+|-------|--------|---------|
+| 64    | 48.70s | 133.61s |
+| 128   | 29.04s |  73.34s |
+| 256   | 17.36s |  41.83s |
+
+Root cause: at chunk=64, all 64 experts have n_e ≈ 4 (all skinny),
+so v7 dispatches 64 × 40 layers × ~80 chunks = ~327k MLX matmul calls
+per prefill. v6 does ~5k batched kernel calls total. Dispatch
+overhead trumps padding waste at this scale.
+
+Conclusion: **v6 padded approach is the right architecture for
+chunked production prefill.** v7 kept at `=7` for future workloads
+where most buckets are fat; not the default.
+
+**Qwen3.6-35B-A3B-4bit:** investigated, NOT ported.
+`qwen3.6-mlx/src/moe.rs:120` already uses MLX's `QuantizedSwitchLinear`
+which internally implements `gather_qmm` — MLX's optimized expert-major
+batched matmul on 4-bit quantized weights. The existing code does:
+  1. `gather_sort(x, indices)` — sorts tokens by expert (≈ our Phase 2)
+  2. `quantized_switch_linear.apply(x_sorted, indices_sorted, true)` —
+     batched Q4 matmul per expert
+  3. `scatter_unsort` to restore per-token output
+
+This is structurally equivalent to v6 but stays in Q4 throughout
+(no bf16 cache, no fp32 promotion). Qwen3.6-35B-A3B already lands
+at 362 prompt-tok/s on hermes 5K — ~3× faster than Gemma4 + v6 even
+though Gemma4 just got an 11× speedup from v6.
+
+**The takeaway**: #35 was specifically valuable for Gemma4's
+non-quantized MoE path. Models routing through MLX's
+QuantizedSwitchLinear already have the equivalent optimization.
+Porting v6 to Qwen3.6 would require either:
+- A Q4-aware kernel variant (kernel rewrite + MLX 4-bit semantics)
+- Pre-dequantizing weights at load (≈ 40 GB of bf16 cache for
+  Qwen3.6-35B-A3B — risky on 96 GB systems alongside everything else)
+
+Neither is justified given Qwen3.6 is already faster than v6-Gemma4.
+
+#### Phase 10 (FUTURE FOLLOW-UP) — optimization not validation
 
 To make v6 production-ready for prefill:
 
