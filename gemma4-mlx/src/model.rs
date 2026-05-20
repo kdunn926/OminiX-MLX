@@ -1298,23 +1298,53 @@ impl Experts {
         }
 
         // ── Phase 8 lazy cache: pre-transpose weights once. ──
-        if self.gate_up_proj_kt.is_none() {
-            let gu_kt = self
+        //
+        // Cache adds ~22 GB persistent bf16 storage on Gemma4-26B-A4B-it
+        // (gate_up_proj_kt 10.8 GB + down_proj_kt 10.8 GB). On memory-tight
+        // systems, set GEMMA4_EXPERT_MAJOR_DISABLE_CACHE=1 to transpose
+        // per-call instead. Per-call materialization peaks at the same
+        // size transiently but releases at each chunk's eval boundary.
+        let disable_cache = std::env::var("GEMMA4_EXPERT_MAJOR_DISABLE_CACHE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let owned_gu_kt;
+        let owned_dp_kt;
+        let gu_t: &Array;
+        let dp_t: &Array;
+        if disable_cache {
+            owned_gu_kt = self
                 .gate_up_proj
                 .as_ref()
                 .as_dtype(Dtype::Bfloat16)?
-                .transpose_axes(&[0, 2, 1])?; // [E, 2I, H] → [E, H, 2I]
-            eval([&gu_kt])?; // materialize once
-            self.gate_up_proj_kt = Some(gu_kt);
-        }
-        if self.down_proj_kt.is_none() {
-            let dp_kt = self
+                .transpose_axes(&[0, 2, 1])?;
+            owned_dp_kt = self
                 .down_proj
                 .as_ref()
                 .as_dtype(Dtype::Bfloat16)?
-                .transpose_axes(&[0, 2, 1])?; // [E, H, I] → [E, I, H]
-            eval([&dp_kt])?;
-            self.down_proj_kt = Some(dp_kt);
+                .transpose_axes(&[0, 2, 1])?;
+            gu_t = &owned_gu_kt;
+            dp_t = &owned_dp_kt;
+        } else {
+            if self.gate_up_proj_kt.is_none() {
+                let gu_kt = self
+                    .gate_up_proj
+                    .as_ref()
+                    .as_dtype(Dtype::Bfloat16)?
+                    .transpose_axes(&[0, 2, 1])?;
+                eval([&gu_kt])?;
+                self.gate_up_proj_kt = Some(gu_kt);
+            }
+            if self.down_proj_kt.is_none() {
+                let dp_kt = self
+                    .down_proj
+                    .as_ref()
+                    .as_dtype(Dtype::Bfloat16)?
+                    .transpose_axes(&[0, 2, 1])?;
+                eval([&dp_kt])?;
+                self.down_proj_kt = Some(dp_kt);
+            }
+            gu_t = self.gate_up_proj_kt.as_ref().unwrap();
+            dp_t = self.down_proj_kt.as_ref().unwrap();
         }
 
         // ── GPU bucketing ──
@@ -1409,8 +1439,7 @@ impl Experts {
         )?
         .as_dtype(Dtype::Bfloat16)?;
 
-        // ── Cached [E, H, 2I] view, materialized once at first call. ──
-        let gu_t = self.gate_up_proj_kt.as_ref().unwrap();
+        // gu_t / dp_t resolved above (cache or per-call).
         // Kernel returns fp32 (Phase 9 mixed-precision: bf16 inputs, fp32 acc+out).
         let y_packed = moe_dense_matmul_batched(
             &packed_x,
@@ -1426,8 +1455,7 @@ impl Experts {
         let z_fp32 = gate.multiply(&split[1])?; // [M_total_padded, I] fp32
         let z_packed = z_fp32.as_dtype(Dtype::Bfloat16)?;
 
-        // ── Cached [E, I, H] view. ──
-        let dp_t = self.down_proj_kt.as_ref().unwrap();
+        // dp_t resolved at the same point as gu_t (cache or per-call).
         let out_packed = moe_dense_matmul_batched(
             &z_packed,
             dp_t,
@@ -2054,19 +2082,26 @@ where
                 .experts
                 .as_mut()
                 .expect("MoE layer missing experts");
-            // GEMMA4_EXPERT_MAJOR_MOE selects MoE dispatch path. Default
-            // (unset) is "6" — v6 batched single-launch kernel with phase 8
-            // lazy weight cache. Phase 9 bench on hermes 5K: ~31× TTFT vs
-            // forward_topk (with GEMMA4_PREFILL_CHUNK=256). v6 internally
-            // skip-gates to forward_topk at n=1 (decode) and when
-            // n_k_total < num_experts (very small chunks), so there's no
-            // decode regression.
+            // GEMMA4_EXPERT_MAJOR_MOE selects MoE dispatch path. **Default
+            // (unset) is forward_topk** — the safe, low-memory path.
             //
-            // Set "0" to force the legacy token-major forward_topk path
-            // (use if memory pressure is the bottleneck — v6 caches an
-            // additional ~22 GB of pre-transposed bf16 weights).
-            let mode = std::env::var("GEMMA4_EXPERT_MAJOR_MOE")
-                .unwrap_or_else(|_| "6".to_string());
+            // v6 (=6) is the fast path (~11–30× TTFT speedup on long-prompt
+            // prefill) but holds ~22 GB of pre-transposed bf16 expert
+            // weights + ~10 GB of per-chunk fp32 intermediates. On systems
+            // with <96 GB unified memory (or 96 GB w/ other apps running)
+            // this triggers Metal OOM mid-prefill, which on macOS can
+            // crash the OS. Opt in EXPLICITLY:
+            //
+            //   GEMMA4_EXPERT_MAJOR_MOE=6 GEMMA4_PREFILL_CHUNK=256
+            //
+            // Memory-conscious tuning:
+            //   GEMMA4_EXPERT_MAJOR_MOE=6 GEMMA4_PREFILL_CHUNK=64
+            //     ↳ ~47s TTFT vs ~17s — saves ~5 GB peak transient.
+            //   GEMMA4_EXPERT_MAJOR_MOE=6 GEMMA4_EXPERT_MAJOR_DISABLE_CACHE=1
+            //     ↳ skips the 22 GB phase 8 cache; transposes per call
+            //       instead. Slower (~10× regression vs cached v6) but
+            //       safe for memory-tight systems.
+            let mode = std::env::var("GEMMA4_EXPERT_MAJOR_MOE").unwrap_or_default();
             let moe_out = match mode.as_str() {
                 "1" => experts.forward_topk_expert_major(&moe_in, &top_k_index, &top_k_weights)?,
                 "2" => experts.forward_topk_expert_major_v2(&moe_in, &top_k_index, &top_k_weights)?,
@@ -4007,28 +4042,28 @@ where
                 // updates the KV cache, so attention can look back at all
                 // previously processed tokens.
                 //
-                // Chunk size is env-tunable via `GEMMA4_PREFILL_CHUNK`. Default
-                // raised to 256 in conjunction with `GEMMA4_EXPERT_MAJOR_MOE=6`
-                // being on by default (see Experts::forward_topk dispatch).
+                // Chunk size is env-tunable via `GEMMA4_PREFILL_CHUNK`.
+                //
+                // **Default 64** — safe across all configurations.
                 //
                 // Historical bench (hermes 5183 tok, default forward_topk):
                 //   chunk=32  → 720s TTFT
-                //   chunk=64  → 604s TTFT
-                //   chunk=128 → 1905s TTFT (MoE expert-gather memory thrashing,
-                //                           peak GPU 73→91 GB on token-major path)
+                //   chunk=64  → 604s TTFT  ⭐ default
+                //   chunk=128 → 1905s TTFT (MoE expert-gather memory
+                //                           thrashing; can crash macOS via
+                //                           Metal OOM kernel panic)
                 //
-                // Bench with `GEMMA4_EXPERT_MAJOR_MOE=6` (v6 batched kernel,
-                // no per-token weight gather → no memory thrashing):
-                //   chunk=64  → 47s TTFT
-                //   chunk=128 → 27s TTFT
-                //   chunk=256 → 17s TTFT  ⭐ new default
+                // Bench with `GEMMA4_EXPERT_MAJOR_MOE=6` (v6 batched kernel
+                // — opt-in only; see Experts::forward_topk dispatch):
+                //   chunk=64  → 47s TTFT, ~32 GB peak
+                //   chunk=128 → 27s TTFT, ~36 GB peak
+                //   chunk=256 → 17s TTFT, ~50 GB peak (≥96 GB unified mem)
                 //
-                // For non-MoE-major paths (forward_topk), 256 may regress;
-                // explicitly set GEMMA4_PREFILL_CHUNK=64 in that case.
+                // Larger chunks ONLY safe with v6 AND ≥96 GB unified memory.
                 let prefill_chunk: i32 = std::env::var("GEMMA4_PREFILL_CHUNK")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(256);
+                    .unwrap_or(64);
                 let PREFILL_CHUNK = prefill_chunk;
                 let seq_len = prompt_token.shape()[1];
 
@@ -4057,6 +4092,19 @@ where
                             } else {
                                 tri!(mlx_rs::transforms::eval([&logits]));
                             }
+                        }
+                        // Bound MLX's reclaimable allocator cache so it
+                        // doesn't accumulate across many chunks. Default
+                        // every 4 chunks. Disable with =0; tune with N>=1.
+                        let cache_clear_every: i32 =
+                            std::env::var("GEMMA4_CLEAR_MLX_CACHE_EVERY")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(4);
+                        if cache_clear_every > 0
+                            && ((pos / PREFILL_CHUNK + 1) % cache_clear_every == 0)
+                        {
+                            let _ = mlx_rs_core::memory::clear_cache();
                         }
                         pos = end;
 
