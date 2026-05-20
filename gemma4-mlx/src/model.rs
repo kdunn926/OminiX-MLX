@@ -2083,25 +2083,32 @@ where
                 .as_mut()
                 .expect("MoE layer missing experts");
             // GEMMA4_EXPERT_MAJOR_MOE selects MoE dispatch path. **Default
-            // (unset) is forward_topk** — the safe, low-memory path.
+            // (unset) is "6"** — v6 batched single-launch kernel with
+            // phase 8 lazy weight cache, paired with the safe-defaults
+            // GEMMA4_PREFILL_CHUNK=64. Validated combo: hermes 5K TTFT
+            // ~47s (vs ~540s on forward_topk), peak ~32 GB on
+            // Gemma4-26B-A4B-it. Workable on 64 GB+ systems w/ minimal
+            // other load.
             //
-            // v6 (=6) is the fast path (~11–30× TTFT speedup on long-prompt
-            // prefill) but holds ~22 GB of pre-transposed bf16 expert
-            // weights + ~10 GB of per-chunk fp32 intermediates. On systems
-            // with <96 GB unified memory (or 96 GB w/ other apps running)
-            // this triggers Metal OOM mid-prefill, which on macOS can
-            // crash the OS. Opt in EXPLICITLY:
+            // v6 internally skip-gates to forward_topk for n=1 (decode)
+            // and when n_k_total < num_experts (very small chunks), so
+            // there's no decode regression.
             //
+            // Opt-outs:
+            //   GEMMA4_EXPERT_MAJOR_MOE=0  → legacy forward_topk
+            //                               (safest, slowest, ~540s)
+            //   GEMMA4_EXPERT_MAJOR_DISABLE_CACHE=1
+            //       → keeps v6 dispatch but skips the 22 GB cache;
+            //         transposes per call (slower but memory-light).
+            //
+            // Faster options (require explicit opt-in due to memory):
+            //   GEMMA4_EXPERT_MAJOR_MOE=6 GEMMA4_PREFILL_CHUNK=128
+            //                               → ~27s TTFT, ~36 GB peak
             //   GEMMA4_EXPERT_MAJOR_MOE=6 GEMMA4_PREFILL_CHUNK=256
-            //
-            // Memory-conscious tuning:
-            //   GEMMA4_EXPERT_MAJOR_MOE=6 GEMMA4_PREFILL_CHUNK=64
-            //     ↳ ~47s TTFT vs ~17s — saves ~5 GB peak transient.
-            //   GEMMA4_EXPERT_MAJOR_MOE=6 GEMMA4_EXPERT_MAJOR_DISABLE_CACHE=1
-            //     ↳ skips the 22 GB phase 8 cache; transposes per call
-            //       instead. Slower (~10× regression vs cached v6) but
-            //       safe for memory-tight systems.
-            let mode = std::env::var("GEMMA4_EXPERT_MAJOR_MOE").unwrap_or_default();
+            //                               → ~17s TTFT, ~50 GB peak
+            //                                 (needs ≥96 GB unified mem)
+            let mode = std::env::var("GEMMA4_EXPERT_MAJOR_MOE")
+                .unwrap_or_else(|_| "6".to_string());
             let moe_out = match mode.as_str() {
                 "1" => experts.forward_topk_expert_major(&moe_in, &top_k_index, &top_k_weights)?,
                 "2" => experts.forward_topk_expert_major_v2(&moe_in, &top_k_index, &top_k_weights)?,
