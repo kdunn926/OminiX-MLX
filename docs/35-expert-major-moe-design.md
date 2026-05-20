@@ -173,6 +173,54 @@ gate_up + one for down_proj per MoE layer = 128 launches/step
 total). Should reclaim the ~400ms/token launch overhead. Realistic
 target: 2-3× decode speedup on Gemma4-26B-A4B-it MoE workloads.
 
+### Phase 7 — LANDED (`bec97ca`), regressed 4.2× — root cause: weight transpose per call
+
+Bench on gemma-4-26B-A4B-it with `CHAT_MAX_TOKENS=64`, prompt "Hi"
+(`77d8f69` added the harness):
+
+| Variant | wall (64 tok) | decode tok/s |
+|---|---|---|
+| default (forward_topk, token-major) | 18.6s | 3.4 |
+| v6 (phase 7 batched single launch) | 78.1s | 0.82 |
+
+v6's user CPU time dropped from 55s (v4) → 16s (v6), confirming launch
+overhead IS reduced as designed. But wall time regressed because the
+Rust setup cost per MoE layer now dominates:
+
+1. `transpose_axes([0,2,1])` on `[E, 2I, H]` weights materializes
+   ~5.5 GB of bf16 memory bandwidth per layer → 350 GB / decode step
+   at 64 layers, ~1 second/token at the memory-bandwidth limit.
+2. `scatter_add_single` for packed_x: n_k × H = ~50 MB/layer written.
+3. `take_axis` gather of n_k real rows from packed output: another
+   50 MB/layer.
+
+The kernel itself is fast and correct; the per-layer dispatch
+overhead from transposing the per-expert weight matrices wipes out
+all the launch-overhead savings.
+
+### Phase 8 (FUTURE) — fix the transpose
+
+Two options:
+
+1. **Cache the [E, K, N] view at model load.** Adds a parallel
+   `gate_up_proj_kn` and `down_proj_kn` field that's the
+   pre-transposed view, materialized once. Memory cost: 10.8 GB of
+   additional bf16 storage (gate_up_proj is `[64, 16384, 5376] bf16`).
+   On a 96 GB machine that's acceptable for the prefill/decode
+   speedup it would unlock.
+
+2. **Modify the kernel to read [E, N, K] directly via simdgroup_load's
+   transpose flag.** Eliminates the materialization entirely. Risk:
+   the transpose flag had unclear behavior in our earlier
+   single-expert kernel attempts (zero output). Now that we know the
+   `set_grid` convention, those earlier failures may have been the
+   real culprit and transpose-load might just work. Worth trying.
+
+Option 2 is cheaper and more elegant. Option 1 is the safe fallback.
+
+Estimated time: ½ day for option 2 (rewrite kernel + parity test).
+If it fails, fall back to option 1 (~½ day for the loader changes).
+
 **Cost**: ~300 LOC of GPU bucketing + new kernel + dispatch wrapper.
 Same complexity tier as the original phase 3 kernel implementation.
 
