@@ -36,6 +36,27 @@ Apple Silicon).
 | Gemma4-26B-A4B-it | mtplx AR (Fused QKV OFF, baseline) | BF16 | 5183 | — | 660.98 | 0.4 (5 decode) | — | 68.6 |
 | Gemma4-26B-A4B-it | mtplx AR (Fused QKV ON, `GEMMA4_FUSED_QKV=1`) | BF16 | 5183 | — | 700.82 | 0.4 (5 decode) | — | 69.6 | +6% TTFT regression — keep off for long context |
 
+## Gemma4 Expert-Major MoE (#35) — hermes 5K prefill
+
+| Variant | hermes 5K prefill wall | Prompt tok/s | Speedup |
+|---|---|---|---|
+| Default `forward_topk` (token-major) | 487s | ~10.6 | 1× (baseline) |
+| **v6 Phase 9 (`GEMMA4_EXPERT_MAJOR_MOE=6`)** ⭐ | **42s** | **~123** | **~11×** |
+
+Pipeline: GPU bucketing (argsort + counts via one-hot sum) → packed
+`[M_total_padded, H]` layout → single batched `moe_dense_matmul_batched`
+Metal launch (per-block expert lookup, simdgroup_matrix<float,8,8>
+4×4 acc tiles, fp32 mixed-precision accumulation) → SwiGLU on packed
+fp32 layout → second batched launch for down_proj → fp32 scatter back
+to per-token output. Pre-transposed `[E, K, N]` weight views cached
+lazily on first call (~22 GB extra bf16). Skip-gate
+`EXPERT_MAJOR_MIN_PROMPT_TOKENS=256` (default) routes decode/short
+prompts back through `forward_topk` so v6 only fires when there's
+enough tokens-per-expert to amortize the 32-row padding.
+
+Same first emitted token as default ("I") — correctness preserved at
+argmax level.
+
 ## Gemma4 paired-model speculation — sliding-window mask A/B (hermes 5K-tok concat)
 
 | Variant | Linear tok/s | Tree2 tok/s | Acceptance (Linear) | Wall (96 tok) |

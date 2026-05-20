@@ -260,7 +260,29 @@ two deeper issues v6 still hits:
 matches default tok/s + output. Prefill path remains gated; actual
 benefit requires a prefill-dominated workload to measure.
 
-### Phase 9 (FUTURE) — fp32 accumulator workaround + prefill bench
+### Phase 9 — LANDED (`c333c45`), **11× prefill speedup validated**
+
+Mixed-precision accumulation (bf16 A/B + fp32 acc + fp32 output)
+works on Apple Metal — `simdgroup_multiply_accumulate(fp32_acc,
+bf16_a, bf16_b, fp32_acc)` is a native overload. Eliminates the
+K=5376 bf16 accumulator-rounding divergence.
+
+Bench (hermes 5K prefill, gemma-4-26B-A4B-it, max_tokens=2):
+
+| Variant                              | wall    | prompt-tok/s | speedup |
+|--------------------------------------|---------|--------------|---------|
+| default `forward_topk` (token-major) | **487s**| ~10.6        | 1×      |
+| v6 phase 9 batched + fp32 acc        | **42s** | **~123**     | **~11×**|
+
+Both produced the same first emitted token ('I'). Correctness
+preserved at argmax level.
+
+The phase 7 (batched single-launch) + phase 8 (pre-transpose cache)
++ phase 9 (fp32 mixed-precision accumulation) architecture is now
+**validated end-to-end** on the workload it was designed for: long
+prefill on MoE models.
+
+#### Phase 9 (FUTURE FOLLOW-UP) — optimization not validation
 
 To make v6 production-ready for prefill:
 
