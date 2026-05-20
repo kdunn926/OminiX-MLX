@@ -966,6 +966,279 @@ impl Experts {
         output.as_dtype(hidden_dtype)
     }
 
+    /// Expert-major MoE dispatch — phase 9c (#35): v7 = v6 + skinny path.
+    ///
+    /// Same overall pipeline as v6 (GPU bucketing → packed layout →
+    /// batched kernel → scatter back) but only "fat" buckets
+    /// (n_e ≥ EXPERT_MAJOR_SKINNY_THRESHOLD, default 32) go through
+    /// the kernel + padding. "Skinny" buckets (n_e < threshold) skip
+    /// the padding waste by going through per-expert MLX matmul like
+    /// `forward_topk_expert_major` (v1). This matters most on chunked
+    /// prefill where chunks have mean bucket ≪ 32 — v6's padding-to-32
+    /// would multiply FLOPs by `32/n_e` per skinny bucket.
+    ///
+    /// Gated at `GEMMA4_EXPERT_MAJOR_MOE=7`.
+    pub fn forward_topk_expert_major_v7(
+        &mut self,
+        hidden_states: &Array,
+        top_k_index: &Array,
+        top_k_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let n = hidden_states.shape()[0];
+        let h = hidden_states.shape()[1];
+        let i = self.intermediate_size;
+        let k_top = top_k_index.shape()[1];
+
+        if h % 32 != 0 || (2 * i) % 32 != 0 || i % 8 != 0 {
+            return Err(Exception::from(
+                "forward_topk_expert_major_v7: shape alignment not met",
+            ));
+        }
+
+        let num_experts = self.gate_up_proj.as_ref().shape()[0];
+        let n_k_total = n * k_top;
+        let dynamic_threshold = num_experts;
+        let min_tokens: i32 = std::env::var("EXPERT_MAJOR_MIN_PROMPT_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let skip_v6 = n == 1
+            || (min_tokens > 0 && n < min_tokens)
+            || (min_tokens == 0 && n_k_total < dynamic_threshold);
+        if skip_v6 {
+            return self.forward_topk(hidden_states, top_k_index, top_k_weights);
+        }
+
+        let skinny_threshold: i32 = std::env::var("EXPERT_MAJOR_SKINNY_THRESHOLD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32);
+
+        // Phase 8 lazy cache.
+        if self.gate_up_proj_kt.is_none() {
+            let gu_kt = self
+                .gate_up_proj
+                .as_ref()
+                .as_dtype(Dtype::Bfloat16)?
+                .transpose_axes(&[0, 2, 1])?;
+            eval([&gu_kt])?;
+            self.gate_up_proj_kt = Some(gu_kt);
+        }
+        if self.down_proj_kt.is_none() {
+            let dp_kt = self
+                .down_proj
+                .as_ref()
+                .as_dtype(Dtype::Bfloat16)?
+                .transpose_axes(&[0, 2, 1])?;
+            eval([&dp_kt])?;
+            self.down_proj_kt = Some(dp_kt);
+        }
+
+        // GPU bucketing.
+        let flat_experts = top_k_index.reshape(&[-1])?.as_dtype(Dtype::Int32)?;
+        let sort_order = argsort_axis(&flat_experts, -1)?.as_dtype(Dtype::Int32)?;
+        let sorted_experts = take_axis(&flat_experts, &sort_order, 0)?;
+        let k_arr = array!(k_top);
+        let sorted_token_indices = sort_order.divide(&k_arr)?.as_dtype(Dtype::Int32)?;
+        let sorted_k_slots = sort_order.remainder(&k_arr)?.as_dtype(Dtype::Int32)?;
+
+        // Counts on GPU, single small sync.
+        let experts_range = ops::arange::<_, i32>(0, num_experts, 1)?
+            .as_dtype(Dtype::Int32)?
+            .reshape(&[1, num_experts])?;
+        let se_col = sorted_experts.reshape(&[n_k_total, 1])?;
+        let counts_arr = se_col
+            .eq(&experts_range)?
+            .as_dtype(Dtype::Int32)?
+            .sum_axis(0, false)?
+            .as_dtype(Dtype::Int32)?;
+        eval([&counts_arr])?;
+        let counts: Vec<i32> = counts_arr.as_slice::<i32>().to_vec();
+        let mut real_starts: Vec<i32> = Vec::with_capacity(num_experts as usize);
+        let mut acc2 = 0;
+        for &c in &counts {
+            real_starts.push(acc2);
+            acc2 += c;
+        }
+
+        // ── Split: fat experts → packed kernel path, skinny → MLX matmul path. ──
+        let mut fat: Vec<usize> = Vec::new();
+        let mut skinny: Vec<usize> = Vec::new();
+        for e in 0..num_experts as usize {
+            if counts[e] == 0 {
+                continue;
+            }
+            if counts[e] >= skinny_threshold {
+                fat.push(e);
+            } else {
+                skinny.push(e);
+            }
+        }
+
+        let h_bf16 = hidden_states.as_dtype(Dtype::Bfloat16)?;
+        let w_flat = top_k_weights.as_dtype(Dtype::Float32)?.reshape(&[-1])?;
+        let mut output = ops::zeros::<f32>(&[n, h])?;
+
+        // ── Fat path (only if any fat experts) ──
+        if !fat.is_empty() {
+            // Compute padded_starts for FAT experts only.
+            let mut fat_padded_counts: Vec<i32> = Vec::with_capacity(fat.len());
+            let mut fat_padded_starts: Vec<i32> = Vec::with_capacity(fat.len());
+            let mut acc = 0;
+            for &e in &fat {
+                let pc = ((counts[e] + 31) / 32) * 32;
+                fat_padded_starts.push(acc);
+                fat_padded_counts.push(pc);
+                acc += pc;
+            }
+            let m_total_padded = acc;
+
+            // For each sorted position p, IF its expert is fat, compute
+            // target_in_packed = fat_padded_starts[fat_idx(e)] + (p - real_starts[e]).
+            // We need a per-position fat-bucket-position. Easier: do it on CPU
+            // since fat list is small (≤ num_experts).
+            //
+            // Build a per-expert vector: fat_packed_starts_full[E] where
+            // fat_packed_starts_full[e] = fat_padded_starts[fat_idx[e]] if e ∈ fat,
+            // else -1 (sentinel meaning "skip in packed scatter").
+            let mut fat_packed_start_per_expert: Vec<i32> = vec![-1; num_experts as usize];
+            for (fi, &e) in fat.iter().enumerate() {
+                fat_packed_start_per_expert[e] = fat_padded_starts[fi];
+            }
+
+            let fat_start_per_e_arr =
+                Array::from_slice(&fat_packed_start_per_expert, &[num_experts]);
+            let real_starts_arr = Array::from_slice(&real_starts, &[num_experts]);
+            let p_fat_start = take_axis(&fat_start_per_e_arr, &sorted_experts, 0)?;
+            let p_real = take_axis(&real_starts_arr, &sorted_experts, 0)?;
+            let pos_in_bucket = ops::arange::<_, i32>(0, n_k_total, 1)?
+                .as_dtype(Dtype::Int32)?
+                .subtract(&p_real)?;
+            let target_in_packed = p_fat_start.add(&pos_in_bucket)?;
+            // Mask: only positions whose expert is fat get scattered.
+            // For skinny positions, p_fat_start was -1, so target_in_packed
+            // is negative. scatter_add_single will fault on negative indices.
+            // Filter via a clipped index + zero updates for masked positions.
+            // Simpler: scatter the positions where mask is true via take_axis
+            // and bool mask.
+            //
+            // Even simpler: skinny positions correspond to target_in_packed < 0.
+            // Set them to 0 (a safe in-range value) and use a multiplier
+            // (mask) on the update so they contribute 0 to packed_x.
+            let is_fat_pos = p_fat_start
+                .ge(&array!(0_i32))?
+                .as_dtype(Dtype::Float32)?; // [n_k_total]
+            let safe_target = ops::maximum(&target_in_packed, &array!(0_i32))?;
+
+            // Gather sorted x and weight.
+            let x_sorted = take_axis(&h_bf16, &sorted_token_indices, 0)?; // [n_k, H]
+            let x_sorted_f32 = x_sorted.as_dtype(Dtype::Float32)?;
+            let masked_x = x_sorted_f32.multiply(&is_fat_pos.reshape(&[n_k_total, 1])?)?;
+            let masked_x_bf = masked_x.as_dtype(Dtype::Bfloat16)?;
+
+            // Build packed_x via scatter_add.
+            let packed_x_init = ops::zeros::<f32>(&[m_total_padded, h])?
+                .as_dtype(Dtype::Bfloat16)?;
+            let updates_x = masked_x_bf.reshape(&[n_k_total, 1, h])?;
+            let packed_x =
+                scatter_add_single(&packed_x_init, &safe_target, &updates_x, 0)?
+                    .as_dtype(Dtype::Bfloat16)?;
+
+            // Build block_expert_id for FAT blocks only.
+            let total_blocks = m_total_padded / 32;
+            let mut block_expert_id_cpu: Vec<i32> = Vec::with_capacity(total_blocks as usize);
+            for b in 0..total_blocks {
+                let row = b * 32;
+                let mut found = -1_i32;
+                for (fi, &e) in fat.iter().enumerate() {
+                    let s = fat_padded_starts[fi];
+                    if s <= row && row < s + fat_padded_counts[fi] {
+                        found = e as i32;
+                        break;
+                    }
+                }
+                block_expert_id_cpu.push(found);
+            }
+            let block_expert_id = Array::from_slice(&block_expert_id_cpu, &[total_blocks]);
+
+            // Run gate_up kernel.
+            let gu_t = self.gate_up_proj_kt.as_ref().unwrap();
+            let y_packed = moe_dense_matmul_batched(
+                &packed_x,
+                gu_t,
+                &block_expert_id,
+                h,
+                2 * i,
+            )?;
+            let split = y_packed.split(2, -1)?;
+            let gate = self.activation.apply(&split[0])?;
+            let z_fp32 = gate.multiply(&split[1])?;
+            let z_packed = z_fp32.as_dtype(Dtype::Bfloat16)?;
+
+            // Run down kernel.
+            let dp_t = self.down_proj_kt.as_ref().unwrap();
+            let out_packed = moe_dense_matmul_batched(
+                &z_packed,
+                dp_t,
+                &block_expert_id,
+                i,
+                h,
+            )?;
+
+            // Gather n_k real rows back; mask out skinny positions; multiply
+            // by routing weight; scatter into per-token output.
+            let flat_routing_idx = sorted_token_indices.multiply(&k_arr)?.add(&sorted_k_slots)?;
+            let w_sorted = take_axis(&w_flat, &flat_routing_idx, 0)?;
+
+            let out_real = take_axis(&out_packed, &safe_target, 0)?;
+            let mask_col = is_fat_pos.reshape(&[n_k_total, 1])?;
+            let weighted = out_real
+                .multiply(&mask_col)?
+                .multiply(&w_sorted.reshape(&[n_k_total, 1])?)?;
+            let updates_out = weighted.reshape(&[n_k_total, 1, h])?;
+            output = scatter_add_single(&output, &sorted_token_indices, &updates_out, 0)?;
+        }
+
+        // ── Skinny path: per-skinny-expert MLX matmul. ──
+        if !skinny.is_empty() {
+            let h_f32 = hidden_states.as_dtype(Dtype::Float32)?;
+            let gu_f32 = self.gate_up_proj.as_ref().as_dtype(Dtype::Float32)?;
+            let dp_f32 = self.down_proj.as_ref().as_dtype(Dtype::Float32)?;
+            let k_top_arr = array!(k_top);
+
+            for &e in &skinny {
+                let n_e = counts[e];
+                let start = real_starts[e];
+                let tok_idx_e = sorted_token_indices.index((start..start + n_e,));
+                let k_slot_e = sorted_k_slots.index((start..start + n_e,));
+
+                let x_e = take_axis(&h_f32, &tok_idx_e, 0)?; // [N_e, H]
+
+                let e_i32 = e as i32;
+                let e_arr = Array::from_slice(&[e_i32], &[1]);
+                let w_gu = take_axis(&gu_f32, &e_arr, 0)?.reshape(&[2 * i, h])?;
+                let w_gu_t = w_gu.transpose_axes(&[1, 0])?; // [H, 2I]
+                let y_e = x_e.matmul(&w_gu_t)?;
+
+                let split = y_e.split(2, -1)?;
+                let gate = self.activation.apply(&split[0])?;
+                let z_e = gate.multiply(&split[1])?;
+
+                let w_d = take_axis(&dp_f32, &e_arr, 0)?.reshape(&[h, i])?;
+                let w_d_t = w_d.transpose_axes(&[1, 0])?;
+                let out_e = z_e.matmul(&w_d_t)?;
+
+                let flat_idx = tok_idx_e.multiply(&k_top_arr)?.add(&k_slot_e)?;
+                let w_flat_idx = take_axis(&w_flat, &flat_idx, 0)?;
+                let weighted = out_e.multiply(&w_flat_idx.reshape(&[n_e, 1])?)?;
+                let updates = weighted.reshape(&[n_e, 1, h])?;
+                output = scatter_add_single(&output, &tok_idx_e, &updates, 0)?;
+            }
+        }
+
+        output.as_dtype(hidden_states.dtype())
+    }
+
     /// Expert-major MoE dispatch — phase 7 (#35).
     ///
     /// Single batched kernel launch covers every expert: GPU bucketing
@@ -996,17 +1269,31 @@ impl Experts {
         let num_experts = self.gate_up_proj.as_ref().shape()[0];
         let n_k = n * k_top;
 
-        // ── Decode skip-gate: v6 pads each bucket to 32 rows. For n=1
-        // (decode) this means 32× redundant FLOPS per bucket vs the
-        // token-major forward_topk (which does no padding). Threshold
-        // ensures we only engage when there are enough tokens per
-        // expert that the dense matmul amortizes the padding cost.
-        // Tunable via EXPERT_MAJOR_MIN_PROMPT_TOKENS (default 256).
+        // ── Dynamic skip-gate. ──
+        //
+        // For n=1 (true decode) v6 always loses: the 32-row bucket padding
+        // multiplies FLOPs by ~32 per bucket. Always fall through.
+        //
+        // For n>1, v6 wins via weight-bandwidth reuse even when buckets are
+        // smaller than 32 rows — each expert's weight matrix is read once
+        // per kernel launch instead of once per (token, k_slot) pair.
+        // Empirically v6 at chunk=64 (n_k=256, mean bucket=4) is ~10× faster
+        // than forward_topk on hermes 5K.
+        //
+        // Default threshold: `n * k_top >= num_experts` (mean bucket ≥ 1).
+        // For E=64, k=4 this gates v6 on at n=16 — enough for chunked
+        // prefill chunks of any reasonable size. Override with
+        // EXPERT_MAJOR_MIN_PROMPT_TOKENS for manual tuning.
+        let n_k_total = n * k_top;
+        let dynamic_threshold = num_experts;
         let min_tokens: i32 = std::env::var("EXPERT_MAJOR_MIN_PROMPT_TOKENS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(256);
-        if n < min_tokens {
+            .unwrap_or(0);
+        let skip_v6 = n == 1
+            || (min_tokens > 0 && n < min_tokens)
+            || (min_tokens == 0 && n_k_total < dynamic_threshold);
+        if skip_v6 {
             return self.forward_topk(hidden_states, top_k_index, top_k_weights);
         }
 
@@ -1775,6 +2062,7 @@ where
                 "4" => experts.forward_topk_expert_major_v4(&moe_in, &top_k_index, &top_k_weights)?,
                 "5" => experts.forward_topk_expert_major_v5(&moe_in, &top_k_index, &top_k_weights)?,
                 "6" => experts.forward_topk_expert_major_v6(&moe_in, &top_k_index, &top_k_weights)?,
+                "7" => experts.forward_topk_expert_major_v7(&moe_in, &top_k_index, &top_k_weights)?,
                 _ => experts.forward_topk(&moe_in, &top_k_index, &top_k_weights)?,
             };
             let moe_out = moe_out.reshape(&residual.shape())?;
