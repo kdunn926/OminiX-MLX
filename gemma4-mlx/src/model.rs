@@ -1124,6 +1124,7 @@ impl Experts {
 
         // ── Cached [E, H, 2I] view, materialized once at first call. ──
         let gu_t = self.gate_up_proj_kt.as_ref().unwrap();
+        // Kernel returns fp32 (Phase 9 mixed-precision: bf16 inputs, fp32 acc+out).
         let y_packed = moe_dense_matmul_batched(
             &packed_x,
             gu_t,
@@ -1132,11 +1133,11 @@ impl Experts {
             2 * i,
         )?;
 
-        // ── SwiGLU on the packed layout ──
+        // ── SwiGLU on the packed layout (fp32) ──
         let split = y_packed.split(2, -1)?;
         let gate = self.activation.apply(&split[0])?;
-        let z_packed = gate.multiply(&split[1])?
-            .as_dtype(Dtype::Bfloat16)?; // [M_total_padded, I]
+        let z_fp32 = gate.multiply(&split[1])?; // [M_total_padded, I] fp32
+        let z_packed = z_fp32.as_dtype(Dtype::Bfloat16)?;
 
         // ── Cached [E, I, H] view. ──
         let dp_t = self.down_proj_kt.as_ref().unwrap();
@@ -1153,9 +1154,8 @@ impl Experts {
         let flat_routing_idx = sorted_token_indices.multiply(&k_arr)?.add(&sorted_k_slots)?;
         let w_sorted = take_axis(&w_flat, &flat_routing_idx, 0)?; // [n_k]
 
-        // ── Gather the n_k real rows back from packed layout (drop padding) ──
-        let out_real = take_axis(&out_packed, &target_in_packed, 0)?
-            .as_dtype(Dtype::Float32)?; // [n_k, H]
+        // ── Gather the n_k real rows back from packed layout (already fp32). ──
+        let out_real = take_axis(&out_packed, &target_in_packed, 0)?; // [n_k, H] fp32
         let weighted = out_real.multiply(&w_sorted.reshape(&[n_k, 1])?)?;
 
         // ── Scatter into per-token output ──

@@ -3903,10 +3903,16 @@ const MOE_DENSE_MATMUL_BATCHED_KERNEL: &str = r#"
     if (e < 0) return;
     uint w_off = uint(e) * uint(N_) * uint(K_);
 
-    simdgroup_matrix<bfloat, 8, 8> acc[4][4];
+    // Phase 9 (#35): fp32 accumulators, bf16 A/B tiles. Apple Metal
+    // supports mixed-precision simdgroup_multiply_accumulate: the acc
+    // type determines accumulation precision. Output buffer is fp32; the
+    // caller narrows to bf16 (or fp16) after the kernel returns. This
+    // eliminates the K=5376 accumulator-rounding divergence we observed
+    // in phase 7+8.
+    simdgroup_matrix<float, 8, 8> acc[4][4];
     for (uint i = 0; i < 4; i++)
         for (uint j = 0; j < 4; j++)
-            acc[i][j] = simdgroup_matrix<bfloat, 8, 8>(bfloat(0.0));
+            acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f);
 
     simdgroup_matrix<bfloat, 8, 8> a_tile[4];
     simdgroup_matrix<bfloat, 8, 8> b_tile[4];
@@ -3929,6 +3935,7 @@ const MOE_DENSE_MATMUL_BATCHED_KERNEL: &str = r#"
         }
     }
 
+    // Store fp32 acc tiles to fp32 output buffer; caller narrows.
     for (uint i = 0; i < 4; i++) {
         for (uint j = 0; j < 4; j++) {
             uint r = row_base + i * 8u;
@@ -4053,9 +4060,9 @@ pub fn moe_dense_matmul_batched(
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1);
 
         let out_shape: [i32; 2] = [m_total_padded, n];
-        let bf16_dtype: u32 = mlx_rs::Dtype::Bfloat16.into();
+        let f32_dtype: u32 = mlx_rs::Dtype::Float32.into();
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
-            config, out_shape.as_ptr(), out_shape.len(), bf16_dtype,
+            config, out_shape.as_ptr(), out_shape.len(), f32_dtype,
         );
 
         let inputs = mlx_sys::mlx_vector_array_new();
