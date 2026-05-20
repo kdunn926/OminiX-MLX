@@ -221,6 +221,73 @@ Option 2 is cheaper and more elegant. Option 1 is the safe fallback.
 Estimated time: ½ day for option 2 (rewrite kernel + parity test).
 If it fails, fall back to option 1 (~½ day for the loader changes).
 
+### Phase 8 — LANDED (`5c33a9d`), revealing deeper architectural issues
+
+Option 2 (`e369569`) was attempted first and failed — the transpose-flag
+on simdgroup_load produces the same max_abs=0.5 broken output we saw
+in the #27 experiment. Confirmed unreliable.
+
+Option 1 (`5c33a9d`) landed: lazy-cached `[E, K, N]` views in
+`gate_up_proj_kt` / `down_proj_kt` fields on `Experts`. Materialized
+once on first v6 call; subsequent calls read the cached views with
+no transpose overhead. Memory cost: ~22 GB additional bf16 storage.
+
+Bench (64 tokens, prompt 'Hi'):
+| variant                                    | tok/s | output |
+|--------------------------------------------|-------|--------|
+| default forward_topk                       | 7.78  | HiHi…  |
+| v6 (phase 7 batched) + phase 8 cache       | 0.95  | 1111…  |
+| v6 + cache + skip-gate (commit `5c33a9d`)  | 7.78  | HiHi…  |
+
+The cache fixed the per-call transpose materialization but revealed
+two deeper issues v6 still hits:
+
+1. **Decode is the wrong workload.** With batch=1 (n=1 token, k=4
+   experts), v6's 32-row bucket padding produces 32× redundant FLOPS
+   per bucket vs forward_topk's per-token dispatch. Dense expert-major
+   matmul only wins when `tokens_per_expert >> 1` — that's prefill,
+   not decode.
+
+2. **bf16 accumulator divergence.** Kernel accumulates in bf16
+   (Metal blocks fp32→bf16 simdgroup_matrix narrowing). For K=H=5376
+   reductions, bf16's 7 mantissa bits accumulate enough rounding error
+   to flip argmax decisions. v6 produced `1111…` while baseline
+   produced `HiHi…` — both are valid model continuations for slightly
+   different logits, but they prove the precision floor is too high.
+
+`5c33a9d` adds `EXPERT_MAJOR_MIN_PROMPT_TOKENS` (default 256) — when
+`n < min_tokens`, v6 falls through to `forward_topk`. Decode bench
+matches default tok/s + output. Prefill path remains gated; actual
+benefit requires a prefill-dominated workload to measure.
+
+### Phase 9 (FUTURE) — fp32 accumulator workaround + prefill bench
+
+To make v6 production-ready for prefill:
+
+1. **fp32 accumulator workaround.** Two options:
+   (a) Store fp32 acc tiles to a `[M_total_padded, N]` fp32 output
+       buffer; do a separate fp32→bf16 narrowing pass on the result.
+       Doubles output bandwidth but preserves precision.
+   (b) Cast acc tiles through threadgroup memory: `simdgroup_store(acc,
+       tg_buf, stride)` then per-thread fp32→bf16 conversion + `simdgroup_load`
+       of the bf16 view. ~2× ops but stays in registers.
+
+2. **Prefill-targeted bench.** `chat_gemma4` with hermes 5K prompt at
+   `--max-tokens 1` measures pure prefill. Compare default vs v6 at
+   that workload. The phase 7 launch-reduction + phase 8 cache should
+   show 1.5-2× prefill speedup if the architecture is sound.
+
+3. **Fuse the packed-x scatter into the sorted gather.** Currently:
+   sorted_x = take(h_bf16, sorted_token_indices); then scatter into
+   packed_x at target_in_packed. The take produces a contiguous
+   [n_k, H] intermediate that we immediately re-scatter — wasteful.
+   Direct gather into the packed layout would halve the scatter
+   bandwidth.
+
+Estimated: ½ day for prefill bench (1), ½ day for fp32 acc workaround
+(2), ½ day for scatter fusion (3). Total ~1.5 days to validate the
+phase 7+8 architecture actually delivers on prefill.
+
 **Cost**: ~300 LOC of GPU bucketing + new kernel + dispatch wrapper.
 Same complexity tier as the original phase 3 kernel implementation.
 
