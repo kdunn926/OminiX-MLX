@@ -2054,7 +2054,19 @@ where
                 .experts
                 .as_mut()
                 .expect("MoE layer missing experts");
-            let mode = std::env::var("GEMMA4_EXPERT_MAJOR_MOE").unwrap_or_default();
+            // GEMMA4_EXPERT_MAJOR_MOE selects MoE dispatch path. Default
+            // (unset) is "6" — v6 batched single-launch kernel with phase 8
+            // lazy weight cache. Phase 9 bench on hermes 5K: ~31× TTFT vs
+            // forward_topk (with GEMMA4_PREFILL_CHUNK=256). v6 internally
+            // skip-gates to forward_topk at n=1 (decode) and when
+            // n_k_total < num_experts (very small chunks), so there's no
+            // decode regression.
+            //
+            // Set "0" to force the legacy token-major forward_topk path
+            // (use if memory pressure is the bottleneck — v6 caches an
+            // additional ~22 GB of pre-transposed bf16 weights).
+            let mode = std::env::var("GEMMA4_EXPERT_MAJOR_MOE")
+                .unwrap_or_else(|_| "6".to_string());
             let moe_out = match mode.as_str() {
                 "1" => experts.forward_topk_expert_major(&moe_in, &top_k_index, &top_k_weights)?,
                 "2" => experts.forward_topk_expert_major_v2(&moe_in, &top_k_index, &top_k_weights)?,
@@ -3995,19 +4007,28 @@ where
                 // updates the KV cache, so attention can look back at all
                 // previously processed tokens.
                 //
-                // Chunk size is env-tunable via `GEMMA4_PREFILL_CHUNK`. The
-                // historical default of 32 forces ~162 GPU dispatches on a
-                // 5K prompt and is dominated by launch overhead, not by
-                // useful compute. Modern Apple GPUs handle far larger
-                // chunks comfortably; default raised to 512.
-                // Bench (hermes 5183 tok, Gemma4-26B-A4B Q4): chunk=32 →
-                // 720s TTFT, chunk=64 → 604s (-16%), chunk=128 → 1905s
-                // (MoE expert-gather memory pressure / thrashing, peak
-                // GPU 73→91 GB). Sweet spot is 64.
+                // Chunk size is env-tunable via `GEMMA4_PREFILL_CHUNK`. Default
+                // raised to 256 in conjunction with `GEMMA4_EXPERT_MAJOR_MOE=6`
+                // being on by default (see Experts::forward_topk dispatch).
+                //
+                // Historical bench (hermes 5183 tok, default forward_topk):
+                //   chunk=32  → 720s TTFT
+                //   chunk=64  → 604s TTFT
+                //   chunk=128 → 1905s TTFT (MoE expert-gather memory thrashing,
+                //                           peak GPU 73→91 GB on token-major path)
+                //
+                // Bench with `GEMMA4_EXPERT_MAJOR_MOE=6` (v6 batched kernel,
+                // no per-token weight gather → no memory thrashing):
+                //   chunk=64  → 47s TTFT
+                //   chunk=128 → 27s TTFT
+                //   chunk=256 → 17s TTFT  ⭐ new default
+                //
+                // For non-MoE-major paths (forward_topk), 256 may regress;
+                // explicitly set GEMMA4_PREFILL_CHUNK=64 in that case.
                 let prefill_chunk: i32 = std::env::var("GEMMA4_PREFILL_CHUNK")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(64);
+                    .unwrap_or(256);
                 let PREFILL_CHUNK = prefill_chunk;
                 let seq_len = prompt_token.shape()[1];
 
