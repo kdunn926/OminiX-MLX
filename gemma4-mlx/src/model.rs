@@ -726,6 +726,29 @@ impl Router {
             .proj
             .forward(&hidden_states)?
             .as_dtype(Dtype::Float32)?;
+
+        // T2 router fusion (kernel-fusion-plan.md). Replaces 8 separate
+        // MLX ops (softmax + negate + argpartition + take_along + sum +
+        // divide + take_axis + multiply) with a single Metal kernel.
+        // Opt-in via GEMMA4_FUSED_ROUTER=1. Default off until benched in
+        // the full forward path.
+        if std::env::var("GEMMA4_FUSED_ROUTER")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            let pes_f32 = (&*self.per_expert_scale).as_dtype(Dtype::Float32)?;
+            let n_experts = expert_scores.shape()[1];
+            let (top_k_index, top_k_weights) = mlx_rs_core::metal_kernels::fused_router_topk(
+                &expert_scores,
+                &pes_f32,
+                self.top_k_experts,
+                n_experts,
+            )?;
+            // router_probabilities is otherwise unused by callers; return
+            // a placeholder. Keeps the (Array, Array, Array) tuple shape.
+            return Ok((expert_scores, top_k_weights, top_k_index));
+        }
+
         let router_probabilities = ops::softmax_axis(&expert_scores, -1, Some(true))?;
 
         let neg_scores = router_probabilities.negative()?;

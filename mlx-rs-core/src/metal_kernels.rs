@@ -4091,11 +4091,312 @@ pub fn moe_dense_matmul_batched(
     }
 }
 
+// ============================================================================
+// Fused router top-k selection + normalize + per-expert-scale (T2).
+//
+// Collapses the post-matmul tail of `gemma4-mlx/src/model.rs:Router::forward`:
+//   softmax → negate → argpartition → take_along → sum → divide → take →
+//   multiply  (8 separate MLX op launches)
+// into ONE Metal kernel that takes raw scores `[n, E]` and emits both
+// `top_k_index [n, K]` and `top_k_weights [n, K]` directly.
+//
+// Per-token routing math: each threadgroup handles one token row.
+// Threads in the group cooperate on the softmax (max + exp + sum
+// reductions across E experts). Top-K selection is serial on thread 0
+// using an insertion-sort over E entries (E=128 or 256, K=8 — ~2K ops
+// max per row, trivial).
+//
+// At Gemma4-26B-A4B (E=128, K=8, 30 MoE layers): saves 7 launches per
+// layer × 30 layers ≈ 210 launches per decoded token = ~8 ms at the
+// observed ~37 µs/launch overhead.
+// ============================================================================
+const FUSED_ROUTER_TOPK_KERNEL: &str = r#"
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint group_size = threads_per_threadgroup.x;
+
+    device const float *row_scores = scores + row * uint(E);
+
+    threadgroup float probs[E];
+    threadgroup float red_buf[256];
+
+    // ── 1. softmax: max reduction across E ──
+    float local_max = -INFINITY;
+    for (uint e = tid; e < uint(E); e += group_size) {
+        local_max = max(local_max, row_scores[e]);
+    }
+    red_buf[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) red_buf[tid] = max(red_buf[tid], red_buf[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = red_buf[0];
+
+    // ── 2. exp(x - max), store in shared probs ──
+    for (uint e = tid; e < uint(E); e += group_size) {
+        probs[e] = exp(row_scores[e] - row_max);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── 3. sum reduction ──
+    float local_sum = 0.0f;
+    for (uint e = tid; e < uint(E); e += group_size) {
+        local_sum += probs[e];
+    }
+    red_buf[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) red_buf[tid] += red_buf[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_sum = red_buf[0];
+
+    // ── 4. normalize: probs[e] /= sum ──
+    for (uint e = tid; e < uint(E); e += group_size) {
+        probs[e] = probs[e] / row_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── 5. top-K selection (serial on thread 0; K small, E small) ──
+    if (tid == 0) {
+        // top_w / top_i held in ascending position order (largest first).
+        float top_w[K];
+        int   top_i[K];
+        for (uint k = 0; k < uint(K); k++) {
+            top_w[k] = -INFINITY;
+            top_i[k] = -1;
+        }
+        for (uint e = 0; e < uint(E); e++) {
+            float v = probs[e];
+            if (v > top_w[uint(K) - 1]) {
+                int pos = int(K) - 1;
+                while (pos > 0 && top_w[pos - 1] < v) {
+                    top_w[pos] = top_w[pos - 1];
+                    top_i[pos] = top_i[pos - 1];
+                    pos--;
+                }
+                top_w[pos] = v;
+                top_i[pos] = int(e);
+            }
+        }
+        // Normalize top-K weights + multiply by per_expert_scale.
+        float topk_sum = 0.0f;
+        for (uint k = 0; k < uint(K); k++) topk_sum += top_w[k];
+        device int *row_idx = top_k_index + row * uint(K);
+        device float *row_w = top_k_weights + row * uint(K);
+        for (uint k = 0; k < uint(K); k++) {
+            float w = top_w[k] / topk_sum;
+            w *= per_expert_scale[top_i[k]];
+            row_w[k] = w;
+            row_idx[k] = top_i[k];
+        }
+    }
+"#;
+
+static FUSED_ROUTER_TOPK_KERNEL_HANDLE: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_fused_router_topk_kernel() -> MetalKernel {
+    unsafe {
+        let scores = CString::new("scores").unwrap();
+        let pes = CString::new("per_expert_scale").unwrap();
+        let out_idx = CString::new("top_k_index").unwrap();
+        let out_w = CString::new("top_k_weights").unwrap();
+
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, scores.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, pes.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, out_idx.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(outputs, out_w.as_ptr());
+
+        let source = CString::new(FUSED_ROUTER_TOPK_KERNEL).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("fused_router_topk").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Fused router post-matmul tail.
+///
+/// `scores`: `[n, E]` fp32 — raw expert scores (post-projection, pre-softmax).
+/// `per_expert_scale`: `[E]` fp32 — multiplier applied to the normalized
+/// top-K weights before output.
+///
+/// Returns `(top_k_index, top_k_weights)`:
+///   - `top_k_index`: `[n, K]` i32 — sorted descending by softmax probability.
+///   - `top_k_weights`: `[n, K]` fp32 — softmax probabilities renormalized
+///     over the top-K then scaled by `per_expert_scale[top_k_index]`.
+///
+/// Replaces 8 separate MLX ops (softmax + negate + argpartition + take_along +
+/// sum + divide + take_axis + multiply) with a single kernel launch.
+pub fn fused_router_topk(
+    scores: &Array,
+    per_expert_scale: &Array,
+    k: i32,
+    e: i32,
+) -> Result<(Array, Array), Exception> {
+    if k <= 0 || e <= 0 {
+        return Err(Exception::custom(format!(
+            "fused_router_topk: K and E must be positive; got K={k} E={e}"
+        )));
+    }
+    if k > e {
+        return Err(Exception::custom(format!(
+            "fused_router_topk: K ({k}) cannot exceed E ({e})"
+        )));
+    }
+    let s = scores.shape();
+    if s.len() != 2 || s[1] != e {
+        return Err(Exception::custom(format!(
+            "fused_router_topk: scores must be [n, E={e}]; got {s:?}"
+        )));
+    }
+    let n = s[0];
+    let pes_shape = per_expert_scale.shape();
+    if pes_shape.len() != 1 || pes_shape[0] != e {
+        return Err(Exception::custom(format!(
+            "fused_router_topk: per_expert_scale must be [E={e}]; got {pes_shape:?}"
+        )));
+    }
+    if scores.dtype() != mlx_rs::Dtype::Float32
+        || per_expert_scale.dtype() != mlx_rs::Dtype::Float32
+    {
+        return Err(Exception::custom(format!(
+            "fused_router_topk: scores and per_expert_scale must be fp32; got {:?} / {:?}",
+            scores.dtype(),
+            per_expert_scale.dtype()
+        )));
+    }
+
+    let kernel = FUSED_ROUTER_TOPK_KERNEL_HANDLE.get_or_init(create_fused_router_topk_kernel);
+
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+        for (name, value) in [("K", k), ("E", e)] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        // One threadgroup per row; 64 threads per group (one simdgroup
+        // pair, enough for the reductions across E≤256).
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, n * 64, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+
+        let idx_shape: [i32; 2] = [n, k];
+        let w_shape: [i32; 2] = [n, k];
+        let i32_dtype: u32 = mlx_rs::Dtype::Int32.into();
+        let f32_dtype: u32 = mlx_rs::Dtype::Float32.into();
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, idx_shape.as_ptr(), idx_shape.len(), i32_dtype,
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config, w_shape.as_ptr(), w_shape.len(), f32_dtype,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, scores.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, per_expert_scale.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("fused_router_topk kernel failed"));
+        }
+        let mut idx = mlx_sys::mlx_array_new();
+        let mut w = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut idx, outputs, 0);
+        mlx_sys::mlx_vector_array_get(&mut w, outputs, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+        Ok((Array::from_ptr(idx), Array::from_ptr(w)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_rs::ops::indexing::IndexOp;
     use mlx_rs::Array;
+
+    /// Router-tail fusion parity vs MLX op chain on E=128, K=8.
+    #[test]
+    fn fused_router_topk_matches_reference() {
+        let n = 4_i32;
+        let e = 128_i32;
+        let k = 8_i32;
+        let scores_data: Vec<f32> = (0..n * e).map(|i| ((i as f32) * 0.013).sin()).collect();
+        let pes_data: Vec<f32> = (0..e).map(|i| 1.0 + 0.01 * (i as f32)).collect();
+        let scores = Array::from_slice(&scores_data, &[n, e]);
+        let pes = Array::from_slice(&pes_data, &[e]);
+
+        // Reference: replicate Router::forward's tail in MLX ops.
+        let probs = mlx_rs::ops::softmax_axis(&scores, -1, Some(true)).unwrap();
+        let neg = probs.negative().unwrap();
+        let parts = mlx_rs::ops::argpartition_axis(&neg, k - 1, -1).unwrap();
+        let top_idx_ref = parts.index((.., ..k)).as_dtype(mlx_rs::Dtype::Int32).unwrap();
+        let top_w_ref = mlx_rs::ops::indexing::take_along_axis(&probs, &top_idx_ref, -1).unwrap();
+        let denom = top_w_ref.sum_axis(-1, true).unwrap();
+        let top_w_ref = top_w_ref.divide(&denom).unwrap();
+        let pes_taken = mlx_rs::ops::indexing::take_axis(&pes, &top_idx_ref, 0).unwrap();
+        let top_w_ref = top_w_ref.multiply(&pes_taken).unwrap();
+        mlx_rs::transforms::eval([&top_idx_ref, &top_w_ref]).unwrap();
+
+        // Kernel.
+        let (top_idx, top_w) = fused_router_topk(&scores, &pes, k, e).unwrap();
+        mlx_rs::transforms::eval([&top_idx, &top_w]).unwrap();
+
+        // Compare. argpartition order can differ within ties; check that
+        // the SET of selected experts matches and the weights match
+        // per-set elementwise after sorting both by index.
+        let ref_idx = top_idx_ref.as_slice::<i32>();
+        let ref_w = top_w_ref.as_slice::<f32>();
+        let our_idx = top_idx.as_slice::<i32>();
+        let our_w = top_w.as_slice::<f32>();
+
+        for row in 0..n as usize {
+            // Pair ref (idx, w) and our (idx, w), sort by idx, compare.
+            let mut ref_pairs: Vec<(i32, f32)> = (0..k as usize)
+                .map(|j| (ref_idx[row * k as usize + j], ref_w[row * k as usize + j]))
+                .collect();
+            let mut our_pairs: Vec<(i32, f32)> = (0..k as usize)
+                .map(|j| (our_idx[row * k as usize + j], our_w[row * k as usize + j]))
+                .collect();
+            ref_pairs.sort_by_key(|p| p.0);
+            our_pairs.sort_by_key(|p| p.0);
+
+            for ((ri, rw), (qi, qw)) in ref_pairs.iter().zip(our_pairs.iter()) {
+                assert_eq!(
+                    ri, qi,
+                    "row {row}: index mismatch ref={ri} kernel={qi}"
+                );
+                let diff = (rw - qw).abs();
+                assert!(
+                    diff < 1e-4,
+                    "row {row} idx {ri}: weight diff {diff} (ref={rw} kernel={qw})"
+                );
+            }
+        }
+    }
 
     /// Batched kernel parity: 2 experts × 32 rows × (K=64, N=128).
     #[test]
