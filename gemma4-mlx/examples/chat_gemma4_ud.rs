@@ -17,6 +17,7 @@ use mlx_rs::{
     ops::indexing::{IndexOp, NewAxis},
     Array,
 };
+use mlx_rs_core::cache::KVCache as CoreKVCache;
 
 fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = env::args().collect();
@@ -33,10 +34,42 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let tokenizer = load_tokenizer(&model_dir)?;
 
     let encoding = tokenizer.encode(prompt, true)?;
-    let prompt_tokens = Array::from(encoding.get_ids()).index(NewAxis);
+    let prompt_ids: Vec<i32> = encoding.get_ids().iter().map(|&i| i as i32).collect();
 
-    let mut cache = Vec::<KVCache>::new();
-    let generator = Generate::new(&mut model, &mut cache, 0.0, &prompt_tokens);
+    // ── Prefix cache (#31): if GEMMA4_PROMPT_CACHE_DIR is set, try to
+    // reuse a previously-saved KV state for the longest matching prefix
+    // of this prompt. Each subsequent tool-use turn in a session
+    // re-prefills only the new suffix instead of the full 5-12K-token
+    // history. Saves ~5-10s of TTFT per turn on hermes-class workloads.
+    // ──
+    let cache_dir = std::env::var("GEMMA4_PROMPT_CACHE_DIR").ok();
+    let (mut cache, prefix_skipped, suffix_arr) = if let Some(ref d) = cache_dir {
+        match CoreKVCache::try_load_kv_caches(&prompt_ids, d) {
+            Ok(Some((caches, n_cached))) => {
+                eprintln!(
+                    "[prompt-cache] HIT — reusing {n_cached} cached tokens, prefilling {} suffix",
+                    prompt_ids.len() - n_cached
+                );
+                let suffix_slice = &prompt_ids[n_cached..];
+                let suffix_arr = Array::from(suffix_slice).index(NewAxis);
+                (caches, n_cached, suffix_arr)
+            }
+            Ok(None) => {
+                eprintln!("[prompt-cache] miss — full prefill, will save");
+                let full = Array::from(prompt_ids.as_slice()).index(NewAxis);
+                (Vec::<KVCache>::new(), 0_usize, full)
+            }
+            Err(e) => {
+                eprintln!("[prompt-cache] load error ({e}) — falling back to full prefill");
+                let full = Array::from(prompt_ids.as_slice()).index(NewAxis);
+                (Vec::<KVCache>::new(), 0_usize, full)
+            }
+        }
+    } else {
+        let full = Array::from(prompt_ids.as_slice()).index(NewAxis);
+        (Vec::<KVCache>::new(), 0_usize, full)
+    };
+    let generator = Generate::new(&mut model, &mut cache, 0.0, &suffix_arr);
 
     let max_tokens: usize = std::env::var("CHAT_MAX_TOKENS")
         .ok()
@@ -60,6 +93,21 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         elapsed,
         emitted as f64 / elapsed.max(1e-6)
     );
+
+    // Save the post-prefill KV cache for reuse on the next turn. Skip
+    // writeback on cache hits to avoid disk churn — the existing
+    // saved cache already covers the prefix that matched.
+    if let Some(d) = cache_dir {
+        if prefix_skipped == 0 {
+            match CoreKVCache::save_kv_caches(&cache, &prompt_ids, &d) {
+                Ok(()) => eprintln!(
+                    "[prompt-cache] saved {} tokens worth of KV state to {d}",
+                    prompt_ids.len()
+                ),
+                Err(e) => eprintln!("[prompt-cache] save error: {e}"),
+            }
+        }
+    }
 
     Ok(())
 }
