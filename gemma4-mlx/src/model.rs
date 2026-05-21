@@ -3055,10 +3055,32 @@ fn make_mq_linear(
             get_weight_optional(weights, &format!("{prefix}.scales")),
             get_weight_optional(weights, &format!("{prefix}.biases")),
         ) {
+            // Derive per-tensor `bits` from weight/scales shapes when the
+            // global config's `bits` doesn't match the actual tensor.
+            // UD-MLX-4bit ships heterogeneous quant: q/k/v/o @ 8-bit,
+            // mlp @ 4-bit, embed @ 6-bit — all sharing group_size=64.
+            // The relation is:
+            //   weight.shape[-1] = in_features / (32 / bits)
+            //   scales.shape[-1] = in_features / group_size
+            // ⇒ bits = (weight.shape[-1] * 32) / (scales.shape[-1] * group_size)
+            let wshape = weight.shape();
+            let sshape = scales.shape();
+            let derived_bits = if wshape.len() >= 2 && sshape.len() >= 2 {
+                let wc = wshape[wshape.len() - 1] as i64;
+                let sc = sshape[sshape.len() - 1] as i64;
+                let gs = q.group_size as i64;
+                if sc > 0 && gs > 0 {
+                    (wc * 32 / (sc * gs)) as i32
+                } else {
+                    q.bits
+                }
+            } else {
+                q.bits
+            };
             let inner = make_linear(weight);
             let mut ql = nn::QuantizedLinear {
                 group_size: q.group_size,
-                bits: q.bits,
+                bits: derived_bits,
                 scales: Param::new(scales),
                 biases: Param::new(biases),
                 inner,
@@ -3176,12 +3198,29 @@ fn make_mq_embedding(
             get_weight_optional(weights, &format!("{prefix}.scales")),
             get_weight_optional(weights, &format!("{prefix}.biases")),
         ) {
+            // Derive per-tensor bits from shapes (same relation as
+            // `make_mq_linear` — supports UD's Q6 embed despite a global
+            // Q4 config).
+            let wshape = weight.shape();
+            let sshape = scales.shape();
+            let derived_bits = if wshape.len() >= 2 && sshape.len() >= 2 {
+                let wc = wshape[wshape.len() - 1] as i64;
+                let sc = sshape[sshape.len() - 1] as i64;
+                let gs = q.group_size as i64;
+                if sc > 0 && gs > 0 {
+                    (wc * 32 / (sc * gs)) as i32
+                } else {
+                    q.bits
+                }
+            } else {
+                q.bits
+            };
             let inner = nn::Embedding {
                 weight: Param::new(weight),
             };
             let mut qe = nn::QuantizedEmbedding {
                 group_size: q.group_size,
-                bits: q.bits,
+                bits: derived_bits,
                 scales: Param::new(scales),
                 biases: Param::new(biases),
                 inner,
@@ -3542,7 +3581,7 @@ pub fn build_model_from_weights(
             activation,
         };
 
-        let (router, experts, post_ff_ln_1, post_ff_ln_2, pre_ff_ln_2) = if args.enable_moe_block {
+        let (router, experts, switch_glu_experts, post_ff_ln_1, post_ff_ln_2, pre_ff_ln_2) = if args.enable_moe_block {
             // Env-tunable MoE top-k. Default = config value. Many MoE
             // papers find top-4 or top-2 captures ~95% of quality at
             // 2-4x throughput. Clamp to [1, top_k_experts] so we never
@@ -3568,25 +3607,90 @@ pub fn build_model_from_weights(
                 norm: UnscaledRmsNorm::new(args.rms_norm_eps),
             };
 
-            let experts = Experts {
-                hidden_size: args.hidden_size,
-                intermediate_size: args.moe_intermediate_size,
-                gate_up_proj: Param::new(get_weight(
-                    &weights,
-                    &format!("{layer_prefix}.experts.gate_up_proj"),
-                )?),
-                down_proj: Param::new(get_weight(
-                    &weights,
-                    &format!("{layer_prefix}.experts.down_proj"),
-                )?),
-                activation,
-                gate_up_proj_kt: None,
-                down_proj_kt: None,
+            // Detect switch_glu vs fused gate_up_proj layout.
+            //
+            // - Canonical mlx-community Gemma4 ships unquantized fused
+            //   `experts.gate_up_proj` + `experts.down_proj`.
+            // - UD-MLX-4bit ships quantized `experts.switch_glu.{gate,
+            //   up, down}_proj.{weight, scales, biases}` triples.
+            //
+            // We branch here. The fused path stays exactly the same as
+            // before; the switch_glu path builds a SwitchGluExperts that
+            // keeps weights packed Q4/Q8 and dispatches via gather_qmm.
+            let switch_glu_present = get_weight_optional(
+                weights,
+                &format!("{layer_prefix}.experts.switch_glu.gate_proj.weight"),
+            )
+            .is_some();
+            let (experts_opt, sgx_opt) = if switch_glu_present {
+                let qg = quant.as_ref().map(|q| q.group_size).unwrap_or(64);
+                let make_qsl = |proj: &str| -> Result<crate::quant_switch::QuantizedSwitchLinear, Error> {
+                    let pfx = format!("{layer_prefix}.experts.switch_glu.{proj}");
+                    let w = get_weight(weights, &format!("{pfx}.weight"))?;
+                    let s = get_weight(weights, &format!("{pfx}.scales"))?;
+                    let b = get_weight(weights, &format!("{pfx}.biases"))?;
+                    // Derive bits from weight/scales shapes (UD has q/k/v/o
+                    // at Q8, mlp at Q4 — all group_size=64).
+                    let wshape = w.shape();
+                    let sshape = s.shape();
+                    let derived_bits = if wshape.len() >= 2 && sshape.len() >= 2 {
+                        let wc = wshape[wshape.len() - 1] as i64;
+                        let sc = sshape[sshape.len() - 1] as i64;
+                        (wc * 32 / (sc * qg as i64)) as i32
+                    } else {
+                        4
+                    };
+                    // QuantizedSwitchLinear's input_dims / output_dims aren't
+                    // used directly by gather_qmm (it reads them from the
+                    // packed weight). Pass canonical values for diagnostics.
+                    let input_dims = (wshape[wshape.len() - 1] as i32) * 32 / derived_bits;
+                    let output_dims = wshape[wshape.len() - 2] as i32;
+                    let num_experts = wshape[0] as i32;
+                    Ok(crate::quant_switch::QuantizedSwitchLinear {
+                        num_experts,
+                        input_dims,
+                        output_dims,
+                        group_size: qg,
+                        bits: derived_bits,
+                        weight: Param::new(w),
+                        scales: Param::new(s),
+                        biases: Param::new(b),
+                    })
+                };
+                let sgl = crate::quant_switch::SwitchGLU {
+                    gate_proj: make_qsl("gate_proj")?,
+                    up_proj: make_qsl("up_proj")?,
+                    down_proj: make_qsl("down_proj")?,
+                };
+                let sgx = crate::quant_switch::SwitchGluExperts {
+                    hidden_size: args.hidden_size,
+                    intermediate_size: args.moe_intermediate_size,
+                    switch_glu: sgl,
+                };
+                (None, Some(sgx))
+            } else {
+                let experts = Experts {
+                    hidden_size: args.hidden_size,
+                    intermediate_size: args.moe_intermediate_size,
+                    gate_up_proj: Param::new(get_weight(
+                        &weights,
+                        &format!("{layer_prefix}.experts.gate_up_proj"),
+                    )?),
+                    down_proj: Param::new(get_weight(
+                        &weights,
+                        &format!("{layer_prefix}.experts.down_proj"),
+                    )?),
+                    activation,
+                    gate_up_proj_kt: None,
+                    down_proj_kt: None,
+                };
+                (Some(experts), None)
             };
 
             (
                 Some(router),
-                Some(experts),
+                experts_opt,
+                sgx_opt,
                 Some(make_rms_norm(
                     get_weight(
                         &weights,
@@ -3610,7 +3714,7 @@ pub fn build_model_from_weights(
                 )),
             )
         } else {
-            (None, None, None, None, None)
+            (None, None, None, None, None, None)
         };
 
         // PLE per-layer weights
@@ -3676,7 +3780,7 @@ pub fn build_model_from_weights(
             ),
             router,
             experts,
-            switch_glu_experts: None,
+            switch_glu_experts,
             post_feedforward_layernorm_1: post_ff_ln_1,
             post_feedforward_layernorm_2: post_ff_ln_2,
             pre_feedforward_layernorm_2: pre_ff_ln_2,
