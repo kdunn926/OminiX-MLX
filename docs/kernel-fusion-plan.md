@@ -139,3 +139,45 @@ tolerance) against the existing op chain on small random inputs.
 - Some of these fusions may not compose cleanly with the v6 bf16
   batched-MoE path — that's fine since UD-MLX-4bit is the
   recommended path and doesn't use v6.
+
+## Empirical results (post-implementation)
+
+| Target | Implemented in | Decode tok/s gain | Notes |
+|---|---|---|---|
+| T2 router tail | `4aaad70` | **0%** (within noise) | MLX auto-fuses softmax/argpartition chain |
+| T4 norm-add-norm | `416b609` | **0%** (within noise) | Reduction-crossing fusion didn't help either |
+
+**Revised thesis (post-T2/T4 measurements):** The 37 µs/launch baseline
+overhead estimate was 3–6× too high. Real per-op overhead on hot paths
+is closer to **5–15 µs** because:
+1. MLX batches Metal command-buffer submissions
+2. MLX's lazy graph optimizer is more aggressive than expected,
+   including fusing softmax chains and elementwise sequences across
+   reductions
+3. Hot-path ops amortize submission cost via async eval pipelining
+
+Remaining targets (T1, T3, T5, T6, T7) are projected to deliver
+single-digit-% improvements individually, not the 30–50% combined
+gain the original plan estimated. **The kernel-fusion lever has
+much less mechanical advantage than initially modeled.**
+
+## Where the decode speedup actually lives
+
+After two consecutive perf-neutral fusions, the practical leverage
+for a meaningful decode improvement shifts to:
+
+1. **Continuous batching (#40)** — multi-tenant aggregate throughput.
+   3–5× per-server win even if single-stream tok/s doesn't change.
+2. **Speculative decoding with in-distribution drafts** — drafter
+   quality is the real lever; we tried this and the published 0.98
+   acceptance only holds for the `flappy` code suite the drafter
+   was trained against.
+3. **Lower-precision quantization** (Q3/Q2 weights) — reduces memory
+   bandwidth proportionally. Quality regressions likely.
+4. **Smaller model** — Qwen3.6-35B-A3B-4bit is already faster on
+   this hardware via MLX's QuantizedSwitchLinear.
+
+The kernel-fusion work isn't wasted — both kernels ship gated and
+are useful scaffolds for the (much harder) Q4-aware fusions like T1
+and T7. But they shouldn't be on the critical path for any user-facing
+"make decode faster" project.
