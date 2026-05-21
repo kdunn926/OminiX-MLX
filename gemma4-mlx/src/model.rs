@@ -4170,26 +4170,34 @@ where
                 //
                 // Chunk size is env-tunable via `GEMMA4_PREFILL_CHUNK`.
                 //
-                // **Default 64** — safe across all configurations.
+                // **Default 256** — tuned for the recommended path:
+                // UD-MLX-4bit Gemma4 via `ud_loader::load_ud_mlx_4bit`,
+                // which keeps weights packed Q4/Q6/Q8 (~15-20 GB peak)
+                // and routes MoE through MLX's gather_qmm. At chunk=256
+                // hermes 5K hits **9.5s TTFT, 30 tok/s decode** on a
+                // 96 GB Mac with ~20-25 GB peak.
                 //
-                // Historical bench (hermes 5183 tok, default forward_topk):
-                //   chunk=32  → 720s TTFT
-                //   chunk=64  → 604s TTFT  ⭐ default
-                //   chunk=128 → 1905s TTFT (MoE expert-gather memory
-                //                           thrashing; can crash macOS via
-                //                           Metal OOM kernel panic)
+                // ⚠️ The bf16 + v6 path (mode=6) at chunk=256 peaks at
+                // ~50 GB and HAS CRASHED macOS via Metal OOM kernel
+                // panic. If using the bf16 model, set
+                // `GEMMA4_PREFILL_CHUNK=64` explicitly.
                 //
-                // Bench with `GEMMA4_EXPERT_MAJOR_MOE=6` (v6 batched kernel
-                // — opt-in only; see Experts::forward_topk dispatch):
-                //   chunk=64  → 47s TTFT, ~32 GB peak
-                //   chunk=128 → 27s TTFT, ~36 GB peak
-                //   chunk=256 → 17s TTFT, ~50 GB peak (≥96 GB unified mem)
+                // Bench grid (hermes 5183 tok):
                 //
-                // Larger chunks ONLY safe with v6 AND ≥96 GB unified memory.
+                // UD-MLX-4bit (preserve-quant via load_ud_mlx_4bit):
+                //   chunk=64   → 16.59s TTFT, 28 tok/s decode, ~15 GB
+                //   chunk=128  → 12.12s TTFT,                  ~17 GB
+                //   chunk=256  →  9.49s TTFT, 30 tok/s decode, ~20 GB ⭐
+                //
+                // bf16 model:
+                //   forward_topk + chunk=64  → 540s TTFT, ~13 GB
+                //   v6 + chunk=64            → 47s   TTFT, ~32 GB
+                //   v6 + chunk=128           → 27s   TTFT, ~36 GB
+                //   v6 + chunk=256           → 17s   TTFT, ~50 GB ⚠ OOM
                 let prefill_chunk: i32 = std::env::var("GEMMA4_PREFILL_CHUNK")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(64);
+                    .unwrap_or(256);
                 let PREFILL_CHUNK = prefill_chunk;
                 let seq_len = prompt_token.shape()[1];
 

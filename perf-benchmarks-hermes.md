@@ -36,6 +36,23 @@ Apple Silicon).
 | Gemma4-26B-A4B-it | mtplx AR (Fused QKV OFF, baseline) | BF16 | 5183 | — | 660.98 | 0.4 (5 decode) | — | 68.6 |
 | Gemma4-26B-A4B-it | mtplx AR (Fused QKV ON, `GEMMA4_FUSED_QKV=1`) | BF16 | 5183 | — | 700.82 | 0.4 (5 decode) | — | 69.6 | +6% TTFT regression — keep off for long context |
 
+## Gemma4 UD-MLX-4bit (preserve-quant) — hermes 5K ⭐ recommended path
+
+`models/gemma4-26B-a4b-it-UD-MLX-4bit/` loaded via
+`ud_loader::load_ud_mlx_4bit`. Heterogeneous per-tensor quant
+(q/k/v/o @ Q8, mlp @ Q4, embed @ Q6, all group_size=64). MoE dispatches
+through MLX's `gather_qmm` via `SwitchGluExperts`.
+
+| GEMMA4_PREFILL_CHUNK | TTFT (s) | Decode @ 5K ctx (tok/s) | Peak GPU (GB) | Notes |
+|---|---|---|---|---|
+| 64                 | 16.59 | 28     | ~15 | safe across all memory tiers |
+| 128                | 12.12 | —      | ~17 | |
+| 256 ⭐ (new default) | **9.49** | **30** | ~20 | recommended; tested on 96 GB Mac |
+
+Resident weights ~15 GB (matches disk, no dequant). Bypasses the v6
+bf16 batched-kernel path entirely; uses MLX's native `quantized_matmul`
+for attention and `gather_qmm` for MoE.
+
 ## Gemma4 Expert-Major MoE (#35) — hermes 5K prefill
 
 | Variant | hermes 5K prefill wall | Prompt tok/s | Speedup |
@@ -111,10 +128,12 @@ Default raised from 32 → 64 in `gemma4-mlx/src/model.rs` (env-tunable via
 
 | Workload | Best config |
 |---|---|
-| Long-context dense BF16 (Gemma4-class) | TurboQuant KV, online softmax, V-tile cache, sink=0, fused_kv_min=1 |
+| **Gemma4-class long-context** ⭐ | **`gemma4-26B-a4b-it-UD-MLX-4bit` via `ud_loader::load_ud_mlx_4bit`** (preserve-quant; `GEMMA4_PREFILL_CHUNK=256` default; ~9.5s TTFT on hermes 5K, 30 tok/s decode, ~20 GB peak) |
 | Long-context MoE A3B (Qwen3.6-35B-A3B) | Plain AR fp16 KV — no speculation, no quantized KV |
 | Long-context dense 4-bit (Qwen3.6-27B) | Plain AR fp16 KV |
 | MTPLX-optimized checkpoints | fp16 KV (TQ regresses; MTP speculation may or may not help vs AR depending on prompt) |
+| Memory-tight Gemma4 (no UD model on disk) | bf16 + `GEMMA4_EXPERT_MAJOR_MOE=6 GEMMA4_PREFILL_CHUNK=64` (~47s TTFT, ~32 GB peak; safe on 64 GB) |
+| Long-context dense BF16 (legacy Gemma4) | TurboQuant KV, online softmax, V-tile cache, sink=0, fused_kv_min=1 |
 
 ## Environment flags (TurboQuant)
 
