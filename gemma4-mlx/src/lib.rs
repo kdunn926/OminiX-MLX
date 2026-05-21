@@ -5,6 +5,8 @@ pub mod chat;
 pub mod vision;
 pub mod model;
 pub mod mtplx_target;
+pub mod quant_switch;
+pub mod ud_loader;
 
 pub use mlx_rs_core::{
     cache::{

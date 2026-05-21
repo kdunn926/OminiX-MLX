@@ -1993,6 +1993,13 @@ pub struct DecoderLayer {
     pub router: Option<Router>,
     #[param]
     pub experts: Option<Experts>,
+    /// Sibling of `experts` for models that ship MoE in quantized
+    /// switch_glu format (UD-MLX-4bit). When `Some`, the MoE block routes
+    /// through `SwitchGluExperts::forward_topk` (gather_qmm on packed
+    /// Q4/Q8 weights) and `experts` must be `None`. When `None`, the
+    /// existing `experts` enum + GEMMA4_EXPERT_MAJOR_MOE dispatch is used.
+    #[param]
+    pub switch_glu_experts: Option<crate::quant_switch::SwitchGluExperts>,
     #[param]
     pub post_feedforward_layernorm_1: Option<nn::RmsNorm>,
     #[param]
@@ -2078,6 +2085,12 @@ where
                 .as_mut()
                 .expect("MoE layer missing pre_feedforward_layernorm_2")
                 .forward(&hidden_states_flat)?;
+            // MoE dispatch: UD-MLX-4bit (switch_glu, quantized) takes
+            // precedence; otherwise fall through to the v0–v7 dispatch on
+            // the canonical fused Experts.
+            let raw_moe = if let Some(sgx) = self.switch_glu_experts.as_mut() {
+                sgx.forward_topk(&moe_in, &top_k_index, &top_k_weights)?
+            } else {
             let experts = self
                 .experts
                 .as_mut()
@@ -2109,7 +2122,7 @@ where
             //                                 (needs ≥96 GB unified mem)
             let mode = std::env::var("GEMMA4_EXPERT_MAJOR_MOE")
                 .unwrap_or_else(|_| "6".to_string());
-            let moe_out = match mode.as_str() {
+            match mode.as_str() {
                 "1" => experts.forward_topk_expert_major(&moe_in, &top_k_index, &top_k_weights)?,
                 "2" => experts.forward_topk_expert_major_v2(&moe_in, &top_k_index, &top_k_weights)?,
                 "3" => experts.forward_topk_expert_major_v3(&moe_in, &top_k_index, &top_k_weights)?,
@@ -2118,8 +2131,9 @@ where
                 "6" => experts.forward_topk_expert_major_v6(&moe_in, &top_k_index, &top_k_weights)?,
                 "7" => experts.forward_topk_expert_major_v7(&moe_in, &top_k_index, &top_k_weights)?,
                 _ => experts.forward_topk(&moe_in, &top_k_index, &top_k_weights)?,
+            }
             };
-            let moe_out = moe_out.reshape(&residual.shape())?;
+            let moe_out = raw_moe.reshape(&residual.shape())?;
             let moe_out = self
                 .post_feedforward_layernorm_2
                 .as_mut()
@@ -3662,6 +3676,7 @@ pub fn build_model_from_weights(
             ),
             router,
             experts,
+            switch_glu_experts: None,
             post_feedforward_layernorm_1: post_ff_ln_1,
             post_feedforward_layernorm_2: post_ff_ln_2,
             pre_feedforward_layernorm_2: pre_ff_ln_2,
