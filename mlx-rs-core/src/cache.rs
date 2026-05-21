@@ -1357,6 +1357,83 @@ impl Default for QuantizedKVCache {
     }
 }
 
+impl QuantizedKVCache {
+    /// Persist the cache state to a single safetensors file.
+    ///
+    /// Each populated Option<Array> field (`k_q`/`k_scales`/`k_biases`/`v_q`/
+    /// `v_scales`/`v_biases`/`k_residual`/`v_residual`) is written under its
+    /// field name. Scalars (`group_size`, `k_bits`, `v_bits`, `step`,
+    /// `batch`, `n_kv_heads`, `k_head_dim`, `v_head_dim`, `n_quantized`,
+    /// `offset`) go into the safetensors metadata block. Returns an error
+    /// if the cache is uninitialised (`offset == 0`).
+    pub fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> Result<(), Exception> {
+        if self.offset == 0 {
+            return Err(Exception::custom("QuantizedKVCache::save_to_path: empty cache"));
+        }
+        let mut tensors: Vec<(&str, &Array)> = Vec::new();
+        if let Some(t) = self.k_q.as_ref() { tensors.push(("k_q", t)); }
+        if let Some(t) = self.k_scales.as_ref() { tensors.push(("k_scales", t)); }
+        if let Some(t) = self.k_biases.as_ref() { tensors.push(("k_biases", t)); }
+        if let Some(t) = self.v_q.as_ref() { tensors.push(("v_q", t)); }
+        if let Some(t) = self.v_scales.as_ref() { tensors.push(("v_scales", t)); }
+        if let Some(t) = self.v_biases.as_ref() { tensors.push(("v_biases", t)); }
+        if let Some(t) = self.k_residual.as_ref() { tensors.push(("k_residual", t)); }
+        if let Some(t) = self.v_residual.as_ref() { tensors.push(("v_residual", t)); }
+
+        let mut meta = std::collections::HashMap::new();
+        for (k, v) in [
+            ("group_size", self.group_size),
+            ("k_bits", self.k_bits),
+            ("v_bits", self.v_bits),
+            ("step", self.step),
+            ("batch", self.batch),
+            ("n_kv_heads", self.n_kv_heads),
+            ("k_head_dim", self.k_head_dim),
+            ("v_head_dim", self.v_head_dim),
+            ("n_quantized", self.n_quantized),
+            ("offset", self.offset),
+        ] {
+            meta.insert(k.to_string(), v.to_string());
+        }
+        mlx_rs::Array::save_safetensors(tensors, Some(&meta), path.as_ref())
+            .map_err(|e| Exception::custom(format!("save_safetensors: {e}")))?;
+        Ok(())
+    }
+
+    /// Restore a QuantizedKVCache from a file produced by `save_to_path`.
+    pub fn load_from_path(path: impl AsRef<std::path::Path>) -> Result<Self, Exception> {
+        let (map, meta) = mlx_rs::Array::load_safetensors_with_metadata(path.as_ref())
+            .map_err(|e| Exception::custom(format!("load_safetensors_with_metadata: {e}")))?;
+        let get_int = |k: &str| -> Result<i32, Exception> {
+            meta.get(k)
+                .and_then(|v| v.parse::<i32>().ok())
+                .ok_or_else(|| Exception::custom(format!(
+                    "QuantizedKVCache::load_from_path: missing/invalid '{k}' in metadata"
+                )))
+        };
+        Ok(Self {
+            k_q: map.get("k_q").cloned(),
+            k_scales: map.get("k_scales").cloned(),
+            k_biases: map.get("k_biases").cloned(),
+            v_q: map.get("v_q").cloned(),
+            v_scales: map.get("v_scales").cloned(),
+            v_biases: map.get("v_biases").cloned(),
+            k_residual: map.get("k_residual").cloned(),
+            v_residual: map.get("v_residual").cloned(),
+            group_size: get_int("group_size")?,
+            k_bits: get_int("k_bits")?,
+            v_bits: get_int("v_bits")?,
+            step: get_int("step")?,
+            batch: get_int("batch")?,
+            n_kv_heads: get_int("n_kv_heads")?,
+            k_head_dim: get_int("k_head_dim")?,
+            v_head_dim: get_int("v_head_dim")?,
+            n_quantized: get_int("n_quantized")?,
+            offset: get_int("offset")?,
+        })
+    }
+}
+
 impl KeyValueCache for QuantizedKVCache {
     fn offset(&self) -> i32 {
         self.offset

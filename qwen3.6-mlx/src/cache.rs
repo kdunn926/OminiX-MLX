@@ -31,6 +31,180 @@ impl Default for RecurrentState {
     }
 }
 
+impl RecurrentState {
+    /// Persist the recurrent state to a safetensors file. Populated
+    /// `state` and `conv_state` Arrays are stored under those names;
+    /// `step` is stored in metadata. Empty state (step==0) is allowed
+    /// and produces a manifest-only file (no tensors).
+    pub fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> Result<(), Exception> {
+        let mut tensors: Vec<(&str, &Array)> = Vec::new();
+        if let Some(t) = self.state.as_ref() {
+            tensors.push(("state", t));
+        }
+        if let Some(t) = self.conv_state.as_ref() {
+            tensors.push(("conv_state", t));
+        }
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("step".to_string(), self.step.to_string());
+        Array::save_safetensors(tensors, Some(&meta), path.as_ref())
+            .map_err(|e| Exception::custom(format!("save_safetensors: {e}")))?;
+        Ok(())
+    }
+
+    pub fn load_from_path(path: impl AsRef<std::path::Path>) -> Result<Self, Exception> {
+        let (map, meta) = Array::load_safetensors_with_metadata(path.as_ref())
+            .map_err(|e| Exception::custom(format!("load_safetensors_with_metadata: {e}")))?;
+        let step = meta
+            .get("step")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0);
+        Ok(Self {
+            state: map.get("state").cloned(),
+            conv_state: map.get("conv_state").cloned(),
+            step,
+        })
+    }
+}
+
+// ============================================================================
+// HybridCache disk persistence (Qwen3.6 prefix-cache)
+//
+// Each layer is one safetensors file with a `kind` metadata tag
+// identifying the variant. The HybridCache::Recurrent variant is
+// supported alongside ::KV and ::QuantizedKV (the modes Qwen3.6 uses
+// in practice). ::TurboQuantKV is currently rejected — its 9-tensor
+// state is more invasive to serialize and isn't on the default
+// OminiX-API code path.
+// ============================================================================
+
+impl HybridCache {
+    pub fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> Result<(), Exception> {
+        let path = path.as_ref();
+        match self {
+            HybridCache::KV(kv) => {
+                // Write a tiny kind marker alongside the KVCache file.
+                kv.save_to_path(path)?;
+                let kind_path = path.with_extension("kind");
+                std::fs::write(&kind_path, b"kv")
+                    .map_err(|e| Exception::custom(format!("write kind: {e}")))?;
+                Ok(())
+            }
+            HybridCache::QuantizedKV(qkv) => {
+                qkv.save_to_path(path)?;
+                std::fs::write(path.with_extension("kind"), b"qkv")
+                    .map_err(|e| Exception::custom(format!("write kind: {e}")))?;
+                Ok(())
+            }
+            HybridCache::Recurrent(rec) => {
+                rec.save_to_path(path)?;
+                std::fs::write(path.with_extension("kind"), b"rec")
+                    .map_err(|e| Exception::custom(format!("write kind: {e}")))?;
+                Ok(())
+            }
+            HybridCache::TurboQuantKV(_) => Err(Exception::custom(
+                "HybridCache::save_to_path: TurboQuantKV not yet supported",
+            )),
+        }
+    }
+
+    pub fn load_from_path(path: impl AsRef<std::path::Path>) -> Result<Self, Exception> {
+        let path = path.as_ref();
+        let kind_path = path.with_extension("kind");
+        let kind = std::fs::read_to_string(&kind_path)
+            .map_err(|e| Exception::custom(format!("read kind {}: {e}", kind_path.display())))?;
+        match kind.trim() {
+            "kv" => Ok(HybridCache::KV(KVCache::load_from_path(path)?)),
+            "qkv" => Ok(HybridCache::QuantizedKV(QuantizedKVCache::load_from_path(path)?)),
+            "rec" => Ok(HybridCache::Recurrent(RecurrentState::load_from_path(path)?)),
+            other => Err(Exception::custom(format!(
+                "HybridCache::load_from_path: unknown kind '{other}'"
+            ))),
+        }
+    }
+
+    /// Save a Vec<HybridCache> + token sequence to a directory.
+    /// Mirrors `mlx_rs_core::cache::KVCache::save_kv_caches`.
+    pub fn save_hybrid_caches(
+        caches: &[HybridCache],
+        tokens: &[i32],
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<(), Exception> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Exception::custom(format!("create_dir_all {}: {e}", dir.display())))?;
+        for (i, c) in caches.iter().enumerate() {
+            if c.offset() == 0 {
+                continue;
+            }
+            c.save_to_path(dir.join(format!("cache_{i}.safetensors")))?;
+        }
+        let manifest = serde_json::json!({
+            "tokens": tokens,
+            "n_caches": caches.len(),
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest)
+                .map_err(|e| Exception::custom(format!("manifest serialize: {e}")))?,
+        )
+        .map_err(|e| Exception::custom(format!("write manifest: {e}")))?;
+        Ok(())
+    }
+
+    /// Try to load a HybridCache session whose token sequence is a strict
+    /// prefix of `prompt_tokens`. Returns `Some((caches, n_cached))` on
+    /// hit. Returns `None` if no manifest is present or the cached tokens
+    /// don't prefix-match.
+    pub fn try_load_hybrid_caches(
+        prompt_tokens: &[i32],
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Option<(Vec<HybridCache>, usize)>, Exception> {
+        let dir = dir.as_ref();
+        let manifest_path = dir.join("manifest.json");
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&manifest_path)
+            .map_err(|e| Exception::custom(format!("read manifest: {e}")))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Exception::custom(format!("manifest parse: {e}")))?;
+        let cached_tokens: Vec<i32> = manifest
+            .get("tokens")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_i64().map(|n| n as i32)).collect())
+            .unwrap_or_default();
+        let n = cached_tokens.len();
+        if n == 0 || prompt_tokens.len() < n {
+            return Ok(None);
+        }
+        if prompt_tokens[..n] != cached_tokens[..] {
+            return Ok(None);
+        }
+        let n = n.min(prompt_tokens.len() - 1);
+        if n == 0 {
+            return Ok(None);
+        }
+        let n_caches = manifest
+            .get("n_caches")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let mut caches = Vec::with_capacity(n_caches);
+        for i in 0..n_caches {
+            let path = dir.join(format!("cache_{i}.safetensors"));
+            let kind_path = path.with_extension("kind");
+            let cache = if kind_path.exists() {
+                HybridCache::load_from_path(&path)?
+            } else {
+                // No kind marker → empty slot at save time (recurrent
+                // layer that hadn't been touched; or skipped).
+                HybridCache::Recurrent(RecurrentState::new())
+            };
+            caches.push(cache);
+        }
+        Ok(Some((caches, n)))
+    }
+}
+
 /// Unified cache for hybrid model layers.
 ///
 /// Full attention layers use KV cache or quantized KV cache;

@@ -20,7 +20,7 @@ pub mod mtp;
 pub mod verify_hook;
 pub mod vision;
 
-pub use cache::{GdnRollbackSnapshot, HybridCache};
+pub use cache::{GdnRollbackSnapshot, HybridCache, RecurrentState};
 pub use deltanet::GdnTapeCapture;
 pub use config::{ModelArgs, VisionConfig};
 pub use mlx_rs_core::{cache::QuantizedKVCache, error::Error, load_tokenizer};
