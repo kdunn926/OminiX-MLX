@@ -411,6 +411,13 @@ impl Gemma4ChatTemplate {
             prompt.push_str(&self.tokens.turn_start);
             prompt.push_str(Gemma4Role::Assistant.as_str());
             prompt.push('\n');
+            // Suppress thinking channel (matches Jinja template `enable_thinking | default(false)`).
+            // Without this prefix, the model generates <|channel>thought\n...<channel|> as its first
+            // tokens; the tokenizer then strips the special-token delimiters, leaking "thought\n"
+            // into visible output.
+            prompt.push_str(&self.tokens.channel_start);
+            prompt.push_str("thought\n");
+            prompt.push_str(&self.tokens.channel_end);
         }
 
         Ok(prompt)
@@ -866,6 +873,7 @@ mod tests {
                 "Hello Gemma\n",
                 "<turn|>\n",
                 "<|turn>assistant\n",
+                "<|channel>thought\n<channel|>",
             )
         );
     }
@@ -908,7 +916,7 @@ mod tests {
         assert!(rendered.contains(
             "<|turn>tool\nweather\n<|tool_response>{\"content\":{\"condition\":\"sunny\",\"temp_c\":20},\"name\":\"weather\"}<tool_response|>\n<turn|>\n"
         ));
-        assert!(rendered.ends_with("<|turn>assistant\n"));
+        assert!(rendered.ends_with("<|turn>assistant\n<|channel>thought\n<channel|>"));
     }
 
     #[test]
