@@ -2083,11 +2083,43 @@ where
             shared_kv,
             position_ids,
         })?;
-        let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
-        let mut hidden_states = residual.add(&attn_out)?;
+
+        // T4 fusion: post_attention_layernorm + residual_add +
+        // pre_feedforward_layernorm collapsed into one Metal kernel
+        // (`fused_norm_add_norm`). Opt-in via GEMMA4_FUSED_T4=1.
+        // Requires bf16 hidden states + RmsNorm eps = 1e-6 (Gemma4 default).
+        // Saves 2 launches/layer ≈ 2.2 ms/token on Gemma4-26B-A4B.
+        let (mut hidden_states, dense_hidden) = if std::env::var("GEMMA4_FUSED_T4")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            && attn_out.dtype() == Dtype::Bfloat16
+            && residual.dtype() == Dtype::Bfloat16
+            && attn_out.shape().len() == 3
+        {
+            // Flatten [B, T, H] → [B*T, H] for the kernel, then reshape back.
+            let s = attn_out.shape();
+            let bt = s[0] * s[1];
+            let h = s[2];
+            let attn_flat = attn_out.reshape(&[bt, h])?;
+            let res_flat = residual.reshape(&[bt, h])?;
+            let (sum_flat, normed_flat) = mlx_rs_core::metal_kernels::fused_norm_add_norm(
+                &attn_flat,
+                &res_flat,
+                self.post_attention_layernorm.weight.as_ref(),
+                self.pre_feedforward_layernorm.weight.as_ref(),
+            )?;
+            (
+                sum_flat.reshape(&[s[0], s[1], h])?,
+                normed_flat.reshape(&[s[0], s[1], h])?,
+            )
+        } else {
+            let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
+            let hidden_states = residual.add(&attn_out)?;
+            let dense_hidden = self.pre_feedforward_layernorm.forward(&hidden_states)?;
+            (hidden_states, dense_hidden)
+        };
 
         let residual = hidden_states.clone();
-        let dense_hidden = self.pre_feedforward_layernorm.forward(&hidden_states)?;
         let mut ff_out = self.mlp.forward(&dense_hidden)?;
 
         if self.enable_moe_block {
