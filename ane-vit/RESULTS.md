@@ -116,8 +116,34 @@ work first.
    haven't satisfied yet (error: "tensor a (288) must match tensor b (576)
    at non-singleton dimension 0").
 
-2. **Qwen3-VL vision tower.** Similar patchification but better tooling on
-   the HF side; likely easier first target than GLM-OCR.
+2. **Qwen3-VL vision tower** — partial progress, two blockers down,
+   one still ahead.
+   - ✅ Got past the original "unpack 1→784" trace failure via
+     pre-patchification in the wrapper.
+   - ✅ Got past the deepstack outputs / dataclass return blocker.
+   - ✅ Got past the windowed-attention `cu_seqlens` split blocker
+     by monkey-patching `Qwen3VLVisionAttention.forward` to use a
+     single full-SDPA call during tracing. Semantically equivalent
+     for square single-image inputs (1 chunk in the windowed case).
+   - ❌ **STILL BLOCKED** on a coremltools MIL error in 2026-05-21
+     attempt:
+     ```
+     ValueError: Tensors in 'values' of the stack op (input.5) should
+     share the same data type. Got [int, double, double, double].
+     ```
+     The offending stack isn't in the attention path — bypassing
+     windowed attention doesn't fix it. It's in the patch
+     embedding, position-embedding interpolation, or somewhere the
+     coremltools Torch frontend inserts an implicit stack of
+     mixed-dtype tensors (the int element looks like a shape value;
+     the doubles look like rotary frequencies or position values).
+     Candidate sites: `apply_interleaved_mrope` (line 370 of
+     modeling_qwen3_vl.py), `fast_pos_embed_interpolate` (line 702),
+     freq-table indexing in `Qwen3VLVisionRotaryEmbedding.forward`.
+   - Realistic estimate to push through: 1-2 days of focused
+     coremltools / torchscript debugging — find the specific stack
+     op, monkey-patch to coerce dtypes, or split the model into
+     smaller traceable subgraphs.
 
 3. **MLX → ANE handoff path.** Currently the bench loads fp32 pixels from
    a Rust `Vec<f32>`. In real use we'd want to forward an MLX `Array`

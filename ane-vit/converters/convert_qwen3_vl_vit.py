@@ -68,6 +68,52 @@ def main():
         vt.config.deepstack_visual_indexes = []
     print("[convert] deepstack_visual_indexes cleared for tracing")
 
+    # Monkey-patch chunked-attention forward → single full-attention call.
+    # The stock Qwen3-VL Qwen3VLVisionAttention.forward splits queries/
+    # keys/values by `cu_seqlens` (windowed attention) and Python-loops
+    # over each chunk, then cats. The split is data-dependent
+    # (`lengths.tolist()`) and coremltools can't trace it (it bakes a
+    # specific chunk count then collides with mixed dtypes inside the
+    # cat op). For square single-image inputs the windowing is degenerate
+    # (1 chunk = full attention), so replacing the path with one direct
+    # SDPA call is semantically equivalent for our use case.
+    import torch.nn.functional as F
+    def _full_attention_forward(self, hidden_states, cu_seqlens, rotary_pos_emb=None,
+                                position_embeddings=None, **kwargs):
+        seq_length = hidden_states.shape[0]
+        query_states, key_states, value_states = (
+            self.qkv(hidden_states)
+            .reshape(seq_length, 3, self.num_heads, -1)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
+        cos, sin = position_embeddings
+        # apply_rotary_pos_emb_vision is in the parent module; re-import here.
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            apply_rotary_pos_emb_vision,
+        )
+        query_states, key_states = apply_rotary_pos_emb_vision(
+            query_states, key_states, cos, sin
+        )
+        query_states = query_states.transpose(0, 1).unsqueeze(0)
+        key_states = key_states.transpose(0, 1).unsqueeze(0)
+        value_states = value_states.transpose(0, 1).unsqueeze(0)
+        # Single SDPA call over the whole sequence (no chunking).
+        attn_output = F.scaled_dot_product_attention(
+            query_states, key_states, value_states,
+            attn_mask=None, dropout_p=0.0, is_causal=False, scale=self.scaling,
+        )
+        attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
+        return self.proj(attn_output)
+
+    from transformers.models.qwen3_vl import modeling_qwen3_vl as _mqvl
+    n_patched = 0
+    for name, mod in vt.named_modules():
+        if type(mod).__name__ == "Qwen3VLVisionAttention":
+            mod.forward = _full_attention_forward.__get__(mod, type(mod))
+            n_patched += 1
+    print(f"[convert] patched {n_patched} Qwen3VLVisionAttention.forward → full SDPA (bypass windowed cu_seqlens split)")
+
     vcfg = config.vision_config
     P = vcfg.patch_size
     T = vcfg.temporal_patch_size
