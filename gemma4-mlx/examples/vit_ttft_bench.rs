@@ -9,13 +9,37 @@
 //!     --image ane-spike-work/benchmarks/bench_results/img1.png \
 //!     --prompt "Describe this image briefly." --iters 5
 
+use coreml_bridge::{ComputeUnits, CoreMlModel};
 use gemma4_mlx::{
     build_gemma4_vl_chat_tokens, load_tokenizer, load_vl_model, GemmaVlChatMessage,
 };
+use image::imageops::FilterType;
 use mlx_rs::ops::indexing::{argmax, IndexOp};
 use mlx_rs::transforms::eval;
+use mlx_rs::Array;
 use std::path::PathBuf;
 use std::time::Instant;
+
+/// Resize image to a fixed square and normalize to a `[3, H, W]` fp32
+/// buffer in [0, 1] — the layout the converted ANE mlpackage expects
+/// (the patch_embedder's `2*(x-0.5)` runs inside the traced graph).
+fn preprocess_ane_pixels(bytes: &[u8], side: u32) -> anyhow::Result<Vec<f32>> {
+    let img = image::load_from_memory(bytes)?;
+    let resized = img.resize_exact(side, side, FilterType::CatmullRom);
+    let rgb = resized.to_rgb8();
+    let n = (side * side) as usize;
+    let mut pixels = vec![0f32; 3 * n];
+    for y in 0..side {
+        for x in 0..side {
+            let px = rgb.get_pixel(x, y).0;
+            let idx = (y * side + x) as usize;
+            pixels[idx] = px[0] as f32 / 255.0;
+            pixels[n + idx] = px[1] as f32 / 255.0;
+            pixels[2 * n + idx] = px[2] as f32 / 255.0;
+        }
+    }
+    Ok(pixels)
+}
 
 fn arg(args: &[String], key: &str) -> Option<String> {
     args.windows(2).find(|w| w[0] == key).map(|w| w[1].clone())
@@ -32,6 +56,16 @@ fn main() -> anyhow::Result<()> {
     let prompt = arg(&args, "--prompt").unwrap_or_else(|| "Describe this image briefly.".into());
     let iters: usize = arg(&args, "--iters").and_then(|s| s.parse().ok()).unwrap_or(5);
     let async_mode = std::env::args().any(|a| a == "--async");
+    let ane_mlpackage = arg(&args, "--ane").map(PathBuf::from);
+    let ane_side: u32 = arg(&args, "--ane-side")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(384);
+    let ane_units = match arg(&args, "--ane-units").as_deref() {
+        Some("gpu") | Some("cpuAndGpu") => ComputeUnits::CpuAndGpu,
+        Some("ane") | Some("cpuAndAne") => ComputeUnits::CpuAndNeuralEngine,
+        Some("cpu") | Some("cpuOnly") => ComputeUnits::CpuOnly,
+        _ => ComputeUnits::All,
+    };
 
     println!("[bench] loading {} ...", model_dir.display());
     let load_t = Instant::now();
@@ -45,6 +79,34 @@ fn main() -> anyhow::Result<()> {
         image_path.display(),
         image_bytes.len()
     );
+
+    // Optional ANE vision tower (Core ML mlpackage).
+    let (ane_model, ane_pixels, ane_out_cap, ane_hidden, ane_n_tokens) =
+        if let Some(p) = &ane_mlpackage {
+            let m = CoreMlModel::load(p, ane_units)?;
+            let pixels = preprocess_ane_pixels(&image_bytes, ane_side)?;
+            // Output is [N_soft_tokens, hidden]. For the 384-side
+            // mlpackage that's [64, 768]; for a 768-retrace it would
+            // be [256, 768]. Caller picks via --ane-hidden / --ane-soft.
+            let hidden: i32 = arg(&args, "--ane-hidden")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(768);
+            let soft: i32 = arg(&args, "--ane-soft")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(64);
+            let cap = (soft * hidden) as usize;
+            println!(
+                "[bench] ANE mlpackage: {} (side={}, units={:?}, expect {} soft tokens × hidden {})",
+                p.display(),
+                ane_side,
+                ane_units,
+                soft,
+                hidden
+            );
+            (Some(m), pixels, cap, hidden, soft)
+        } else {
+            (None, Vec::new(), 0, 0, 0)
+        };
 
     let image_token_id = model.image_token_id;
     let boi_token_id = model.boi_token_id;
@@ -79,7 +141,23 @@ fn main() -> anyhow::Result<()> {
         // visual features stay lazy so MLX can schedule the ViT graph
         // alongside the prefill graph kernels.
         let vt = Instant::now();
-        let visual_features = if async_mode {
+        let visual_features = if let Some(ane) = ane_model.as_ref() {
+            // ANE path: predict on fixed-side pixels → wrap as MLX Array
+            // → run through embed_vision projection on Metal.
+            let mut out = vec![0f32; ane_out_cap];
+            ane.predict(&ane_pixels, &mut out)
+                .map_err(|e| anyhow::anyhow!("ANE predict: {e}"))?;
+            let hidden = Array::from_slice(&out, &[1, ane_n_tokens, ane_hidden]);
+            let embeds = model
+                .embed_vision
+                .forward(&hidden)
+                .map_err(|e| anyhow::anyhow!("embed_vision: {e}"))?;
+            let s1 = embeds.shape()[1];
+            let s2 = embeds.shape()[2];
+            embeds
+                .reshape(&[s1, s2])
+                .map_err(|e| anyhow::anyhow!("reshape: {e}"))?
+        } else if async_mode {
             model
                 .encode_image_bytes_async(&image_bytes)
                 .map_err(|e| anyhow::anyhow!("encode_image_bytes_async: {e}"))?

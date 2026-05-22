@@ -174,6 +174,52 @@ further but doesn't help bandwidth-bound prefill.
 | Best accuracy                 | Current MLX path                            |
 | Best TTFT *and* accuracy      | Overlap MLX vision with prefill (async pipeline; future work) |
 
+## End-to-end TTFT wired through ANE (2026-05-22)
+
+Spike branch `spike/async-vision-prefill` now drives the MLX
+`embed_vision` projection from the converted Gemma4-VL mlpackage's
+output, replacing the MLX vision tower. Bench
+`gemma4-mlx/examples/vit_ttft_bench.rs` with `--ane <mlpackage>` and
+`--ane-units {gpu|ane|cpu|all}`.
+
+### Three-way A/B (gemma-4-E4B-it, img1.png, 5 iters)
+
+| Path                                  | vision  | prefill (tokens) | **TTFT**  | first  |
+|---------------------------------------|---------|------------------|-----------|--------|
+| MLX baseline (255 soft tokens, ~768²) | 300 ms  | 1 710 ms (283)   | **2 011** | "This" |
+| **ANE→GPU** (64 soft tokens, 384²) ⭐ | 30 ms   | 513 ms (92)      | **544**   | "The"  |
+| ANE→ANE (64 soft tokens, 384²)        | 54 ms   | 511 ms (92)      | 566       | "Please" |
+
+**3.7× faster TTFT, 1.47 s saved**. Vision delta is 270 ms; prefill
+delta is 1 197 ms. Confirms the central finding: **soft-token count
+dominates which-accelerator choice**. The image-token positions in
+the LLM prefill scale linearly (~6 ms each on E4B prefill at this
+context length), so cutting image tokens 4× saves ~5× more wall time
+than the ViT speedup does.
+
+### Accuracy caveats
+
+- First tokens diverge across all three paths ("This" / "The" /
+  "Please") — same prompt, different visual encodings. The 384/64 ANE
+  path is a real lossy trade, not just a latency one.
+- ANE→GPU and ANE→ANE produce different first tokens from the *same*
+  mlpackage. Known Core ML quirk: compute-unit backends have small
+  numerical deltas that propagate into the downstream LLM.
+- For an accuracy-preserving comparison, need a second mlpackage
+  traced at 768×768 / 256 soft tokens. Projected TTFT for that
+  retrace ≈ 1 760 ms (~13% faster vs MLX baseline) — modest gain
+  because prefill (not vision) dominates when image-token counts are
+  matched.
+
+### Decision matrix
+
+| Want                          | Use                                              |
+|-------------------------------|--------------------------------------------------|
+| Best TTFT, lossy is OK        | ANE→GPU at 384²/64 tokens (3.7× faster)          |
+| Best TTFT, no quality loss    | ANE-path at 768²/256 tokens (projected ~1.08×)   |
+| Best accuracy                 | Current MLX path                                 |
+| Best TTFT *and* accuracy      | Overlap ANE vision with MLX prefill chunk 0 (~50 ms additional save on top of 1.08×) — needs background-thread ANE call |
+
 ## Earlier Qwen3-VL attempt (superseded by the LANDED section above)
 
 Tried `Qwen/Qwen3-VL-2B-Instruct` via `convert_qwen3_vl_vit.py`. Hit four

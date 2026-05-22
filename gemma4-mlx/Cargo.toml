@@ -56,4 +56,5 @@ path = "examples/draft_verify_spike.rs"
 
 [dev-dependencies]
 anyhow = "1"
+coreml-bridge = { path = "../ane-vit/coreml-bridge" }
 
