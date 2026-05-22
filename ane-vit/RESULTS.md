@@ -211,14 +211,60 @@ than the ViT speedup does.
   because prefill (not vision) dominates when image-token counts are
   matched.
 
-### Decision matrix
+### 768²/256-token retrace (measured 2026-05-22)
 
-| Want                          | Use                                              |
-|-------------------------------|--------------------------------------------------|
-| Best TTFT, lossy is OK        | ANE→GPU at 384²/64 tokens (3.7× faster)          |
-| Best TTFT, no quality loss    | ANE-path at 768²/256 tokens (projected ~1.08×)   |
-| Best accuracy                 | Current MLX path                                 |
-| Best TTFT *and* accuracy      | Overlap ANE vision with MLX prefill chunk 0 (~50 ms additional save on top of 1.08×) — needs background-thread ANE call |
+Second mlpackage `gemma4-e4b-vit-768.mlpackage` (295 MB, fp16,
+`--image-size 768`) for accuracy-preserving comparison. Same bench,
+5 iters each:
+
+| Path                              | vision   | prefill    | **TTFT**    | first  |
+|-----------------------------------|----------|------------|-------------|--------|
+| ANE-768→**GPU** ⭐                | 138 ms   | 1 753 ms   | **1 891**   | "The"  |
+| ANE-768→ANE                       | 578 ms   | 1 753 ms   | 2 330       | "I"    |
+| ANE-768→All (auto picks ANE)      | 571 ms   | 1 741 ms   | 2 311       | "I"    |
+
+**1.06× faster vs MLX baseline, ~120 ms saved.** Matches the
+1.08× projection. Findings:
+
+1. **ANE compute unit collapses at this shape.** 578 ms on ANE vs
+   138 ms on GPU (4.2× slower). Hidden=4096-class ViT at 768²
+   falls off ANE's tile sweet spot — same pattern as Qwen3-VL ViT.
+   Core ML's `all` policy auto-picks ANE → 2 311 ms TTFT, so
+   leaving dispatch on auto actively *hurts*. **Empirical winner
+   at scale is `cpuAndGpu`**; the per-class dispatch policy in
+   `ane_vision.rs` already encodes this.
+2. **First token still diverges from MLX** ("The" vs "This") even
+   with matched 256-token count. Two contributors: (a) Core ML's
+   fp16 GPU kernels aren't bit-identical to MLX's bf16 ViT
+   implementation, (b) preprocess differs — MLX preserves aspect
+   ratio (img1 → ~816×720 grid); the converter squashes to fixed
+   768×768 to keep the traced graph static-shape. The retrace
+   closes the *capacity* gap but not the *fidelity* gap.
+
+### Decision matrix (final)
+
+| Want                            | Use                                            | Expected TTFT |
+|---------------------------------|------------------------------------------------|---------------|
+| Best TTFT, lossy is OK          | ANE-384→GPU (3.7× faster)                      | ~544 ms       |
+| Best TTFT, matched token count  | ANE-768→GPU (1.06× faster)                     | ~1 891 ms     |
+| Best accuracy                   | MLX baseline                                   | ~2 011 ms     |
+| Worst-case                      | ANE-768→ANE (Core ML auto)                     | ~2 330 ms     |
+
+The 1.06× retrace win is modest because prefill (1.7 s) dwarfs the
+vision delta. Three follow-ups would change the picture:
+
+- **Background-thread ANE call**: if the 138 ms ANE-768 prediction
+  runs while MLX builds prefill chunk 0, vision cost effectively
+  → 0 ms, projecting ~1 750 ms TTFT (1.15× faster). Needs
+  `std::thread::spawn` + `mpsc::channel` for the FFI call;
+  CoreMlModel is `Send` (Swift's `MLModel` is thread-safe for
+  prediction).
+- **Variable-resolution mlpackage**: re-trace with a few discrete
+  resolutions (e.g. 768×768, 768×576, 576×768) and dispatch by
+  aspect ratio to close the preprocess fidelity gap.
+- **Quantize the LLM prefill path**: this is where the win lives
+  for image-heavy prompts. Image tokens cost ~6 ms each on E4B
+  prefill; reducing prefill ms/token is the broadest lever.
 
 ## Earlier Qwen3-VL attempt (superseded by the LANDED section above)
 
