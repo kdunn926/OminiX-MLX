@@ -57,7 +57,23 @@ fn main() {
         panic!("swiftc failed compiling {}", swift_src.display());
     }
 
-    println!("cargo:rustc-link-arg={}", obj_out.display());
+    // Bundle the .o into a static lib so symbols propagate to
+    // downstream binaries (raw `cargo:rustc-link-arg=foo.o` only
+    // applies to the producing crate, not its dependents).
+    let lib_path = out_dir.join("libane_runner.a");
+    let _ = std::fs::remove_file(&lib_path);
+    let status = Command::new("ar")
+        .arg("crs")
+        .arg(&lib_path)
+        .arg(&obj_out)
+        .status()
+        .expect("failed to invoke ar");
+    if !status.success() {
+        panic!("ar failed creating {}", lib_path.display());
+    }
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=ane_runner");
+
     // Frameworks required for Core ML + Foundation + ANE driver bridge.
     println!("cargo:rustc-link-lib=framework=CoreML");
     println!("cargo:rustc-link-lib=framework=Foundation");
