@@ -452,16 +452,23 @@ pub struct VisionModel {
 }
 
 impl VisionModel {
+    /// Original eval-and-sync vision forward. Preserved verbatim
+    /// (modulo formatting) so the sync code path's outputs and timing
+    /// are unchanged for callers that haven't migrated. New code
+    /// should call `forward_lazy` with caller-known counts to keep
+    /// the entire pipeline lazy.
     pub fn forward(
         &mut self,
         pixel_values: &Array,
         patch_positions: &Array,
         padding_positions: &Array,
     ) -> Result<Array> {
-        eval(std::slice::from_ref(padding_positions)).map_err(|e| Error::Model(format!("eval padding_positions: {e}")))?;
-        let padding_slice = padding_positions.try_as_slice::<bool>().map_err(|e| {
-            Error::Model(format!("padding_positions must be contiguous bool: {e}"))
+        eval(std::slice::from_ref(padding_positions)).map_err(|e| {
+            Error::Model(format!("eval padding_positions: {e}"))
         })?;
+        let padding_slice = padding_positions
+            .try_as_slice::<bool>()
+            .map_err(|e| Error::Model(format!("padding_positions must be contiguous bool: {e}")))?;
         let total = padding_positions.shape()[1] as usize;
         let num_real = padding_slice
             .iter()
@@ -484,30 +491,37 @@ impl VisionModel {
         }
 
         let b = padding_positions.shape()[0] as usize;
-        let l = padding_positions.shape()[1] as usize;        let mut attn_mask = vec![0f32; b * l * l];
+        let l = padding_positions.shape()[1] as usize;
+        let mut attn_mask = vec![0f32; b * l * l];
         for batch in 0..b {
             for i in 0..l {
                 let valid_i = !padding_slice[batch * l + i];
                 for j in 0..l {
                     let valid_j = !padding_slice[batch * l + j];
-                    attn_mask[(batch * l + i) * l + j] = if valid_i && valid_j { 0.0 } else { -1e4 };
+                    attn_mask[(batch * l + i) * l + j] =
+                        if valid_i && valid_j { 0.0 } else { -1e4 };
                 }
             }
         }
-        let attn_mask = Array::from_slice(&attn_mask, &[b as i32, 1, l as i32, l as i32])
-            .as_dtype(inputs_embeds.dtype())?;
-        let hidden_states = self.encoder.forward(&inputs_embeds, patch_positions, &attn_mask)?;
+        let attn_mask =
+            Array::from_slice(&attn_mask, &[b as i32, 1, l as i32, l as i32])
+                .as_dtype(inputs_embeds.dtype())?;
+        let hidden_states =
+            self.encoder.forward(&inputs_embeds, patch_positions, &attn_mask)?;
         let (pooled, valid_mask) = self
             .pooler
             .forward(&hidden_states, patch_positions, padding_positions, None)?;
 
-        eval(std::slice::from_ref(&valid_mask)).map_err(|e| Error::Model(format!("eval valid_mask: {e}")))?;
+        eval(std::slice::from_ref(&valid_mask)).map_err(|e| {
+            Error::Model(format!("eval valid_mask: {e}"))
+        })?;
         let valid = valid_mask.try_as_slice::<bool>().map_err(|e| {
             Error::Model(format!("valid pool mask must be contiguous bool: {e}"))
         })?;
         let mut outputs = Vec::with_capacity(b);
         for batch in 0..b {
-            let n_valid = valid[batch * valid_mask.shape()[1] as usize..(batch + 1) * valid_mask.shape()[1] as usize]
+            let n_valid = valid[batch * valid_mask.shape()[1] as usize
+                ..(batch + 1) * valid_mask.shape()[1] as usize]
                 .iter()
                 .filter(|&&v| v)
                 .count() as i32;
@@ -517,17 +531,99 @@ impl VisionModel {
         let mut hidden_states = if refs.len() == 1 {
             refs[0].reshape(&[1, refs[0].shape()[0], refs[0].shape()[1]])?
         } else {
-            ops::concatenate_axis(&refs, 0)?.reshape(&[1, -1, pooled.shape()[2]])?
+            ops::concatenate_axis(&refs, 0)?
+                .reshape(&[1, -1, pooled.shape()[2]])?
         };
 
-        eval([&hidden_states]).map_err(|e| Error::Model(format!("eval hidden_states after reshape: {e}")))?;
+        eval([&hidden_states]).map_err(|e| {
+            Error::Model(format!("eval hidden_states after reshape: {e}"))
+        })?;
         if let (Some(std_bias), Some(std_scale)) = (&self.std_bias, &self.std_scale) {
-            // Cast bias/scale to match hidden_states dtype to avoid mixed-precision ops.
             let std_bias = std_bias.as_dtype(hidden_states.dtype())?;
             let std_scale = std_scale.as_dtype(hidden_states.dtype())?;
             hidden_states = hidden_states.subtract(&std_bias)?.multiply(&std_scale)?;
-            eval([&hidden_states]).map_err(|e| Error::Model(format!("eval after std norm: {e}")))?;        } else {        }
+            eval([&hidden_states]).map_err(|e| {
+                Error::Model(format!("eval after std norm: {e}"))
+            })?;
+        }
+        Ok(hidden_states)
+    }
 
+    /// Fully-lazy vision forward.
+    ///
+    /// Callers must supply:
+    /// - `num_real`: number of real (non-padded) patches at the head of
+    ///   `patch_positions` / `padding_positions`.
+    /// - `n_valid`: number of valid post-pooler positions for the
+    ///   (single) image. Equals `(num_real_per_side / pool)^2`.
+    ///
+    /// Both are derivable in `preprocess_image_gemma4` without any GPU
+    /// readback — this signature exists so the entire vision graph
+    /// stays unevaluated until the caller (typically
+    /// `prefill_multimodal_async`) issues a single eval at the end of
+    /// the first prefill chunk.
+    pub fn forward_lazy(
+        &mut self,
+        pixel_values: &Array,
+        patch_positions: &Array,
+        padding_positions: &Array,
+        num_real: i32,
+        n_valid: i32,
+    ) -> Result<Array> {
+        let mut inputs_embeds = self.patch_embedder.forward(
+            pixel_values,
+            &patch_positions.index((.., ..num_real, ..)),
+            &padding_positions.index((.., ..num_real)),
+        )?;
+
+        let num_padding = self.max_patches - num_real;
+        if num_padding > 0 {
+            let pad_embeds = ops::zeros_dtype(
+                &[pixel_values.shape()[0], num_padding, inputs_embeds.shape()[2]],
+                inputs_embeds.dtype(),
+            )?;
+            inputs_embeds = ops::concatenate_axis(&[&inputs_embeds, &pad_embeds], 1)?;
+        }
+
+        // Lazy bidirectional attention mask: -1e4 where either row or
+        // column is a padded patch, 0 elsewhere. Built from
+        // `padding_positions` (shape [B, L], bool) via broadcast
+        // reductions — no CPU loop, no eval/sync.
+        let b = padding_positions.shape()[0];
+        let l = padding_positions.shape()[1];
+        let not_pad = padding_positions.logical_not()?; // [B, L] bool
+        let row = not_pad.reshape(&[b, 1, l, 1])?;
+        let col = not_pad.reshape(&[b, 1, 1, l])?;
+        let valid = row.logical_and(&col)?; // [B, 1, L, L] bool
+        let zero =
+            Array::from(0.0_f32).as_dtype(inputs_embeds.dtype())?;
+        let neg_inf =
+            Array::from(-1.0e4_f32).as_dtype(inputs_embeds.dtype())?;
+        let attn_mask = ops::r#where(&valid, &zero, &neg_inf)?;
+
+        let hidden_states =
+            self.encoder.forward(&inputs_embeds, patch_positions, &attn_mask)?;
+        let (pooled, _valid_mask) = self
+            .pooler
+            .forward(&hidden_states, patch_positions, padding_positions, None)?;
+
+        // Crop trailing invalid pool positions using the caller-provided
+        // count — same as the historical CPU-readback version, but
+        // without the eval. Single-batch only (the only call shape in
+        // `encode_image_bytes`).
+        let mut hidden_states = pooled
+            .index((0i32, ..n_valid, ..))
+            .reshape(&[1, n_valid, pooled.shape()[2]])?;
+
+        if let (Some(std_bias), Some(std_scale)) =
+            (&self.std_bias, &self.std_scale)
+        {
+            let std_bias = std_bias.as_dtype(hidden_states.dtype())?;
+            let std_scale = std_scale.as_dtype(hidden_states.dtype())?;
+            hidden_states = hidden_states
+                .subtract(&std_bias)?
+                .multiply(&std_scale)?;
+        }
         Ok(hidden_states)
     }
 }
@@ -548,6 +644,29 @@ impl EmbedVision {
         eval([&normed]).map_err(|e| Error::Model(format!("eval normed: {e}")))?;        let proj = self.embedding_projection.forward(&normed).map_err(|e| Error::Model(e.to_string()))?;
         eval([&proj]).map_err(|e| Error::Model(format!("eval projection: {e}")))?;        Ok(proj)
     }
+}
+
+/// Same as `preprocess_image_gemma4` but also returns the number of
+/// non-padding patches (`num_real`) and the resulting valid post-pooler
+/// token count (`n_valid`) so callers can drive `forward_lazy` without
+/// any GPU readback. The two extra ints are derived purely from the
+/// chosen target resolution on the host side.
+pub fn preprocess_image_gemma4_with_counts(
+    bytes: &[u8],
+) -> Result<(Array, Vec<i32>, Vec<i32>, i32, i32)> {
+    let (pixel_values, patch_positions, padding_positions) =
+        preprocess_image_gemma4(bytes)?;
+    let pooling_kernel_size = 3i32;
+    let max_soft_tokens = 280i32;
+    let max_patches = max_soft_tokens * pooling_kernel_size * pooling_kernel_size;
+    let n_pad = padding_positions.iter().filter(|&&v| v != 0).count() as i32;
+    let num_real = max_patches - n_pad;
+    // Pooler emits one soft token per pool^2 kernel over the valid
+    // patch grid; for the canonical square-resize path that the
+    // preprocess function uses, `num_real` is always a perfect
+    // multiple of pool^2, so this is exact.
+    let n_valid = num_real / (pooling_kernel_size * pooling_kernel_size);
+    Ok((pixel_values, patch_positions, padding_positions, num_real, n_valid))
 }
 
 pub fn preprocess_image_gemma4(bytes: &[u8]) -> Result<(Array, Vec<i32>, Vec<i32>)> {

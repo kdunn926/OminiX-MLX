@@ -13,12 +13,16 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("../vit-base.mlpackage"));
     let iters: usize = arg(&args, "--iters").and_then(|s| s.parse().ok()).unwrap_or(32);
+    let image_size: usize = arg(&args, "--image-size").and_then(|s| s.parse().ok()).unwrap_or(224);
+    // Worst-case output capacity. ViT-base/224 needs 151_296; Qwen3-VL
+    // 2B @ 448 needs 802_816. Default high; CLI override available.
+    let out_capacity: usize = arg(&args, "--out-capacity")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(802_816);
 
     let zero_copy = std::env::args().any(|a| a == "--zero-copy");
-    // ViT-base/224 input: 1 × 3 × 224 × 224 = 150_528 f32
-    let mut pixels = vec![0.0f32; 1 * 3 * 224 * 224];
-    // 197 = 1 cls + 14×14 patches; hidden 768. Output capacity buffer.
-    let mut out = vec![0.0f32; 197 * 768];
+    let mut pixels = vec![0.0f32; 3 * image_size * image_size];
+    let mut out = vec![0.0f32; out_capacity];
 
     for (label, units) in [
         ("all", ComputeUnits::All),

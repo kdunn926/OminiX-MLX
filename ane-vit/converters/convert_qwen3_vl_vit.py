@@ -128,6 +128,45 @@ def main():
     grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
     print(f"[convert] grid_thw=[1,{grid_h},{grid_w}] patch={P} temporal_patch={T} merge={M}")
 
+    # The vision tower forward calls three module-level helpers from
+    # transformers.vision_utils that iterate over `grid_thw.tolist()` and
+    # build tensors via list-of-lists. coremltools traces those builders
+    # as mixed-dtype stack ops and fails. Since input shape is fixed at
+    # convert time, precompute their outputs and rebind the helpers in
+    # the modeling module's namespace to return the constants.
+    from transformers.models.qwen3_vl import modeling_qwen3_vl as _mqv
+    with torch.no_grad():
+        _bi, _bw = _mqv.get_vision_bilinear_indices_and_weights(
+            grid_thw,
+            num_grid_per_side=vt.num_grid_per_side,
+            spatial_merge_size=vt.config.spatial_merge_size,
+            kwargs=None,
+        )
+        _pids = _mqv.get_vision_position_ids(grid_thw, vt.spatial_merge_size, kwargs=None)
+        _cu = _mqv.get_vision_cu_seqlens(grid_thw, kwargs=None)
+    _bi = _bi.detach().clone()
+    _bw = _bw.detach().clone()
+    _pids = _pids.detach().clone()
+    _cu = _cu.detach().clone() if hasattr(_cu, "detach") else _cu
+    vt.register_buffer("_frozen_bilinear_indices", _bi, persistent=False)
+    vt.register_buffer("_frozen_bilinear_weights", _bw, persistent=False)
+    vt.register_buffer("_frozen_vision_position_ids", _pids, persistent=False)
+    vt.register_buffer("_frozen_cu_seqlens", _cu, persistent=False)
+    _mqv.get_vision_bilinear_indices_and_weights = (
+        lambda grid_thw, num_grid_per_side, spatial_merge_size, kwargs=None: (
+            vt._frozen_bilinear_indices, vt._frozen_bilinear_weights
+        )
+    )
+    _mqv.get_vision_position_ids = (
+        lambda grid_thw, spatial_merge_size, kwargs=None: vt._frozen_vision_position_ids
+    )
+    _mqv.get_vision_cu_seqlens = (
+        lambda grid_thw, kwargs=None: vt._frozen_cu_seqlens
+    )
+    print(f"[convert] froze vision_utils helpers: bilinear_indices={tuple(_bi.shape)} "
+          f"bilinear_weights={tuple(_bw.shape)} position_ids={tuple(_pids.shape)} "
+          f"cu_seqlens={tuple(_cu.shape) if hasattr(_cu, 'shape') else _cu}")
+
     # Wrap: takes raw [1, 3, H, W] in, returns hidden [(grid_h/M)*(grid_w/M), out_hidden].
     # We must repeat the image temporal_patch times then patchify into the
     # flattened layout the inner module expects:

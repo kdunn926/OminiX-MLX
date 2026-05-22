@@ -3973,6 +3973,33 @@ impl Gemma4VlModel {
         embeds.reshape(&[s1, s2]).map_err(Into::into)
     }
 
+    /// Lazy-graph variant: drives the refactored `VisionModel::forward_lazy`
+    /// path which has no internal `eval()`/`try_as_slice` calls. The
+    /// returned `Array` is unevaluated — the entire vision + embed_vision
+    /// graph stays deferred until the caller evaluates it (e.g. during
+    /// `prefill_multimodal_async`'s first prefill-chunk eval), letting
+    /// MLX's scheduler overlap vision kernels with downstream prefill
+    /// kernels.
+    pub fn encode_image_bytes_async(&mut self, bytes: &[u8]) -> Result<Array, Error> {
+        let (pixel_values, patch_positions, padding_mask, num_real, n_valid) =
+            crate::vision::preprocess_image_gemma4_with_counts(bytes)?;
+        let num_positions = padding_mask.len() as i32;
+        let patch_positions = Array::from_slice(&patch_positions, &[1, num_positions, 2]);
+        let padding_bool: Vec<bool> = padding_mask.iter().map(|&v| v != 0).collect();
+        let padding_positions = Array::from_slice(&padding_bool, &[1, num_positions]);
+        let hidden = self.vision.forward_lazy(
+            &pixel_values,
+            &patch_positions,
+            &padding_positions,
+            num_real,
+            n_valid,
+        )?;
+        let embeds = self.embed_vision.forward(&hidden)?;
+        let s1 = embeds.shape()[1];
+        let s2 = embeds.shape()[2];
+        embeds.reshape(&[s1, s2]).map_err(Into::into)
+    }
+
     pub fn prefill_multimodal(
         &mut self,
         input_ids: &[i32],
@@ -4072,6 +4099,127 @@ impl Gemma4VlModel {
             pos = end;
         }
         Err(Error::Model("prefill_multimodal: unexpected empty sequence".into()))
+    }
+
+    /// Async-overlap variant of `prefill_multimodal`.
+    ///
+    /// Eliminates the three CPU-sync points (`eval text_embeds`,
+    /// `eval visual_features`, CPU scatter via `try_as_slice` + memcpy)
+    /// that force the vision graph to drain before prefill can start.
+    /// Instead, splices visual features into the embed stream using a
+    /// lazy MLX `concatenate_axis` on a [pre_text, vision, post_text]
+    /// triple, keeping the full pipeline as one graph so MLX's
+    /// scheduler can overlap vision-tower kernels with text-embedding,
+    /// PLE, and the first prefill chunk.
+    ///
+    /// Assumes the image tokens form a single contiguous block in
+    /// `input_ids` (this is the standard Gemma4-VL prompt shape from
+    /// `build_gemma4_vl_chat_tokens`). Returns an error otherwise.
+    pub fn prefill_multimodal_async(
+        &mut self,
+        input_ids: &[i32],
+        visual_features: &Array,
+        cache: &mut Vec<KVCache>,
+    ) -> Result<Array, Error> {
+        let image_positions: Vec<usize> = input_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &id)| (id as u32 == self.image_token_id).then_some(idx))
+            .collect();
+        if image_positions.is_empty() {
+            return self.prefill_text(input_ids, cache);
+        }
+        let img_start = *image_positions.first().unwrap();
+        let img_end_excl = image_positions.last().unwrap() + 1;
+        let is_contiguous =
+            image_positions.windows(2).all(|w| w[1] == w[0] + 1);
+        if !is_contiguous {
+            return Err(Error::Model(
+                "prefill_multimodal_async requires a contiguous image-token block; \
+                 use prefill_multimodal for interleaved layouts."
+                    .into(),
+            ));
+        }
+        let n_image_slots = image_positions.len();
+        let vis_len = visual_features.shape()[0] as usize;
+        if vis_len == 0 {
+            return Err(Error::Model(
+                "encode_image_bytes returned zero visual tokens".into(),
+            ));
+        }
+        if vis_len != n_image_slots {
+            return Err(Error::Model(format!(
+                "prefill_multimodal_async: vis_len ({vis_len}) != image-token count ({n_image_slots})"
+            )));
+        }
+
+        // Pre-text and post-text embedding lookups — lazy.
+        let scale_f32 = (self.text.args.hidden_size as f32).sqrt();
+        let pre_ids = &input_ids[..img_start];
+        let post_ids = &input_ids[img_end_excl..];
+        let pre_embeds = self.text.embed_tokens_slice(pre_ids)?;
+        let post_embeds = self.text.embed_tokens_slice(post_ids)?;
+        let scale = Array::from(scale_f32)
+            .as_dtype(Dtype::Bfloat16)?
+            .as_dtype(pre_embeds.dtype())?;
+        let pre_scaled = pre_embeds.multiply(&scale)?;
+        let post_scaled = post_embeds.multiply(&scale)?;
+
+        // Match dtype of text embeds for the concat. visual_features
+        // comes through `embed_vision.forward` which yields the LLM
+        // hidden_size in bf16; the cast is a no-op in the common case.
+        let vis_aligned = if visual_features.dtype() != pre_scaled.dtype() {
+            visual_features.as_dtype(pre_scaled.dtype())?
+        } else {
+            visual_features.clone()
+        };
+
+        // [pre_L, H], [vis_L, H], [post_L, H] -> [seq_len, H]
+        let combined_2d = ops::concatenate_axis(
+            &[&pre_scaled, &vis_aligned, &post_scaled],
+            0,
+        )?;
+        let seq_len = input_ids.len() as i32;
+        let combined = combined_2d
+            .reshape(&[1, seq_len, self.text.args.hidden_size])?;
+
+        // PLE: same fallback as prefill_multimodal — auxiliary signal,
+        // OK to feed image_token_id through the lookup at image slots.
+        let input_ids_arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+        let per_layer_inputs_full = self
+            .text
+            .model
+            .compute_per_layer_inputs(&input_ids_arr, &combined)
+            .map_err(|e| Error::Model(format!("compute_per_layer_inputs: {e}")))?;
+
+        // Chunked prefill — same as prefill_multimodal.
+        const PREFILL_CHUNK: i32 = 32;
+        let total = seq_len;
+        let mut pos: i32 = 0;
+        while pos < total {
+            let end = (pos + PREFILL_CHUNK).min(total);
+            let chunk = combined.index((.., pos..end, ..));
+            let ple_chunk = per_layer_inputs_full
+                .as_ref()
+                .map(|p| p.index((.., pos..end, .., ..)));
+            if end < total {
+                let hidden = self
+                    .text
+                    .model
+                    .forward_from_embeds(&chunk, None, cache, ple_chunk.as_ref())?;
+                eval([&hidden])
+                    .map_err(|e| Error::Model(format!("prefill_async chunk {pos}: {e}")))?;
+            } else {
+                return self
+                    .text
+                    .forward_from_embeds(&chunk, cache, ple_chunk.as_ref())
+                    .map_err(Into::into);
+            }
+            pos = end;
+        }
+        Err(Error::Model(
+            "prefill_multimodal_async: unexpected empty sequence".into(),
+        ))
     }
 
     pub fn prefill_text(
