@@ -326,3 +326,56 @@ pub struct GdnRollbackSnapshot {
     /// Innovation tape + (k, decay) captured by `forward_prefill_with_tape`.
     pub capture: crate::deltanet::GdnTapeCapture,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deltanet::GdnTapeCapture;
+    use mlx_rs::ops::zeros_dtype;
+    use mlx_rs::Dtype;
+
+    // F1 regression: on a speculative-decoding rollback, a recurrent (GDN)
+    // layer MUST be rolled back. `HybridCache::trim` is a no-op for recurrent
+    // slots (leaving GDN state advanced past the accepted prefix while KV
+    // layers are trimmed — silent corruption); `trim_gdn` replays the accepted
+    // prefix from a snapshot and rolls the step back. This guards that the MTP
+    // verify path uses `trim_gdn`, not `trim`, for recurrent layers.
+    #[test]
+    fn trim_is_noop_for_recurrent_but_trim_gdn_rolls_back() {
+        let (b, h, kdim, vdim, l) = (1i32, 1i32, 32i32, 32i32, 4i32);
+        let conv_dim = 96i32;
+        let post_state = zeros_dtype(&[b, h, kdim, vdim], Dtype::Float32).unwrap();
+        let rec = RecurrentState {
+            state: Some(post_state),
+            conv_state: None,
+            step: 10 + l, // advanced by the verify of `l` tokens
+        };
+
+        // `trim` leaves the recurrent step advanced — documents the bug.
+        let mut c_trim = HybridCache::Recurrent(rec.clone());
+        c_trim.trim(2).unwrap();
+        assert_eq!(
+            c_trim.offset(),
+            10 + l,
+            "trim must be a no-op for recurrent layers",
+        );
+
+        // `trim_gdn` rolls the layer back to snapshot.step + (verify_len - n_drop).
+        let capture = GdnTapeCapture {
+            tape: zeros_dtype(&[b, h, l, vdim], Dtype::Float32).unwrap(),
+            k: zeros_dtype(&[b, h, l, kdim], Dtype::Float32).unwrap(),
+            decay: zeros_dtype(&[b, h, l], Dtype::Float32).unwrap(),
+            qkv_cf: zeros_dtype(&[b, conv_dim, l], Dtype::Float32).unwrap(),
+            conv_kernel_size: 4,
+        };
+        let snap = GdnRollbackSnapshot {
+            state: zeros_dtype(&[b, h, kdim, vdim], Dtype::Float32).unwrap(),
+            conv_state: None,
+            step: 10,
+            capture,
+        };
+        let mut c_gdn = HybridCache::Recurrent(rec);
+        c_gdn.trim_gdn(2, l, Some(&snap)).unwrap();
+        assert_eq!(c_gdn.offset(), 10 + (l - 2)); // 12: rolled back to accepted prefix
+    }
+}

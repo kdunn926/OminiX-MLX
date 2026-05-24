@@ -17,7 +17,7 @@ use mlx_rs_core::{
 };
 
 use crate::attention::{GatedAttention, GatedAttentionInput};
-use crate::cache::{HybridCache, RecurrentState};
+use crate::cache::{GdnRollbackSnapshot, HybridCache, RecurrentState};
 use crate::config::{ModelArgs, TextConfig};
 use crate::deltanet::GatedDeltaNet;
 use crate::moe::{DenseMlp, MoeBlock, QuantizedSwitchLinear, SharedExpert, SwitchGLU};
@@ -87,6 +87,83 @@ impl TransformerBlock {
             _ => return Err(Exception::custom("Cache type mismatch with layer type")),
         };
 
+        self.ffn_tail(x, attn_out)
+    }
+
+    /// Like [`forward`], but for recurrent (GDN) layers in a multi-token
+    /// prefill (`L > 1`) it records a [`GdnRollbackSnapshot`] so a speculative
+    /// verify pass can be rolled back via [`HybridCache::trim_gdn`]. Returns
+    /// `None` for full-attention layers and for single-token steps (where the
+    /// plain KV `trim` already rolls back correctly and no GDN tape is needed).
+    ///
+    /// Kept separate from [`forward`] so the hot path never pays the tape-
+    /// recording cost (`deltanet_with_tape` vs the plain recurrence).
+    #[allow(non_snake_case)]
+    pub fn forward_capture_gdn(
+        &mut self,
+        x: &Array,
+        mask: Option<&mlx_rs_core::utils::AttentionMask>,
+        cache: &mut HybridCache,
+    ) -> Result<(Array, Option<GdnRollbackSnapshot>), Exception> {
+        let normed = self.input_layernorm.forward(x)?;
+
+        let mut snapshot: Option<GdnRollbackSnapshot> = None;
+        let attn_out = match (&mut self.attention, cache) {
+            (AttentionLayer::FullAttention(attn), HybridCache::KV(kv_cache)) => {
+                attn.forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(kv_cache),
+                })?
+            }
+            (AttentionLayer::FullAttention(attn), HybridCache::QuantizedKV(qkv_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(qkv_cache),
+                })?,
+            (AttentionLayer::FullAttention(attn), HybridCache::TurboQuantKV(tq_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(tq_cache),
+                })?,
+            (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
+                let L = normed.shape()[1];
+                if L > 1 {
+                    // Snapshot the recurrent state BEFORE the tape forward
+                    // mutates it (it `take`s cache.state and updates step).
+                    let B = normed.shape()[0];
+                    let pre_state = match &rec_cache.state {
+                        Some(s) => s.clone(),
+                        None => mlx_rs::ops::zeros_dtype(
+                            &[B, delta.num_v_heads, delta.key_head_dim, delta.value_head_dim],
+                            Dtype::Float32,
+                        )?,
+                    };
+                    let pre_conv_state = rec_cache.conv_state.clone();
+                    let pre_step = rec_cache.step;
+                    let (out, capture) = delta.forward_prefill_with_tape(&normed, rec_cache)?;
+                    snapshot = Some(GdnRollbackSnapshot {
+                        state: pre_state,
+                        conv_state: pre_conv_state,
+                        step: pre_step,
+                        capture,
+                    });
+                    out
+                } else {
+                    delta.forward_step(&normed, rec_cache)?
+                }
+            }
+            _ => return Err(Exception::custom("Cache type mismatch with layer type")),
+        };
+
+        Ok((self.ffn_tail(x, attn_out)?, snapshot))
+    }
+
+    /// Residual + post-attention norm + FFN, shared by [`forward`] and
+    /// [`forward_capture_gdn`].
+    fn ffn_tail(&mut self, x: &Array, attn_out: Array) -> Result<Array, Exception> {
         let h = x.add(attn_out)?;
         let normed_h = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = match &mut self.ffn {
@@ -226,6 +303,52 @@ impl Model {
     ) -> Result<Array, Exception> {
         let h = self.forward_hidden(inputs, cache)?;
         self.apply_lm_head(&h)
+    }
+
+    /// Verify forward for speculative decoding. Identical to [`forward`]
+    /// (per-position logits `[B, T, V]`) but additionally returns, per layer, a
+    /// [`GdnRollbackSnapshot`] for recurrent (GDN) layers so a rejected draft
+    /// suffix can be undone with [`HybridCache::trim_gdn`]. Without this, GDN
+    /// layers' recurrent state advances during verify and `HybridCache::trim`
+    /// (a no-op for recurrent slots) leaves them desynced from the trimmed KV
+    /// layers — silently corrupting every subsequent token.
+    ///
+    /// The returned vector is aligned with `cache` (one entry per layer); entries
+    /// are `None` for full-attention layers and for `T == 1`.
+    #[allow(non_snake_case)]
+    pub fn forward_verify_with_snapshots(
+        &mut self,
+        inputs: &Array,
+        cache: &mut Vec<HybridCache>,
+    ) -> Result<(Array, Vec<Option<GdnRollbackSnapshot>>), Exception> {
+        let mut h = self.text_model.embed_tokens.forward(inputs)?;
+        let T = h.shape()[1];
+        let mask = if T > 1 {
+            Some(mlx_rs_core::utils::AttentionMask::Causal)
+        } else {
+            None
+        };
+
+        if cache.is_empty() {
+            for layer_type in &self.text_model.layer_types {
+                if layer_type == "full_attention" {
+                    cache.push(HybridCache::KV(KVCache::new()));
+                } else {
+                    cache.push(HybridCache::Recurrent(RecurrentState::new()));
+                }
+            }
+        }
+
+        let mut snapshots = Vec::with_capacity(self.text_model.layers.len());
+        for (layer, c) in self.text_model.layers.iter_mut().zip(cache.iter_mut()) {
+            let (out, snap) = layer.forward_capture_gdn(&h, mask.as_ref(), c)?;
+            h = out;
+            snapshots.push(snap);
+        }
+
+        h = self.text_model.norm.forward(&h)?;
+        let logits = self.apply_lm_head(&h)?;
+        Ok((logits, snapshots))
     }
 
     /// Forward pass starting from pre-built embeddings instead of token IDs.

@@ -107,13 +107,15 @@ pub fn accept_greedy(
 
 /// Probability-ratio acceptance + residual `(p-q)+` sampling.
 ///
-/// `target_logits` / `draft_logits` shape `[K, vocab]`. `temp` must be
-/// > 0; the caller is expected to route T=0 paths through
-/// [`accept_greedy`] (or pass `temp = 1.0` if it really wants
-/// Leviathan-Chen at T=0).
+/// `target_logits` has shape `[K+1, vocab]`: one target distribution per
+/// drafted position (rows `0..K`) plus a bonus row `K` — the target's
+/// distribution at the position one past the last draft, used when every
+/// draft is accepted. `draft_logits` has shape `[K, vocab]`. `temp` must be
+/// > 0; the caller is expected to route T=0 paths through [`accept_greedy`]
+/// (or pass `temp = 1.0` if it really wants Leviathan-Chen at T=0).
 ///
-/// Both distributions are softmaxed in fp32 for numerical stability,
-/// even when the model emits bf16.
+/// Both distributions are softmaxed in fp32 for numerical stability, even when
+/// the model emits bf16.
 pub fn accept_speculative<R: FnMut() -> f32>(
     target_logits: &Array,
     draft_logits: &Array,
@@ -123,7 +125,15 @@ pub fn accept_speculative<R: FnMut() -> f32>(
 ) -> Result<AcceptanceResult, MtpError> {
     debug_assert!(temp > 0.0, "speculative acceptance requires temp > 0");
     let k = draft.len();
-    let t_probs = softmax_rows_fp32(target_logits, temp)?; // [K, vocab]
+    // Target must carry the K draft rows plus the bonus row at index K.
+    let t_rows = target_logits.shape().first().copied().unwrap_or(0) as usize;
+    if t_rows < k + 1 {
+        return Err(MtpError::Mlx(format!(
+            "accept_speculative: target_logits needs K+1={} rows, got {t_rows}",
+            k + 1
+        )));
+    }
+    let t_probs = softmax_rows_fp32(target_logits, temp)?; // [K+1, vocab]
     let q_probs = softmax_rows_fp32(draft_logits, temp)?;
 
     let vocab = t_probs.shape().last().copied().unwrap_or(0) as usize;
@@ -171,17 +181,13 @@ pub fn accept_speculative<R: FnMut() -> f32>(
         });
     }
 
-    // All K accepted: sample a bonus token from p at slot K-1's row?
-    // No — the bonus comes from the target's distribution at position K
-    // (i.e. one past the last accepted draft). The caller provides this
-    // as the last row of `target_logits` *iff* it built target_logits
-    // with shape `[K+1, vocab]`. To avoid that contract complexity we
-    // instead require the caller to pass the bonus row separately via
-    // `accept_speculative_with_bonus`. For the all-accepted branch here
-    // we sample from the last row of `target_logits` as a best-effort
-    // (Leviathan-Chen's "bonus" is just one extra free target sample).
-    let last_row = (k - 1) * vocab;
-    let row_p = &t_flat[last_row..last_row + vocab];
+    // All K accepted: the bonus is a free sample from the target's
+    // distribution at position K (one past the last accepted draft), which is
+    // row K of `target_logits`. Sampling row K-1 (the last draft's own row)
+    // would re-sample the position that was just accepted — an off-by-one that
+    // breaks the chain.
+    let bonus_row = k * vocab;
+    let row_p = &t_flat[bonus_row..bonus_row + vocab];
     let s_p: f32 = row_p.iter().sum();
     let bonus = sample_from_unnormalized(row_p, s_p, &mut rng);
     Ok(AcceptanceResult {
@@ -304,7 +310,8 @@ mod tests {
     #[test]
     fn speculative_accepts_when_p_dominates_q() {
         // Target heavily favors id=0; draft also favors id=0. p[0]/q[0] ≈ 1 → almost always accept.
-        let t = logits(&[&[10.0, 0.0, 0.0]]);
+        // Row K=1 is the bonus row (required by the [K+1, vocab] contract).
+        let t = logits(&[&[10.0, 0.0, 0.0], &[0.0, 10.0, 0.0]]);
         let q = logits(&[&[10.0, 0.0, 0.0]]);
         seed_default_rng(42);
         let r = accept_speculative(&t, &q, &[0], 1.0, default_rng).unwrap();
@@ -313,10 +320,25 @@ mod tests {
     }
 
     #[test]
+    fn speculative_all_accepted_bonus_from_row_k() {
+        // K=1, row 0 uniform so the draft (id=0) is always accepted; the bonus
+        // must come from row K=1, which peaks overwhelmingly at id=2.
+        let t = logits(&[&[5.0, 5.0, 5.0], &[0.0, 0.0, 20.0]]);
+        let q = logits(&[&[5.0, 5.0, 5.0]]);
+        for s in 0..20u64 {
+            seed_default_rng(s);
+            let r = accept_speculative(&t, &q, &[0], 1.0, default_rng).unwrap();
+            assert!(r.all_accepted);
+            assert_eq!(r.correction, 2, "bonus must be sampled from row K, not row K-1");
+        }
+    }
+
+    #[test]
     fn speculative_rejects_when_p_starves_q() {
         // Target says id=2 (p[2] huge); draft picked id=0 (q[0] huge).
         // ratio = p[0]/q[0] is tiny → almost always reject; residual peaks at id=2.
-        let t = logits(&[&[0.0, 0.0, 10.0]]);
+        // Second row is the (rarely used) bonus row.
+        let t = logits(&[&[0.0, 0.0, 10.0], &[0.0, 0.0, 10.0]]);
         let q = logits(&[&[10.0, 0.0, 0.0]]);
         seed_default_rng(7);
         let mut rejects = 0;
@@ -341,7 +363,7 @@ mod tests {
     #[test]
     fn speculative_unbiased_marginal_smoke() {
         // With matching draft = target, accept rate should be ~1.
-        let t = logits(&[&[1.0, 2.0, 3.0]]);
+        let t = logits(&[&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]]);
         let q = logits(&[&[1.0, 2.0, 3.0]]);
         let mut accepts = 0;
         for s in 0..200u64 {
