@@ -1469,6 +1469,38 @@ impl KeyValueCache for QuantizedKVCache {
         *self = Self::new(self.group_size, self.k_bits, self.v_bits, self.step);
     }
 
+    /// Drop the last `n_drop` tokens (F20). Only the unquantized residual is
+    /// trimmable — quantized blocks can't be partially un-quantized cheaply.
+    /// Speculative rollback only ever drops the just-appended draft tokens,
+    /// which are still in the residual (drafts are recent and `block_len` is
+    /// far smaller than `step`), so this covers the real case; trimming past
+    /// the residual into a quantized block returns an error rather than
+    /// silently corrupting.
+    fn trim_kv(&mut self, n_drop: i32) -> Result<(), Exception> {
+        if n_drop <= 0 {
+            return Ok(());
+        }
+        let res_len = self.k_residual.as_ref().map(|r| r.shape()[2]).unwrap_or(0);
+        if n_drop > res_len {
+            return Err(Exception::custom(format!(
+                "QuantizedKVCache::trim_kv: n_drop={n_drop} exceeds unquantized \
+                 residual={res_len}; trimming into quantized blocks is unsupported"
+            )));
+        }
+        let keep = res_len - n_drop;
+        if keep == 0 {
+            self.k_residual = None;
+            self.v_residual = None;
+        } else {
+            self.k_residual =
+                Some(self.k_residual.as_ref().unwrap().index((Ellipsis, ..keep, ..)));
+            self.v_residual =
+                Some(self.v_residual.as_ref().unwrap().index((Ellipsis, ..keep, ..)));
+        }
+        self.offset -= n_drop;
+        Ok(())
+    }
+
     fn update_and_fetch(
         &mut self,
         keys: Array,
@@ -1713,6 +1745,25 @@ mod tests {
         let (k, v) = make_kv(1, 4, 1, 100, 0.01);
         let result = cache.update_and_fetch(k, v);
         assert!(result.is_err(), "Expected error for non-divisible head_dim");
+    }
+
+    // F20: trim_kv drops recent tokens from the unquantized residual (the
+    // speculative-rollback case) and errors if asked to trim into a quantized
+    // block rather than corrupting silently.
+    #[test]
+    fn quantized_kv_trim_kv_residual() {
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 256);
+        let (k, v) = make_kv(1, 2, 5, 64, 0.02); // 5 < step → all in residual
+        cache.update_and_fetch(k, v).unwrap();
+        assert_eq!(cache.offset(), 5);
+
+        cache.trim_kv(2).unwrap();
+        assert_eq!(cache.offset(), 3);
+        let (rk, _rv) = cache.current_kv().expect("non-empty");
+        assert_eq!(rk.shape()[2], 3, "reconstruct reflects the trim");
+
+        // Trimming past the residual is unsupported (would need to un-quantize).
+        assert!(cache.trim_kv(10).is_err());
     }
 
     // F21: current_kv must reconstruct at the model's dtype, not a hardcoded

@@ -3,6 +3,14 @@
 //! Speculative decoding uses a smaller "draft" model to generate candidate tokens,
 //! which are then verified by the larger "target" model in parallel. This can
 //! significantly speed up inference when the draft model has high acceptance rate.
+//!
+//! NOTE: this generic dual-model implementation is currently unused by the
+//! workspace — the production speculative paths are `mtplx-mlx` (MTP head) and
+//! `dflash-mlx` (block diffusion), which carry their own distribution-preserving
+//! acceptance and cache rollback. Until this version's accept/reject sampling is
+//! made distribution-preserving (it is greedy-equality only), prefer those.
+//! Cache rollback on rejection was previously a no-op and is now wired via
+//! `trim_kv`; it remains unverified by any consumer.
 
 use mlx_rs::{
     argmax_axis, array, categorical,
@@ -160,12 +168,17 @@ where
         Ok((seq_len, tokens, logprobs))
     }
 
-    /// Trim cache by removing the last n entries
-    #[allow(dead_code)]
+    /// Drop the last `n` speculated positions from every layer's cache.
     fn trim_cache<Cache: KeyValueCache>(cache: &mut Vec<Option<Cache>>, n: i32) {
-        // This is a simplified version - full implementation would need
-        // proper cache trimming support in KeyValueCache trait
-        let _ = (cache, n);
+        if n <= 0 {
+            return;
+        }
+        for c in cache.iter_mut().flatten() {
+            // trim_kv is best-effort: caches that don't support O(1) trim
+            // return Err, which we surface as a no-op here (callers using such
+            // caches must not speculate).
+            let _ = c.trim_kv(n);
+        }
     }
 }
 
@@ -274,6 +287,16 @@ where
                         break;
                     }
                 }
+
+                // Roll back the speculated positions that were NOT accepted, on
+                // both caches, so the next cycle doesn't attend to phantom
+                // tokens. Verify appended `last_token + N drafts` to the target
+                // and the draft model advanced by N; we keep `accepted` of the
+                // N drafts on each (the correction at `accepted` is emitted now
+                // but re-appended next cycle), so both trim by `N - accepted`.
+                let rejected = draft_tokens.len() as i32 - accepted as i32;
+                Self::trim_cache(self.target_cache, rejected);
+                Self::trim_cache(self.draft_cache, rejected);
 
                 // The token at position `accepted` is from target model (either correction or next)
                 let final_token = target_tokens[accepted].clone();

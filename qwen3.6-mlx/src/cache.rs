@@ -244,9 +244,7 @@ impl HybridCache {
                 Ok(())
             }
             HybridCache::TurboQuantKV(tq) => tq.trim(n_drop),
-            HybridCache::QuantizedKV(_) => Err(Exception::custom(
-                "HybridCache::trim: QuantizedKVCache trim is not implemented",
-            )),
+            HybridCache::QuantizedKV(qkv) => qkv.trim_kv(n_drop),
             HybridCache::Recurrent(_) => Ok(()), // no-op; see trim_gdn
         }
     }
@@ -273,13 +271,11 @@ impl HybridCache {
                 kv.trim(n_drop);
                 Ok(())
             }
-            HybridCache::QuantizedKV(_) => {
-                // QuantizedKVCache currently lacks an O(1) trim hook. Callers
-                // that mix quantized KV with speculative rollback must fall
-                // back to the snapshot+re-forward path until that lands.
-                Err(Exception::custom(
-                    "HybridCache::trim_gdn: QuantizedKVCache trim is not yet implemented",
-                ))
+            HybridCache::QuantizedKV(qkv) => {
+                // Residual-only trim (F20): rejected draft tokens are recent and
+                // live in the unquantized residual. Errors if a rollback reaches
+                // into a quantized block (unsupported), rather than corrupting.
+                qkv.trim_kv(n_drop)
             }
             HybridCache::TurboQuantKV(tq) => {
                 tq.trim(n_drop)?;
