@@ -945,14 +945,18 @@ const TQ_SDPA_4BIT_ONLINE_KERNEL: &str = r#"
     }
 "#;
 
-// V matmul using simdgroup_matrix<float, 8, 8> tile intrinsics. 256
-// threads (8 simdgroups of 32 lanes); each simdgroup owns one d-group
-// of 8 outputs. Same online-softmax + V-tile cache shape as the v2
-// kernel, only the FMA loop swaps scalar reads for matrix-tile ops on
-// the Apple matrix functional pipe. Opt-in via TURBOQUANT_SIMD_MATMUL=1
-// — empirical impact depends on whether V matmul is on the workload's
-// critical path; on Gemma4 5K decode the kernel itself is <5% of decode
-// time and gains may be marginal.
+// Wide (256-thread) online-softmax SDPA kernel for the 4-bit TurboQuant
+// path. Originally an attempt to drive the V matmul through
+// simdgroup_matrix<float, 8, 8> tile intrinsics, but for q_len=1 decode the
+// attention output is a matrix-VECTOR product (1xKV scores · KVxD V): an 8x8
+// systolic tile leaves 7 of 8 rows empty, wasting 7/8 of the MACs, and the
+// sparse-A path produced wrong results (sign flips / inf). simdgroup_matrix is
+// the right tool for DENSE matmuls (MoE MLP, batched/q_len>1 prefill), not a
+// row-vector reduction. This kernel therefore uses a cooperative scalar
+// reduction (64 threads, one output dim each) — the same math as
+// tq_sdpa_4bit_online but spreading V-dequant across 256 threads (4 per KV
+// row). Selected via TURBOQUANT_SIMD_MATMUL; gains over the v2 kernel are
+// marginal since the V matmul is <5% of Gemma4 5K decode time.
 const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
     uint tid = thread_position_in_threadgroup.x;
     uint group_x = threadgroup_position_in_grid.x;
@@ -963,10 +967,6 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
     uint h_kv = h_q / uint(kv_repeat);
     uint d_start = d_chunk_id * 64u;
     if (d_start >= uint(D)) return;
-
-    uint sg_id   = tid >> 5;       // 0..7
-    uint sg_lane = tid & 31u;
-    uint d_group_start = sg_id * 8u;  // each simdgroup outputs d_start + 8*sg_id .. +8
 
     threadgroup float s_q[512];
     threadgroup float s_centroids[16];
@@ -979,10 +979,8 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
     threadgroup float s_running_m;
     threadgroup float s_running_l;
     threadgroup float s_v_tile[64 * 64];
-    // 8x8 A tile (only row 0 used). Shared across simdgroups.
-    threadgroup float s_a_tile[64];
-    // Per-simdgroup 8x8 C tile dump (only row 0 of each is used).
-    threadgroup float s_c_dump[8 * 64];
+    // Running (rescaled) output numerator for the 64 d-cols of this chunk.
+    threadgroup float s_out[64];
 
     if (tid < 16u) s_centroids[tid] = centroids[tid];
 
@@ -1049,11 +1047,8 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
     uint v_base  = b * v_stride_b + h_kv * v_stride_h;
     uint vs_base = b * vs_b + h_kv * vs_h;
 
-    // Per-simdgroup accumulator: only row 0 is the real output. Stored
-    // across the 32 lanes of the simdgroup as a tile.
-    simdgroup_matrix<float, 8, 8> sg_c = simdgroup_matrix<float, 8, 8>(0.0f);
-
     if (tid == 0u) { s_running_m = -1.0e30f; s_running_l = 0.0f; }
+    if (tid < 64u) s_out[tid] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t = 0u; t < uint(KV); t += 64u) {
@@ -1174,82 +1169,28 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // (e) V matmul via simdgroup_matrix.
-        // Online-softmax rescale: sg_c *= alpha BEFORE accumulating this
-        // tile's contribution. Metal's simdgroup_matrix has no native
-        // scalar multiply, so we round-trip through threadgroup memory:
-        //   store → scalar multiply per lane → load.
-        // The store/load is 64 floats per simdgroup, dominated by the
-        // accumulate path's GMEM traffic in practice.
-        simdgroup_store(sg_c, &s_c_dump[sg_id * 64u], 8);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
-            uint base = sg_id * 64u;
-            for (uint k = sg_lane; k < 64u; k += 32u) {
-                s_c_dump[base + k] *= alpha;
+        // (e) Cooperative V matmul: 64 threads, each accumulates one output
+        // dim d-local = tid over all KV positions in the tile, then folds into
+        // the running numerator with the online-softmax rescale. Scores for
+        // kk >= tile_len are zeroed in step (c), so the full 64-wide loop is
+        // safe even for a short final tile.
+        if (tid < 64u) {
+            float acc = 0.0f;
+            for (uint kk = 0u; kk < 64u; ++kk) {
+                acc += s_tile_scores[kk] * s_v_tile[kk * 64u + tid];
             }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_load(sg_c, &s_c_dump[sg_id * 64u], 8);
-
-        // Each tile contributes 8 8x8 matmuls per simdgroup (kv split
-        // into 8 chunks of 8 positions).
-        for (uint kk_chunk = 0u; kk_chunk < 8u; ++kk_chunk) {
-            uint kk_start = kk_chunk * 8u;
-            // Build A tile: row 0 = scores[kk_start..kk_start+8], rows 1..7 = 0.
-            // 64 cells; first 8 threads populate row 0, rest write 0.
-            if (tid < 8u) {
-                s_a_tile[tid] = s_tile_scores[kk_start + tid];
-            } else if (tid < 64u) {
-                s_a_tile[tid] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            simdgroup_matrix<float, 8, 8> sg_a, sg_b;
-            simdgroup_load(sg_a, s_a_tile, 8);
-            simdgroup_load(
-                sg_b,
-                &s_v_tile[kk_start * 64u + d_start + d_group_start],
-                64
-            );
-            simdgroup_multiply_accumulate(sg_c, sg_a, sg_b, sg_c);
+            s_out[tid] = s_out[tid] * alpha + acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // (f) Extract row 0 of each simdgroup's sg_c, normalise by l, write 8 d values.
-    simdgroup_store(sg_c, &s_c_dump[sg_id * 64u], 8);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    // (f) Normalise by the running softmax denominator and write D_CHUNK outputs.
     if (tid < 64u) {
-        uint sg_part = tid >> 3;
-        uint col = tid & 7u;
-        // row 0, col `col` of simdgroup `sg_part`'s 8x8 tile.
-        // NOTE: this kernel's correctness test (`online_softmax_simd_matches_reference`)
-        // fails with ~13% rel error and sign flips at ~half the output positions.
-        // Root cause (diagnosed 2026-05-18 against tinygrad's working metal_matmul
-        // reference at github.com/tinygrad/tinygrad/blob/3f2d4014/extra/gemm/metal_matmul.py):
-        // simdgroup_matrix expects DENSE 8x8 tiles. Our A-tile is a row-vector
-        // (1x8 real data + 7x8 zero padding), and Apple's per-thread lane→element
-        // mapping inside simdgroup_multiply_accumulate is implementation-defined,
-        // so the zero-padded rows land in lanes that scramble the result.
-        // Two viable fixes:
-        //   (a) Batch 8 query rows at once so A is dense — requires rewriting
-        //       the online-softmax loop to process 8 queries together. Not worth
-        //       it for our decode path where q_len=1.
-        //   (b) Use raw simdgroup ops (simd_shuffle dot products) instead of
-        //       simdgroup_matrix — that's what tq_sdpa_4bit_online (the working
-        //       kernel) already does.
-        // Conclusion: simdgroup_matrix is the wrong tool for row-vector workloads.
-        // Kernel kept gated off (TURBOQUANT_SIMD_MATMUL=1) as a record. Use
-        // tq_sdpa_4bit_online for production. simdgroup_matrix IS the right tool
-        // for dense matmul workloads (MoE expert MLP, large-batch prefill).
-        float v = s_c_dump[sg_part * 64u + col];
         float inv_l = 1.0f / s_running_l;
-        uint d_global = d_start + sg_part * 8u + col;
+        uint d_global = d_start + tid;  // tid is the d-local index (0..63)
         if (d_global < uint(D)) {
             uint out_offset = (b * uint(Hq) + h_q) * uint(D) + d_global;
-            out[out_offset] = T(v * inv_l);
+            out[out_offset] = T(s_out[tid] * inv_l);
         }
     }
 "#;

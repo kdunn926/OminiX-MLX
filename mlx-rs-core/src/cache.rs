@@ -1079,13 +1079,16 @@ impl KeyValueCache for TurboQuantKVCache {
             let signs_vec = cached_signs(d, self.seed);
             let signs = Array::from_slice(&signs_vec, &[d]);
             let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
-            // NOTE: TURBOQUANT_SIMD_MATMUL is experimental — the
-            // simdgroup_matrix V-matmul kernel currently fails its
-            // correctness test (online_softmax_simd_matches_reference,
-            // ~13% rel error with sign flips, suspected layout issue in
-            // simdgroup_load/store rescale round-trip). Leave gated off
-            // by default until fixed.
-            let out = if std::env::var("TURBOQUANT_SIMD_MATMUL").is_ok() {
+            // TURBOQUANT_SIMD_MATMUL selects the wide 256-thread online kernel
+            // (tq_sdpa_4bit_online_simd). It now passes
+            // online_softmax_simd_matches_reference; gains over the default v2
+            // kernel are marginal (V matmul is a small fraction of decode), so
+            // it stays opt-in. Gate on != "0" so `=0` disables it, matching the
+            // TURBOQUANT_ONLINE convention (presence alone must not enable it).
+            let simd_matmul = std::env::var("TURBOQUANT_SIMD_MATMUL")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            let out = if simd_matmul {
                 crate::metal_kernels::tq_sdpa_4bit_online_simd(
                     q, packed, sigma, mean, pv, vs, vb,
                     &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
