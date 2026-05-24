@@ -1310,6 +1310,107 @@ impl QuantizedKVCache {
         Self::new(64, 8, 4, 256)
     }
 
+    /// Append a block of tokens: grow the unquantized residual and flush full
+    /// `step`-sized blocks into the quantized stores. Unlike `update_and_fetch`
+    /// this does NOT call `reconstruct`, so the fused attention path can append
+    /// and then attend directly on the quantized data, skipping the O(n)
+    /// full-history dequantize that every decode step would otherwise pay.
+    fn append(&mut self, keys: Array, values: Array) -> Result<(), Exception> {
+        let ks = keys.shape();
+        let b = ks[0];
+        let h = ks[1];
+        let t = ks[2];
+        let kd = ks[3];
+        let vd = values.shape()[3];
+
+        if self.batch == 0 {
+            if kd % self.group_size != 0 {
+                return Err(Exception::custom(format!(
+                    "QuantizedKVCache: k_head_dim={kd} not divisible by group_size={}",
+                    self.group_size
+                )));
+            }
+            if vd % self.group_size != 0 {
+                return Err(Exception::custom(format!(
+                    "QuantizedKVCache: v_head_dim={vd} not divisible by group_size={}",
+                    self.group_size
+                )));
+            }
+            self.batch = b;
+            self.n_kv_heads = h;
+            self.k_head_dim = kd;
+            self.v_head_dim = vd;
+        } else if b != self.batch || h != self.n_kv_heads {
+            return Err(Exception::custom(format!(
+                "QuantizedKVCache: batch/heads mismatch: expected ({},{}) got ({b},{h})",
+                self.batch, self.n_kv_heads
+            )));
+        }
+
+        let k_res = match self.k_residual.take() {
+            Some(prev) => concatenate_axis(&[prev, keys], 2)?,
+            None => keys,
+        };
+        let v_res = match self.v_residual.take() {
+            Some(prev) => concatenate_axis(&[prev, values], 2)?,
+            None => values,
+        };
+
+        let res_len = k_res.shape()[2];
+        let n_full_steps = res_len / self.step;
+
+        if n_full_steps > 0 {
+            let tokens_to_q = n_full_steps * self.step;
+            let remaining = res_len - tokens_to_q;
+
+            let k_to_q = k_res.index((Ellipsis, ..tokens_to_q, ..));
+            let v_to_q = v_res.index((Ellipsis, ..tokens_to_q, ..));
+
+            let (new_kq, new_ks, new_kb) =
+                Self::quantize_block(&k_to_q, b, h, tokens_to_q, kd, self.group_size, self.k_bits)?;
+            let (new_vq, new_vs, new_vb) =
+                Self::quantize_block(&v_to_q, b, h, tokens_to_q, vd, self.group_size, self.v_bits)?;
+
+            self.k_q = Some(match self.k_q.take() {
+                Some(prev) => concatenate_axis(&[prev, new_kq], 2)?,
+                None => new_kq,
+            });
+            self.k_scales = Some(match self.k_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, new_ks], 2)?,
+                None => new_ks,
+            });
+            self.k_biases = Some(match self.k_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, new_kb], 2)?,
+                None => new_kb,
+            });
+            self.v_q = Some(match self.v_q.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vq], 2)?,
+                None => new_vq,
+            });
+            self.v_scales = Some(match self.v_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vs], 2)?,
+                None => new_vs,
+            });
+            self.v_biases = Some(match self.v_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vb], 2)?,
+                None => new_vb,
+            });
+
+            self.n_quantized += tokens_to_q;
+
+            if remaining > 0 {
+                self.k_residual = Some(k_res.index((Ellipsis, tokens_to_q.., ..)));
+                self.v_residual = Some(v_res.index((Ellipsis, tokens_to_q.., ..)));
+            }
+        } else {
+            self.k_residual = Some(k_res);
+            self.v_residual = Some(v_res);
+        }
+
+        self.offset += t;
+        Ok(())
+    }
+
     /// Dequantize stored keys/values and concatenate with residual.
     fn reconstruct(&self) -> Result<(Array, Array), Exception> {
         let b = self.batch;
@@ -1506,105 +1607,103 @@ impl KeyValueCache for QuantizedKVCache {
         keys: Array,
         values: Array,
     ) -> Result<(Array, Array), Exception> {
-        let ks = keys.shape();
-        let b = ks[0] as i32;
-        let h = ks[1] as i32;
-        let t = ks[2] as i32;
-        let kd = ks[3] as i32;
-        let vd = values.shape()[3] as i32;
-
-        // Validate dimensions on subsequent calls
-        if self.batch == 0 {
-            if kd % self.group_size != 0 {
-                return Err(Exception::custom(format!(
-                    "QuantizedKVCache: k_head_dim={kd} not divisible by group_size={}",
-                    self.group_size
-                )));
-            }
-            if vd % self.group_size != 0 {
-                return Err(Exception::custom(format!(
-                    "QuantizedKVCache: v_head_dim={vd} not divisible by group_size={}",
-                    self.group_size
-                )));
-            }
-            self.batch = b;
-            self.n_kv_heads = h;
-            self.k_head_dim = kd;
-            self.v_head_dim = vd;
-        } else if b != self.batch || h != self.n_kv_heads {
-            return Err(Exception::custom(format!(
-                "QuantizedKVCache: batch/heads mismatch: expected ({},{}) got ({b},{h})",
-                self.batch, self.n_kv_heads
-            )));
-        }
-
-        // Grow residual by appending new tokens along axis-2
-        let k_res = match self.k_residual.take() {
-            Some(prev) => concatenate_axis(&[prev, keys], 2)?,
-            None => keys,
-        };
-        let v_res = match self.v_residual.take() {
-            Some(prev) => concatenate_axis(&[prev, values], 2)?,
-            None => values,
-        };
-
-        let res_len = k_res.shape()[2] as i32;
-        let n_full_steps = res_len / self.step;
-
-        if n_full_steps > 0 {
-            let tokens_to_q = n_full_steps * self.step;
-            let remaining = res_len - tokens_to_q;
-
-            // Slice the tokens to quantize [B, H, tokens_to_q, D]
-            let k_to_q = k_res.index((Ellipsis, ..tokens_to_q, ..));
-            let v_to_q = v_res.index((Ellipsis, ..tokens_to_q, ..));
-
-            // Quantize keeping [B, H, tokens_to_q, packed] shape
-            let (new_kq, new_ks, new_kb) =
-                Self::quantize_block(&k_to_q, b, h, tokens_to_q, kd, self.group_size, self.k_bits)?;
-            let (new_vq, new_vs, new_vb) =
-                Self::quantize_block(&v_to_q, b, h, tokens_to_q, vd, self.group_size, self.v_bits)?;
-
-            // Append along token axis-2
-            self.k_q = Some(match self.k_q.take() {
-                Some(prev) => concatenate_axis(&[prev, new_kq], 2)?,
-                None => new_kq,
-            });
-            self.k_scales = Some(match self.k_scales.take() {
-                Some(prev) => concatenate_axis(&[prev, new_ks], 2)?,
-                None => new_ks,
-            });
-            self.k_biases = Some(match self.k_biases.take() {
-                Some(prev) => concatenate_axis(&[prev, new_kb], 2)?,
-                None => new_kb,
-            });
-            self.v_q = Some(match self.v_q.take() {
-                Some(prev) => concatenate_axis(&[prev, new_vq], 2)?,
-                None => new_vq,
-            });
-            self.v_scales = Some(match self.v_scales.take() {
-                Some(prev) => concatenate_axis(&[prev, new_vs], 2)?,
-                None => new_vs,
-            });
-            self.v_biases = Some(match self.v_biases.take() {
-                Some(prev) => concatenate_axis(&[prev, new_vb], 2)?,
-                None => new_vb,
-            });
-
-            self.n_quantized += tokens_to_q;
-
-            if remaining > 0 {
-                self.k_residual = Some(k_res.index((Ellipsis, tokens_to_q.., ..)));
-                self.v_residual = Some(v_res.index((Ellipsis, tokens_to_q.., ..)));
-            }
-            // else: residual is empty; leave as None
-        } else {
-            self.k_residual = Some(k_res);
-            self.v_residual = Some(v_res);
-        }
-
-        self.offset += t;
+        self.append(keys, values)?;
         self.reconstruct()
+    }
+
+    /// Fused decode attention on quantized K/V (F9). Computes
+    /// `softmax(Q·Kᵀ·scale)·V` directly from the quantized stores via
+    /// `quantized_matmul` (QKᵀ with `transpose=true`, PV with `transpose=false`)
+    /// plus a plain matmul over the small unquantized residual, so the full
+    /// O(n) dequantize that `update_and_fetch`→`reconstruct` performs on every
+    /// decode step is skipped. Only handles unmasked single-query decode; other
+    /// shapes return `None` (before appending) so the caller takes the
+    /// reconstruct+SDPA path. Output is `[B, Hq, 1, D]`.
+    fn try_fused_attention(
+        &mut self,
+        q: &Array,
+        k_new: Array,
+        v_new: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        kv_repeat: i32,
+    ) -> Result<Option<Array>, Exception> {
+        let qs = q.shape();
+        if qs.len() != 4 || qs[2] != 1 || mask.is_some() {
+            return Ok(None);
+        }
+        self.append(k_new, v_new)?;
+        if self.offset == 0 {
+            return Ok(None);
+        }
+
+        let (b, hq, d) = (qs[0], qs[1], qs[3]);
+        let hkv = self.n_kv_heads;
+
+        // GQA: expand a [B, Hkv, A, C] tensor to [B, Hq, A, C].
+        let expand = |x: &Array| -> Result<Array, Exception> {
+            if kv_repeat == 1 {
+                return Ok(x.clone());
+            }
+            let s = x.shape();
+            let (a, c) = (s[2], s[3]);
+            let x5 = x.reshape(&[b, hkv, 1, a, c])?;
+            let xb = mlx_rs::ops::broadcast_to(&x5, &[b, hkv, kv_repeat, a, c])?;
+            xb.reshape(&[b, hq, a, c])
+        };
+
+        let n_q = self.n_quantized;
+        let n_res = self.k_residual.as_ref().map(|r| r.shape()[2]).unwrap_or(0);
+
+        // --- scores: [B, Hq, 1, n] = concat(Q·K_qᵀ, Q·K_resᵀ) ---
+        let mut score_parts: Vec<Array> = Vec::new();
+        if n_q > 0 {
+            let kq = expand(self.k_q.as_ref().unwrap())?;
+            let kqs = expand(self.k_scales.as_ref().unwrap())?;
+            let kqb = expand(self.k_biases.as_ref().unwrap())?;
+            score_parts.push(mlx_rs::ops::quantized_matmul(
+                q, &kq, &kqs, &kqb, Some(true), Some(self.group_size), Some(self.k_bits), None,
+            )?);
+        }
+        if n_res > 0 {
+            let kr = expand(self.k_residual.as_ref().unwrap())?;
+            let kr_t = kr.transpose_axes(&[0, 1, 3, 2])?; // [B, Hq, d, n_res]
+            score_parts.push(mlx_rs::ops::matmul(q, &kr_t)?);
+        }
+        let scores = if score_parts.len() == 1 {
+            score_parts.pop().unwrap()
+        } else {
+            concatenate_axis(&score_parts.iter().collect::<Vec<_>>(), -1)?
+        };
+        let scale_arr = mlx_rs::array!(scale).as_dtype(scores.dtype())?;
+        let scores = scores.multiply(&scale_arr)?;
+        let probs = mlx_rs::ops::softmax_axis(&scores, -1, true)?; // [B, Hq, 1, n]
+
+        // --- weighted V: P_q·V_q + P_res·V_res ---
+        let mut out: Option<Array> = None;
+        if n_q > 0 {
+            let p_q = probs.index((Ellipsis, ..n_q));
+            let vq = expand(self.v_q.as_ref().unwrap())?;
+            let vqs = expand(self.v_scales.as_ref().unwrap())?;
+            let vqb = expand(self.v_biases.as_ref().unwrap())?;
+            // P_q [.., n_q] · V[n_q, d]: contract n_q, V_q quantized along d →
+            // transpose=false (x · dequant(w)).
+            let o = mlx_rs::ops::quantized_matmul(
+                &p_q, &vq, &vqs, &vqb, Some(false), Some(self.group_size), Some(self.v_bits), None,
+            )?;
+            out = Some(o);
+        }
+        if n_res > 0 {
+            let p_res = probs.index((Ellipsis, n_q..));
+            let vr = expand(self.v_residual.as_ref().unwrap())?; // [B, Hq, n_res, d]
+            let o = mlx_rs::ops::matmul(&p_res, &vr)?; // [B, Hq, 1, d]
+            out = Some(match out {
+                Some(prev) => prev.add(&o)?,
+                None => o,
+            });
+        }
+        let _ = d;
+        Ok(out)
     }
 
     fn current_kv(&self) -> Option<(Array, Array)> {
@@ -1764,6 +1863,71 @@ mod tests {
 
         // Trimming past the residual is unsupported (would need to un-quantize).
         assert!(cache.trim_kv(10).is_err());
+    }
+
+    // F9: the fused quantized-attention path must match the reconstruct+SDPA
+    // reference (both operate on identical quantized state, so they should
+    // agree up to float-accumulation order). Uses step=4 so a handful of tokens
+    // produce BOTH quantized blocks and an unquantized residual, and GQA
+    // (Hq=4, Hkv=2) so head expansion is exercised.
+    #[test]
+    fn quantized_kv_fused_attention_matches_reference() {
+        let (group_size, d, step) = (64i32, 64i32, 4i32);
+        let (b, hkv, hq) = (1i32, 2i32, 4i32);
+        let kv_repeat = hq / hkv;
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let mut cf = QuantizedKVCache::new(group_size, 8, 4, step);
+        let mut cr = QuantizedKVCache::new(group_size, 8, 4, step);
+        for i in 0..9 {
+            let (k, v) = make_kv(b, hkv, 1, d, 0.01 + i as f32 * 0.004);
+            cf.update_and_fetch(k.clone(), v.clone()).unwrap();
+            cr.update_and_fetch(k, v).unwrap();
+        }
+
+        // Decode query [B, Hq, 1, D] and the new K/V block.
+        let (q, _) = make_kv(b, hq, 1, d, 0.05);
+        let (kn, vn) = make_kv(b, hkv, 1, d, 0.07);
+
+        let fused = cf
+            .try_fused_attention(&q, kn.clone(), vn.clone(), scale, None, kv_repeat)
+            .unwrap()
+            .expect("fused path engaged");
+
+        // Reference: reconstruct full K/V, then GQA SDPA in plain ops.
+        let (fk, fv) = cr.update_and_fetch(kn, vn).unwrap(); // [B, Hkv, n, D]
+        let n = fk.shape()[2];
+        let expand = |x: &Array| -> Array {
+            let x32 = x
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap()
+                .reshape(&[b, hkv, 1, n, d])
+                .unwrap();
+            let xb = mlx_rs::ops::broadcast_to(&x32, &[b, hkv, kv_repeat, n, d]).unwrap();
+            xb.reshape(&[b, hq, n, d]).unwrap()
+        };
+        let kref = expand(&fk);
+        let vref = expand(&fv);
+        let scores = mlx_rs::ops::matmul(&q, &kref.transpose_axes(&[0, 1, 3, 2]).unwrap())
+            .unwrap()
+            .multiply(mlx_rs::array!(scale))
+            .unwrap();
+        let p = mlx_rs::ops::softmax_axis(&scores, -1, true).unwrap();
+        let ref_out = mlx_rs::ops::matmul(&p, &vref).unwrap();
+
+        let fused_v = fused.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&fused_v, &ref_out]).unwrap();
+        let fs = fused_v.as_slice::<f32>();
+        let rs = ref_out.as_slice::<f32>();
+        assert_eq!(fs.len(), rs.len());
+        let mut worst = 0f32;
+        for (a, c) in fs.iter().zip(rs.iter()) {
+            let diff = (a - c).abs() / c.abs().max(1.0);
+            if diff > worst {
+                worst = diff;
+            }
+        }
+        assert!(worst < 0.02, "fused vs reconstruct+SDPA rel-error {worst}");
     }
 
     // F21: current_kv must reconstruct at the model's dtype, not a hardcoded
