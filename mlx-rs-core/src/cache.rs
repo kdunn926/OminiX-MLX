@@ -1001,6 +1001,15 @@ impl KeyValueCache for TurboQuantKVCache {
         if qs.len() != 4 || qs[2] != 1 {
             return Ok(None);
         }
+        // The fused SDPA kernels (tq_sdpa_4bit{,_online,_online_simd}) hardcode
+        // 8-bit V packing (D/4 u32 words, 4 values/word). With v_bits != 8 the
+        // V unpack reads the wrong words/lanes and can run off the buffer, so
+        // fall back to the reconstruct+SDPA path (which honors v_bits) by
+        // returning None BEFORE appending — the caller runs its own
+        // update_and_fetch on None, matching the q_len > 1 early return above.
+        if self.v_bits != 8 {
+            return Ok(None);
+        }
         let b = qs[0];
         let h_q = qs[1];
         let d = qs[3];
@@ -1694,5 +1703,25 @@ mod tests {
         let (k, v) = make_kv(1, 4, 1, 100, 0.01);
         let result = cache.update_and_fetch(k, v);
         assert!(result.is_err(), "Expected error for non-divisible head_dim");
+    }
+
+    // F3: the TurboQuant fused SDPA kernels assume 8-bit V packing, so a
+    // v_bits=4 cache must NOT take the fused path (which would silently read
+    // the wrong bytes / run off the buffer). It falls back by returning None
+    // before appending, leaving the caller to run the v_bits-aware slow path.
+    #[test]
+    fn turboquant_v_bits_4_falls_back_from_fused_path() {
+        let mut cache = TurboQuantKVCache::new().with_v_quant(4, 32);
+        let (k, v) = make_kv(1, 2, 1, 64, 0.01); // q_len == 1, eligible shape
+        let q = Array::from_slice(&vec![0f32; 1 * 2 * 1 * 64], &[1, 2, 1, 64]);
+        let out = cache
+            .try_fused_attention(&q, k, v, 0.125, None, 1)
+            .unwrap();
+        assert!(
+            out.is_none(),
+            "v_bits=4 must fall back; the fused kernels assume 8-bit V"
+        );
+        // Guard returns before append, so nothing was consumed into the cache.
+        assert_eq!(cache.offset(), 0);
     }
 }
