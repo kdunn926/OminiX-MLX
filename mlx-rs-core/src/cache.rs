@@ -608,6 +608,10 @@ pub struct TurboQuantKVCache {
     offset: i32,
     /// Sign tensor seed (deterministic across the lifetime of this cache).
     seed: u64,
+    /// Model dtype captured at the first append, so `current_kv` can rebuild
+    /// K/V at the correct precision instead of guessing (the u32-packed bulk
+    /// doesn't carry the original dtype).
+    model_dtype: Option<mlx_rs::Dtype>,
 }
 
 impl TurboQuantKVCache {
@@ -633,6 +637,7 @@ impl TurboQuantKVCache {
             v_bits: 8,
             offset: 0,
             seed: 0x5EED_5EED,
+            model_dtype: None,
         }
     }
 
@@ -871,6 +876,11 @@ impl KeyValueCache for TurboQuantKVCache {
         let t_new = k_shape[2];
         let d = k_shape[3];
         let dtype = keys.dtype();
+        // Remember the model dtype so current_kv can rebuild at the right
+        // precision (the compressed bulk is u32-packed and loses it).
+        if self.model_dtype.is_none() {
+            self.model_dtype = Some(dtype);
+        }
 
         // Determine how many of the new tokens go into the sink (kept at
         // native dtype) vs the compressed bulk. Sink positions are the
@@ -973,10 +983,10 @@ impl KeyValueCache for TurboQuantKVCache {
             let packed_cols = q.shape()[3];
             // Recover D from packed_cols: packed_cols * 32 / v_bits.
             let d = (packed_cols * 32) / self.v_bits;
-            // quant_v dtype is uint32; the original input was the model
-            // dtype but we lost it. Default to bf16 since that's what
-            // Gemma4 uses; downstream attention casts as needed.
-            (d, mlx_rs::Dtype::Bfloat16)
+            // quant_v is uint32-packed and doesn't carry the original dtype;
+            // use the dtype captured at the first append (bf16 only as a last
+            // resort if the cache was somehow populated without one).
+            (d, self.model_dtype.unwrap_or(mlx_rs::Dtype::Bfloat16))
         } else {
             return None;
         };
@@ -1703,6 +1713,24 @@ mod tests {
         let (k, v) = make_kv(1, 4, 1, 100, 0.01);
         let result = cache.update_and_fetch(k, v);
         assert!(result.is_err(), "Expected error for non-divisible head_dim");
+    }
+
+    // F21: current_kv must reconstruct at the model's dtype, not a hardcoded
+    // bf16. With sink_tokens=0 the bulk (quant_v) branch is taken, which
+    // previously always returned Bfloat16 and corrupted f16/f32 models.
+    #[test]
+    fn turboquant_current_kv_preserves_dtype() {
+        let mut cache = TurboQuantKVCache::new().with_sink_tokens(0);
+        let (k, v) = make_kv(1, 2, 8, 64, 0.01);
+        let k = k.as_dtype(mlx_rs::Dtype::Float16).unwrap();
+        let v = v.as_dtype(mlx_rs::Dtype::Float16).unwrap();
+        cache.update_and_fetch(k, v).unwrap();
+        let (rk, _rv) = cache.current_kv().expect("cache populated");
+        assert_eq!(
+            rk.dtype(),
+            mlx_rs::Dtype::Float16,
+            "current_kv must preserve the model dtype captured at append"
+        );
     }
 
     // F3: the TurboQuant fused SDPA kernels assume 8-bit V packing, so a

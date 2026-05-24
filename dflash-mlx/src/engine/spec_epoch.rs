@@ -469,15 +469,12 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
             } else {
                 self.metrics.total_drafted as f32 / self.metrics.total_cycles as f32
             };
-            // v0.1.7 adaptive verify needs real per-cycle wall time so it
-            // can compare reduced vs probe throughput honestly. Force an
-            // eval on the just-pushed correction token so the timer
-            // reflects actual GPU work this cycle, not just MLX graph
-            // construction.
-            // (No-op when pending was already eval'd elsewhere.)
-            if let Some(Ok(t_arr)) = pending.back() {
-                let _ = t_arr;
-            }
+            // v0.1.7 adaptive verify needs real per-cycle wall time. This cycle's
+            // draft + verify GPU work is already forced before we get here:
+            // `array_to_vec_u32` (drafted tokens) and either `scalar_token` (greedy
+            // correction) or `speculative_accept`'s host-side softmax read all call
+            // `eval`/`as_slice`, which materialize the verify logits. So
+            // `cycle_wall_s` reflects real GPU work, not just MLX graph build.
             let cycle_wall_s = cycle_start
                 .map(|s| s.elapsed().as_secs_f32())
                 .unwrap_or(0.0);
