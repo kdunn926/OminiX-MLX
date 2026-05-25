@@ -2875,12 +2875,17 @@ impl Model {
         //     all P cached tokens + its causal-prefix verify positions.
         let t = hidden_states.shape()[1];
         let cache_offset: i32 = cache.first().map(|c| c.offset()).unwrap_or(0);
-        let mask_arr = if t > 1 {
-            Some(create_causal_mask(t, Some(cache_offset), None, None)?)
-        } else {
-            None
-        };
-        let mask_ref = mask_arr.as_ref();
+        // gemma4 interleaves sliding-window and full attention, so the mask must
+        // be built PER LAYER TYPE (offset-aware): window-limited for sliding
+        // layers, full-causal for full-attention layers. The previous code
+        // applied a single full-causal mask to every layer, letting sliding
+        // layers attend beyond their window — so the captured hidden states (and
+        // thus the DFlash draft) diverged from the training reference, depressing
+        // acceptance (worse at long context). Cache masks by window (key -1 =
+        // full causal). Built only for multi-token forwards (t > 1); single-step
+        // decode passes None and each layer self-builds its mask.
+        let mut mask_by_window: std::collections::HashMap<i32, Array> =
+            std::collections::HashMap::new();
 
         // Per-layer eval was originally needed during long-prompt prefill on
         // MoE to bound peak Metal memory. For short multi-token forwards
@@ -2901,9 +2906,22 @@ impl Model {
 
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let cache_slot = self.model.kv_cache_map[i];
+            // Per-layer offset-aware mask: window-limited for sliding layers,
+            // full-causal for full-attention layers (key -1).
+            let mask_opt: Option<&Array> = if t > 1 {
+                let window = layer.self_attn.sliding_window;
+                let key = window.unwrap_or(-1);
+                if !mask_by_window.contains_key(&key) {
+                    let m = create_causal_mask(t, Some(cache_offset), window, None)?;
+                    mask_by_window.insert(key, m);
+                }
+                mask_by_window.get(&key)
+            } else {
+                None
+            };
             hidden_states = layer.forward(DecoderLayerInput {
                 hidden_states: &hidden_states,
-                mask: mask_ref,
+                mask: mask_opt,
                 cache: &mut cache[cache_slot],
                 shared_kv: None,
                 per_layer_input: None,
