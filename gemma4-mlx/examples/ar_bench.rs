@@ -4,20 +4,19 @@
 //! KV cache (fused paged-attention kernel); default is the standard fp16 cache.
 
 use anyhow::Result;
+use gemma4_mlx::mixed_cache::init_mixed_paged_cache;
 use gemma4_mlx::{load_model, load_tokenizer, Generate, Model};
 use mlx_rs::Array;
 use mlx_rs_core::cache::{KVCache, KeyValueCache};
-use mlx_rs_core::paged::PagedKvCache;
 use std::time::Instant;
 
-/// Run AR generation with a given cache backend `C` and report timing.
-fn run<C: KeyValueCache + Default>(
+/// Run AR generation with a pre-built cache and report timing.
+fn run_with_cache<C: KeyValueCache + Default>(
     model: &mut Model,
-    num_slots: usize,
+    mut cache: Vec<C>,
     max_tokens: usize,
     prompt: &Array,
 ) -> Result<(f64, f64, usize)> {
-    let mut cache: Vec<C> = (0..num_slots).map(|_| Default::default()).collect();
     let t0 = Instant::now();
     let mut prefill = 0.0;
     let mut count = 0usize;
@@ -58,11 +57,18 @@ fn main() -> Result<()> {
     let num_slots = *model.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
 
     let paged = std::env::var("PAGED_KV").is_ok();
-    eprintln!("kv_backend: {}", if paged { "paged" } else { "standard fp16" });
+    eprintln!(
+        "kv_backend: {}",
+        if paged { "paged (full-attn layers only; sliding stay contiguous)" } else { "standard fp16" }
+    );
     let (prefill, decode_tok_s, count) = if paged {
-        run::<PagedKvCache>(&mut model, num_slots, max_tokens, &prompt)?
+        // Mixed cache: page only full-attention layers; sliding layers stay
+        // on the contiguous KVCache (paging them regresses badly).
+        let cache = init_mixed_paged_cache(&model);
+        run_with_cache(&mut model, cache, max_tokens, &prompt)?
     } else {
-        run::<KVCache>(&mut model, num_slots, max_tokens, &prompt)?
+        let cache: Vec<KVCache> = (0..num_slots).map(|_| Default::default()).collect();
+        run_with_cache(&mut model, cache, max_tokens, &prompt)?
     };
 
     let decode_s = (count.saturating_sub(1) as f64) / decode_tok_s.max(0.001);
