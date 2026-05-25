@@ -12,6 +12,7 @@ pub use mlx_rs_core::{
     cache::{
         ConcatKeyValueCache, KVCache, KeyValueCache, QuantizedKVCache, TurboQuantKVCache,
     },
+    paged::{PagedKvCache, PagedKvPool},
     error::{Error, Result},
     sampler::{DefaultSampler, Sampler},
     utils::{

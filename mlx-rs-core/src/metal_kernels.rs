@@ -2724,7 +2724,10 @@ pub fn paged_attention_decode(
             config, type_name.as_ptr(), dtype,
         );
         // Threads per (hq, b) threadgroup that cooperate over the KV length.
-        const TG: i32 = 32;
+        // Capped so the `tg_acc[TG*D]` threadgroup buffer stays ≤ 16 KB
+        // (4096 f32), well under Metal's ~32 KB limit — for large head_dim
+        // (e.g. 256) a fixed TG=32 would overflow threadgroup memory.
+        let tg: i32 = (4096 / d.max(1)).clamp(1, 32);
         for (name, value) in [
             ("D", d),
             ("HQ", hq),
@@ -2734,7 +2737,7 @@ pub fn paged_attention_decode(
             ("BLOCK", block_size),
             ("N", n_tokens),
             ("KV_REPEAT", kv_repeat),
-            ("TG", TG),
+            ("TG", tg),
         ] {
             let cname = CString::new(name).unwrap();
             mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
@@ -2743,8 +2746,8 @@ pub fn paged_attention_decode(
         }
         // One threadgroup per (hq, b): grid.x = HQ·TG threads (HQ groups of TG),
         // grid.y = B groups of 1. `threadgroup_position_in_grid` → (hq, b).
-        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, hq.max(1) * TG, b.max(1), 1);
-        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, TG, 1, 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, hq.max(1) * tg, b.max(1), 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1);
 
         let out_shape: [i32; 4] = [b, hq, 1, d];
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
