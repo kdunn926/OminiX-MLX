@@ -113,6 +113,9 @@ fn main() -> anyhow::Result<()> {
     } else if std::env::var("QUANTIZE_KV").is_ok() {
         eprintln!("kv_backend: quantized (K=q8, V=q4)");
         Generate::new_quantized_kv(&mut model, temp, &prompt_tokens)
+    } else if std::env::var("PAGED_KV").is_ok() {
+        eprintln!("kv_backend: paged");
+        Generate::new_paged_kv(&mut model, temp, &prompt_tokens)
     } else {
         eprintln!("kv_backend: standard fp16");
         Generate::new(&mut model, temp, &prompt_tokens)

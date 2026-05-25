@@ -171,6 +171,22 @@ impl<'a> Generate<'a> {
         }
     }
 
+    /// Paged KV for full-attention layers: each layer draws blocks from its own
+    /// private `PagedKvPool` and decode runs through the fused paged-attention
+    /// kernel. Recurrent (GDN) layers are unaffected. Used to benchmark the
+    /// paged-attention path against the standard contiguous KV cache.
+    pub fn new_paged_kv(model: &'a mut Model, temp: f32, prompt: &'a Array) -> Self {
+        let cache = model.new_cache(KVCacheMode::Paged);
+        Self {
+            model,
+            cache,
+            temp,
+            state: GenerateState::Prefill { prompt },
+            prefetched: None,
+            token_count: 0,
+        }
+    }
+
     /// Build a Generate with a pre-populated cache (e.g. from a
     /// prompt-cache prefix load). Caller wraps each loaded `KVCache`
     /// in `HybridCache::KV(...)` and supplies the suffix prompt.

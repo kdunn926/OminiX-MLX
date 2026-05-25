@@ -220,7 +220,7 @@ if [[ "${SWEEP}" == "quick" ]]; then
   MAXTOKS=(64)
   # Include QUANTIZE_KV so the quick sweep measures the F9 fused-quantized-
   # attention path (which now skips the per-step full dequantize).
-  KV_MODES=("unset" "QUANTIZE_KV" "TURBO_KV")
+  KV_MODES=("unset" "QUANTIZE_KV" "PAGED" "TURBO_KV")
   SINKS=(0 4)
   SIMDS=("unset")
   KVMINS=("8192")          # plus 512 only for long prompt in full sweep
@@ -232,7 +232,7 @@ elif [[ "${SWEEP}" == "full" ]]; then
   CELL_A_MODELS=("Qwen3.6-27B-4bit" "Qwen3.6-35B-A3B-4bit")
   PROMPTS=("short" "long")
   MAXTOKS=(64 256)
-  KV_MODES=("unset" "QUANTIZE_KV" "TURBO_KV")
+  KV_MODES=("unset" "QUANTIZE_KV" "PAGED" "TURBO_KV")
   SINKS=(0 4)
   SIMDS=("unset" "1")
   KVMINS=("8192" "512")
@@ -272,6 +272,7 @@ cell_a() {
           else
             local env_str=""
             [[ "${kv}" == "QUANTIZE_KV" ]] && env_str="QUANTIZE_KV=1"
+            [[ "${kv}" == "PAGED" ]] && env_str="PAGED_KV=1"
             run_cell "${env_str}" "${model}" "generate" "${prompt}" "${mt}" \
               "${kv}" "-" "-" "-" "-" "greedy" "0.0" "off" \
               -- "${GEN}" "${mp}" "${ptext}" "${mt}"
