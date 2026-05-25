@@ -125,11 +125,21 @@ pub fn init_mixed_paged_cache(model: &Model) -> Vec<MixedKvCache> {
             slot_full[inner.kv_cache_map[i]] = true;
         }
     }
+    // Optional block-size override (PAGED_BLOCK_SIZE) for tuning the paged
+    // arena's block granularity. Affects memory packing / sharing granularity;
+    // the fused decode kernel's per-position cost is block-size-independent.
+    let block_size: Option<i32> = std::env::var("PAGED_BLOCK_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0);
     slot_full
         .into_iter()
         .map(|full| {
             if full {
-                MixedKvCache::Paged(PagedKvCache::default())
+                match block_size {
+                    Some(bs) => MixedKvCache::Paged(PagedKvCache::new(bs)),
+                    None => MixedKvCache::Paged(PagedKvCache::default()),
+                }
             } else {
                 MixedKvCache::Kv(KVCache::default())
             }
