@@ -12,6 +12,7 @@ use mlx_rs::{
 
 use mlx_rs_core::{
     cache::{KVCache, QuantizedKVCache, TurboQuantKVCache},
+    paged::PagedKvCache,
     error::Error,
     utils::initialize_rope,
 };
@@ -76,6 +77,12 @@ impl TransformerBlock {
                     mask,
                     cache: Some(tq_cache),
                 })?,
+            (AttentionLayer::FullAttention(attn), HybridCache::Paged(paged_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(paged_cache),
+                })?,
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
                 let L = normed.shape()[1];
                 if L > 1 {
@@ -127,6 +134,12 @@ impl TransformerBlock {
                     x: &normed,
                     mask,
                     cache: Some(tq_cache),
+                })?,
+            (AttentionLayer::FullAttention(attn), HybridCache::Paged(paged_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(paged_cache),
                 })?,
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
                 let L = normed.shape()[1];
@@ -189,6 +202,10 @@ pub enum KVCacheMode {
     /// Spike: TurboQuant 4-bit K + 8-bit V cache with fused SDPA via
     /// `KeyValueCache::try_fused_attention` (online softmax, V-tile cache).
     TurboQuant,
+    /// Paged KV for full-attention layers, drawn from the thread-default
+    /// `PagedKvPool` (behind `OMINIX_PAGED_ATTENTION`). Decode runs through
+    /// the fused paged-attention kernel; recurrent layers are unaffected.
+    Paged,
 }
 
 pub struct Qwen36TextModel {
@@ -251,6 +268,9 @@ impl Model {
                         KVCacheMode::TurboQuant => {
                             HybridCache::TurboQuantKV(TurboQuantKVCache::new())
                         }
+                        // Draws from the thread-default PagedKvPool installed by
+                        // the engine; one shared arena backs all full-attn layers.
+                        KVCacheMode::Paged => HybridCache::Paged(PagedKvCache::default()),
                     }
                 } else {
                     HybridCache::Recurrent(RecurrentState::new())

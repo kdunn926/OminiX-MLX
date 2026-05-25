@@ -1,5 +1,6 @@
 use mlx_rs::{error::Exception, Array};
 use mlx_rs_core::cache::{KVCache, KeyValueCache, QuantizedKVCache, TurboQuantKVCache};
+use mlx_rs_core::paged::PagedKvCache;
 
 /// Recurrent state for DeltaNet layers.
 ///
@@ -103,6 +104,11 @@ impl HybridCache {
             }
             HybridCache::TurboQuantKV(_) => Err(Exception::custom(
                 "HybridCache::save_to_path: TurboQuantKV not yet supported",
+            )),
+            // Paged caches live in an in-memory pool and are never disk-persisted
+            // (the API forces an in-memory prefix cache when paging is enabled).
+            HybridCache::Paged(_) => Err(Exception::custom(
+                "HybridCache::save_to_path: Paged not supported (in-memory only)",
             )),
         }
     }
@@ -217,6 +223,10 @@ pub enum HybridCache {
     /// SDPA path. Wired via `KVCacheMode::TurboQuant`.
     TurboQuantKV(TurboQuantKVCache),
     Recurrent(RecurrentState),
+    /// Paged KV for full-attention layers (behind `OMINIX_PAGED_ATTENTION`).
+    /// Cloning forks the block table (shared prefix blocks, CoW on divergence);
+    /// dropping releases blocks back to the shared pool.
+    Paged(PagedKvCache),
 }
 
 impl HybridCache {
@@ -226,6 +236,7 @@ impl HybridCache {
             HybridCache::QuantizedKV(qkv) => qkv.offset(),
             HybridCache::TurboQuantKV(tq) => tq.offset(),
             HybridCache::Recurrent(rec) => rec.step,
+            HybridCache::Paged(p) => p.offset(),
         }
     }
 
@@ -246,6 +257,7 @@ impl HybridCache {
             HybridCache::TurboQuantKV(tq) => tq.trim(n_drop),
             HybridCache::QuantizedKV(qkv) => qkv.trim_kv(n_drop),
             HybridCache::Recurrent(_) => Ok(()), // no-op; see trim_gdn
+            HybridCache::Paged(p) => p.trim_kv(n_drop),
         }
     }
 
@@ -281,6 +293,7 @@ impl HybridCache {
                 tq.trim(n_drop)?;
                 Ok(())
             }
+            HybridCache::Paged(p) => p.trim_kv(n_drop),
             HybridCache::Recurrent(rec) => {
                 let snap = snapshot.ok_or_else(|| {
                     Exception::custom(

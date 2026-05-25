@@ -23,6 +23,7 @@ pub mod error;
 pub mod generate;
 pub mod memory;
 pub mod metal_kernels;
+pub mod paged;
 pub mod sampler;
 pub mod speculative;
 pub mod turboquant;

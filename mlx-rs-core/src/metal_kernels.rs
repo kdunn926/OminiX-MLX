@@ -2364,6 +2364,425 @@ pub fn kv_compact(
     }
 }
 
+// =============================================================================
+// Paged KV gather kernel (Phase 2/3 of paged attention — see `paged.rs`)
+// =============================================================================
+//
+// Gathers a sequence's logical KV out of a paged block arena into one
+// contiguous `[B, H, N, D]` tensor in a single Metal dispatch — the kernel
+// replacement for the concat-based `paged::gather_blocks` placeholder.
+//
+// Storage model it expects:
+//   pool_buf:     contiguous arena `[num_blocks, B, H, BLOCK, D]` of dtype T
+//   block_table:  int32 `[ceil(N / BLOCK)]`, logical block i → physical block id
+// For logical token t: physical block = block_table[t / BLOCK],
+//                      in-block offset = t % BLOCK.
+//
+// NOTE (draft): `PagedKvPool` currently stores each block as a separate
+// `Array` (`Vec<Option<Array>>`), so it must first be given a single-arena
+// storage mode before this kernel can be wired into `PagedKvCache`. Until
+// then `PagedKvCache` keeps using the concat fallback. The kernel below is
+// validated in isolation by `gather_blocks` tests.
+const GATHER_BLOCKS_KERNEL_SOURCE: &str = r#"
+    // Grid layout: (D * N, H, B) — one thread per output element.
+    uint d = thread_position_in_grid.x % uint(D);
+    uint t = thread_position_in_grid.x / uint(D);
+    uint h = thread_position_in_grid.y;
+    uint b = thread_position_in_grid.z;
+    if (t >= uint(N)) return;
+
+    // Resolve the physical token for logical position t: block_table maps the
+    // logical block, blocks are contiguous BLOCK-token ranges in the arena.
+    int logical_block = int(t) / BLOCK;
+    int in_off        = int(t) % BLOCK;
+    int pb            = block_table[logical_block];
+    uint phys_t       = uint(pb) * uint(BLOCK) + uint(in_off);
+
+    // Strides into the [B, H, SEQ, D] contiguous arena.
+    uint stride_t = uint(D);
+    uint stride_h = uint(SEQ) * stride_t;
+    uint stride_b = uint(H) * stride_h;
+    uint src = b * stride_b + h * stride_h + phys_t * stride_t + d;
+
+    // Strides into the [B, H, N, D] contiguous output.
+    uint out_stride_t = uint(D);
+    uint out_stride_h = uint(N) * out_stride_t;
+    uint out_stride_b = uint(H) * out_stride_h;
+    uint dst = b * out_stride_b + h * out_stride_h + t * out_stride_t + d;
+
+    out[dst] = pool_buf[src];
+"#;
+
+static GATHER_BLOCKS_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_gather_blocks_kernel() -> MetalKernel {
+    unsafe {
+        let pool_name = CString::new("pool_buf").unwrap();
+        let table_name = CString::new("block_table").unwrap();
+        let out_name = CString::new("out").unwrap();
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, pool_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, table_name.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, out_name.as_ptr());
+        let source = CString::new(GATHER_BLOCKS_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("paged_gather_blocks").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Gather a paged sequence's KV into one contiguous `[B, H, n_tokens, D]`
+/// tensor in a single Metal dispatch (the non-contiguous-blocks fallback;
+/// contiguous sequences are a free slice in `PagedKvCache::gather`).
+///
+/// - `pool_buf`: contiguous arena `[B, H, seq, D]`, dtype `T` (blocks are
+///   `block_size`-token ranges along the seq axis).
+/// - `block_table`: int32 `[ceil(n_tokens / block_size)]`, logical→physical
+///   block id. Coerced to int32 if needed.
+/// - `seq`: the arena's physical token capacity (`pool_buf.shape()[2]`).
+#[allow(clippy::too_many_arguments)]
+pub fn gather_blocks(
+    pool_buf: &Array,
+    block_table: &Array,
+    n_tokens: i32,
+    block_size: i32,
+    seq: i32,
+    b: i32,
+    h: i32,
+    d: i32,
+) -> Result<Array, Exception> {
+    if n_tokens <= 0 {
+        return Err(Exception::custom("gather_blocks: n_tokens must be > 0"));
+    }
+    let shape = pool_buf.shape();
+    if shape.len() != 4 {
+        return Err(Exception::custom(format!(
+            "gather_blocks expects pool_buf [B,H,SEQ,D], got {:?}",
+            shape
+        )));
+    }
+    let dtype: u32 = pool_buf.dtype().into();
+    let block_table = if block_table.dtype() != Dtype::Int32 {
+        block_table.as_dtype(Dtype::Int32)?
+    } else {
+        block_table.clone()
+    };
+
+    let kernel = GATHER_BLOCKS_KERNEL.get_or_init(create_gather_blocks_kernel);
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype,
+        );
+        for (name, value) in [("D", d), ("H", h), ("B", b), ("BLOCK", block_size), ("N", n_tokens), ("SEQ", seq)] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config,
+            (d * n_tokens).max(1),
+            h.max(1),
+            b.max(1),
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+
+        let out_shape: [i32; 4] = [b, h, n_tokens, d];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            dtype,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, pool_buf.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, block_table.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("gather_blocks kernel execution failed"));
+        }
+
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok(Array::from_ptr(result))
+    }
+}
+
+// =============================================================================
+// Paged attention — decode (single-query) kernel
+// =============================================================================
+//
+// Computes attention output for a one-token query directly against a paged KV
+// arena, WITHOUT first gathering the cache into a contiguous tensor. One
+// thread per (query head, batch); each does a flash-style online-softmax pass
+// over all cached positions, resolving each position's physical block through
+// the block table. This removes the per-decode-step gather copy.
+//
+//   q:           [B, HQ, 1, D]                (the just-projected query)
+//   k_arena:     [num_blocks, B, HKV, BLOCK, D]
+//   v_arena:     [num_blocks, B, HKV, BLOCK, D]
+//   block_table: int32 [ceil(N / BLOCK)]      logical→physical block id
+//   scale_arr:   f32 [1]                       softmax scale (1/sqrt(D))
+//   out:         [B, HQ, 1, D]
+//
+// GQA: HQ query heads map to HKV kv heads via kv_repeat = HQ / HKV.
+// Decode attends to all N cached positions (the query is the latest token),
+// so no causal masking is needed here.
+// Flash-style: one THREADGROUP per (query head hq, batch b), `TG` threads
+// cooperating. Each thread runs an online-softmax pass over a strided slice of
+// the cached positions (registers only), then the `TG` partials are combined
+// via a threadgroup-memory reduction. This gives both occupancy (HQ×B×TG
+// threads vs the old HQ×B) and parallelism over the KV length.
+const PAGED_ATTENTION_DECODE_KERNEL_SOURCE: &str = r#"
+    threadgroup float tg_m[TG];
+    threadgroup float tg_l[TG];
+    threadgroup float tg_acc[TG * D];
+    threadgroup float g_m;
+    threadgroup float g_l;
+
+    uint hq  = threadgroup_position_in_grid.x;
+    uint b   = threadgroup_position_in_grid.y;
+    uint tid = thread_position_in_threadgroup.x;
+
+    uint hkv = hq / uint(KV_REPEAT);
+    float scale = float(scale_arr[0]);
+    uint q_base = b * uint(HQ) * uint(D) + hq * uint(D);
+
+    // arena: [B, HKV, SEQ, D] — block pb owns tokens [pb*BLOCK, (pb+1)*BLOCK).
+    uint ar_t = uint(D);
+    uint ar_h = uint(SEQ) * ar_t;
+    uint ar_b = uint(HKV) * ar_h;
+
+    // Per-thread online-softmax partial over positions tid, tid+TG, tid+2·TG, …
+    float m = -INFINITY;
+    float l = 0.0;
+    float acc[D];
+    for (int d = 0; d < D; ++d) { acc[d] = 0.0; }
+
+    for (int t = int(tid); t < N; t += TG) {
+        int pb  = block_table[t / BLOCK];
+        int off = t % BLOCK;
+        uint phys_t  = uint(pb) * uint(BLOCK) + uint(off);
+        uint kv_base = b * ar_b + hkv * ar_h + phys_t * ar_t;
+
+        float score = 0.0;
+        for (int d = 0; d < D; ++d) {
+            score += float(q[q_base + d]) * float(k_arena[kv_base + d]);
+        }
+        score *= scale;
+
+        float m_new = max(m, score);
+        float corr  = exp(m - m_new);
+        float p     = exp(score - m_new);
+        l = l * corr + p;
+        for (int d = 0; d < D; ++d) {
+            acc[d] = acc[d] * corr + p * float(v_arena[kv_base + d]);
+        }
+        m = m_new;
+    }
+
+    tg_m[tid] = m;
+    tg_l[tid] = l;
+    for (int d = 0; d < D; ++d) { tg_acc[tid * D + d] = acc[d]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce the TG partials to a global (max, sum) via the flash combine.
+    if (tid == 0) {
+        float gm = -INFINITY;
+        for (int i = 0; i < TG; ++i) { gm = max(gm, tg_m[i]); }
+        float gl = 0.0;
+        for (int i = 0; i < TG; ++i) { gl += tg_l[i] * exp(tg_m[i] - gm); }
+        g_m = gm;
+        g_l = gl;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread finalizes the output dims it owns: rescale every partial's
+    // acc by exp(m_i - g_m) and normalize by the global sum.
+    float gm = g_m;
+    float inv_l = (g_l > 0.0) ? (1.0 / g_l) : 0.0;
+    uint o_base = b * uint(HQ) * uint(D) + hq * uint(D);
+    for (uint d = tid; d < uint(D); d += TG) {
+        float a = 0.0;
+        for (int i = 0; i < TG; ++i) {
+            a += tg_acc[uint(i) * uint(D) + d] * exp(tg_m[i] - gm);
+        }
+        out[o_base + d] = T(a * inv_l);
+    }
+"#;
+
+static PAGED_ATTENTION_DECODE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_paged_attention_decode_kernel() -> MetalKernel {
+    unsafe {
+        let inputs = mlx_sys::mlx_vector_string_new();
+        for n in ["q", "k_arena", "v_arena", "block_table", "scale_arr"] {
+            let c = CString::new(n).unwrap();
+            mlx_sys::mlx_vector_string_append_value(inputs, c.as_ptr());
+        }
+        let outputs = mlx_sys::mlx_vector_string_new();
+        let out_name = CString::new("out").unwrap();
+        mlx_sys::mlx_vector_string_append_value(outputs, out_name.as_ptr());
+        let source = CString::new(PAGED_ATTENTION_DECODE_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("paged_attention_decode").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Single-query paged attention: `[B, HQ, 1, D]` output computed against a
+/// paged KV arena in one Metal dispatch, no gather. See the kernel source.
+///
+/// - `q`: `[B, HQ, 1, D]`, dtype `T`.
+/// - `k_arena`/`v_arena`: contiguous `[B, HKV, seq, D]`, dtype `T` (blocks are
+///   `block_size`-token ranges along the seq axis).
+/// - `block_table`: int32 `[ceil(n_tokens / block_size)]` (coerced if needed).
+/// - `seq`: the arena's physical token capacity (`k_arena.shape()[2]`).
+/// - `scale`: softmax scale (typically `1/sqrt(D)`).
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_decode(
+    q: &Array,
+    k_arena: &Array,
+    v_arena: &Array,
+    block_table: &Array,
+    scale: f32,
+    n_tokens: i32,
+    block_size: i32,
+    seq: i32,
+    b: i32,
+    hq: i32,
+    hkv: i32,
+    d: i32,
+) -> Result<Array, Exception> {
+    if n_tokens <= 0 {
+        return Err(Exception::custom("paged_attention_decode: n_tokens must be > 0"));
+    }
+    if hkv <= 0 || hq % hkv != 0 {
+        return Err(Exception::custom("paged_attention_decode: HQ must be a multiple of HKV"));
+    }
+    if q.shape() != [b, hq, 1, d] {
+        return Err(Exception::custom(format!(
+            "paged_attention_decode expects q [B,HQ,1,D]={:?}, got {:?}",
+            [b, hq, 1, d],
+            q.shape()
+        )));
+    }
+    let kv_repeat = hq / hkv;
+    let dtype: u32 = q.dtype().into();
+    let block_table = if block_table.dtype() != Dtype::Int32 {
+        block_table.as_dtype(Dtype::Int32)?
+    } else {
+        block_table.clone()
+    };
+    let scale_arr = Array::from_slice(&[scale], &[1]);
+
+    let kernel = PAGED_ATTENTION_DECODE_KERNEL.get_or_init(create_paged_attention_decode_kernel);
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype,
+        );
+        // Threads per (hq, b) threadgroup that cooperate over the KV length.
+        const TG: i32 = 32;
+        for (name, value) in [
+            ("D", d),
+            ("HQ", hq),
+            ("HKV", hkv),
+            ("B", b),
+            ("SEQ", seq),
+            ("BLOCK", block_size),
+            ("N", n_tokens),
+            ("KV_REPEAT", kv_repeat),
+            ("TG", TG),
+        ] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        // One threadgroup per (hq, b): grid.x = HQ·TG threads (HQ groups of TG),
+        // grid.y = B groups of 1. `threadgroup_position_in_grid` → (hq, b).
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, hq.max(1) * TG, b.max(1), 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, TG, 1, 1);
+
+        let out_shape: [i32; 4] = [b, hq, 1, d];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            dtype,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        for arr in [q, k_arena, v_arena, &block_table, &scale_arr] {
+            mlx_sys::mlx_vector_array_append_value(inputs, arr.as_ptr());
+        }
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("paged_attention_decode kernel execution failed"));
+        }
+
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok(Array::from_ptr(result))
+    }
+}
+
 const SWIGLU_KERNEL_SOURCE: &str = r#"
     uint elem = thread_position_in_grid.x;
     T gate_val = gate[elem];

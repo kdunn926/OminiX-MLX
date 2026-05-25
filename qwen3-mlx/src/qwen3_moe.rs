@@ -213,6 +213,28 @@ where
                 .build()?;
             keys = self.rope.forward(k_input)?;
 
+            // Decode fast path: a paged cache fuses append + attention in one
+            // kernel (no gather). `KVCache` returns `None`, so this is a no-op
+            // for the default backend.
+            if L == 1 {
+                let kv_repeat = (self.n_heads / self.n_kv_heads) as i32;
+                let fused_mask = match mask {
+                    Some(AttentionMask::Array(m)) => Some(m),
+                    _ => None,
+                };
+                if let Some(attn) = cache.try_fused_attention(
+                    &queries,
+                    keys.clone(),
+                    values.clone(),
+                    self.scale,
+                    fused_mask,
+                    kv_repeat,
+                )? {
+                    let output = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[B, L, -1])?;
+                    return self.o_proj.forward(&output);
+                }
+            }
+
             (keys, values) = cache.update_and_fetch(keys, values)?;
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
