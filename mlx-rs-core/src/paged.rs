@@ -661,6 +661,13 @@ impl KeyValueCache for PagedKvCache {
         if q.shape()[2] != 1 || mask.is_some() {
             return Ok(None);
         }
+        // The fused decode kernel caps cached length at PAGED_DECODE_MAX_KV (its
+        // s_p threadgroup buffer). Beyond that, fall back to gather+SDPA — do it
+        // BEFORE appending so the caller's update_and_fetch handles the append.
+        let projected = self.table.n_tokens + k_new.shape()[2];
+        if projected > crate::metal_kernels::PAGED_DECODE_MAX_KV {
+            return Ok(None);
+        }
         self.append(&k_new, &v_new)?;
         let b = q.shape()[0];
         let hq = q.shape()[1];
@@ -900,10 +907,15 @@ mod tests {
 
     #[test]
     fn paged_attention_decode_matches_reference_sdpa() {
+        // Cover BOTH dispatch paths: small n → single-pass (V1), large n →
+        // register-light 2-pass (V2), gated at PAGED_DECODE_TWO_PASS_MIN.
+        check_paged_decode(6, 4); // spans 2 blocks → V1
+        check_paged_decode(1100, 256); // ≥ two-pass threshold → V2
+    }
+
+    fn check_paged_decode(n: i32, block: i32) {
         // kv_repeat = 1 (hq == hkv) so the reference can matmul head-to-head.
         let (b, hq, hkv, d) = (1, 2, 2, 4);
-        let block = 4;
-        let n = 6; // spans 2 blocks
 
         let mut cache = PagedKvCache::new(block);
         let k_full = kv(hkv, n, d, 1.0);
@@ -945,7 +957,10 @@ mod tests {
         let weights = mlx_rs::ops::softmax_axis(&scores, -1, None).unwrap();
         let ref_out = weights.matmul(&vg).unwrap(); // [1,h,1,d]
 
-        assert!(approx_eq(&ref_out, &out), "paged decode kernel != reference SDPA");
+        assert!(
+            approx_eq(&ref_out, &out),
+            "paged decode kernel != reference SDPA (n={n}, block={block})"
+        );
     }
 
     #[test]

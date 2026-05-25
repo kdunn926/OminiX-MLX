@@ -2557,12 +2557,34 @@ pub fn gather_blocks(
 // GQA: HQ query heads map to HKV kv heads via kv_repeat = HQ / HKV.
 // Decode attends to all N cached positions (the query is the latest token),
 // so no causal masking is needed here.
-// Flash-style: one THREADGROUP per (query head hq, batch b), `TG` threads
-// cooperating. Each thread runs an online-softmax pass over a strided slice of
-// the cached positions (registers only), then the `TG` partials are combined
-// via a threadgroup-memory reduction. This gives both occupancy (HQ×B×TG
-// threads vs the old HQ×B) and parallelism over the KV length.
-const PAGED_ATTENTION_DECODE_KERNEL_SOURCE: &str = r#"
+// 2-pass split-D flash decode. One THREADGROUP per (query head hq, batch b),
+// `TG` threads cooperating. The previous design kept a per-thread `acc[D]`
+// register array — for D=256 that spills (256 registers/thread), which crippled
+// occupancy and made the kernel slower than contiguous SDPA at long context.
+//
+// This version is register-light:
+//   Pass 1: the TG threads cooperatively compute all N scores into the `s_p`
+//           threadgroup buffer, reducing to the global softmax max and sum.
+//           Each thread holds only scalars (no acc array).
+//   Pass 2: the D output dims are SPLIT across threads — each thread owns the
+//           dims `d = tid, tid+TG, …`, looping over all N positions and reading
+//           `s_p[t]` (the softmax weight) × V[t][d]. Each thread accumulates a
+//           single scalar per dim, so there is no per-thread D-sized array.
+//
+// `s_p` caps the cached length at `N_MAX`; the caller falls back to gather+SDPA
+// for sequences longer than that. Pass-2 reads across the TG threads at a fixed
+// position are contiguous in D, so they coalesce.
+/// Max cached length the fused paged decode kernel handles (sized by its `s_p`
+/// threadgroup buffer). Callers fall back to gather + SDPA beyond this.
+pub const PAGED_DECODE_MAX_KV: i32 = 4096;
+
+// Single-pass variant (small N). Each of TG threads runs the full online
+// softmax over a strided slice of N, holding a per-thread `acc[D]`. The acc[D]
+// register array spills for large D, which is why this loses to the 2-pass
+// kernel at long context — but at SHORT context its lower fixed overhead (no
+// score buffer, fewer barriers) makes it the faster choice. The dispatch picks
+// this below PAGED_DECODE_TWO_PASS_MIN cached tokens.
+const PAGED_ATTENTION_DECODE_V1_SOURCE: &str = r#"
     threadgroup float tg_m[TG];
     threadgroup float tg_l[TG];
     threadgroup float tg_acc[TG * D];
@@ -2577,12 +2599,10 @@ const PAGED_ATTENTION_DECODE_KERNEL_SOURCE: &str = r#"
     float scale = float(scale_arr[0]);
     uint q_base = b * uint(HQ) * uint(D) + hq * uint(D);
 
-    // arena: [B, HKV, SEQ, D] — block pb owns tokens [pb*BLOCK, (pb+1)*BLOCK).
     uint ar_t = uint(D);
     uint ar_h = uint(SEQ) * ar_t;
     uint ar_b = uint(HKV) * ar_h;
 
-    // Per-thread online-softmax partial over positions tid, tid+TG, tid+2·TG, …
     float m = -INFINITY;
     float l = 0.0;
     float acc[D];
@@ -2615,7 +2635,6 @@ const PAGED_ATTENTION_DECODE_KERNEL_SOURCE: &str = r#"
     for (int d = 0; d < D; ++d) { tg_acc[tid * D + d] = acc[d]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Reduce the TG partials to a global (max, sum) via the flash combine.
     if (tid == 0) {
         float gm = -INFINITY;
         for (int i = 0; i < TG; ++i) { gm = max(gm, tg_m[i]); }
@@ -2626,8 +2645,6 @@ const PAGED_ATTENTION_DECODE_KERNEL_SOURCE: &str = r#"
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Each thread finalizes the output dims it owns: rescale every partial's
-    // acc by exp(m_i - g_m) and normalize by the global sum.
     float gm = g_m;
     float inv_l = (g_l > 0.0) ? (1.0 / g_l) : 0.0;
     uint o_base = b * uint(HQ) * uint(D) + hq * uint(D);
@@ -2640,9 +2657,101 @@ const PAGED_ATTENTION_DECODE_KERNEL_SOURCE: &str = r#"
     }
 "#;
 
+static PAGED_ATTENTION_DECODE_V1_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_paged_attention_decode_v1_kernel() -> MetalKernel {
+    create_paged_kernel("paged_attention_decode_v1", PAGED_ATTENTION_DECODE_V1_SOURCE)
+}
+
+/// Cached length at/above which the dispatch uses the register-light 2-pass
+/// kernel (below it, the lower-overhead single-pass V1 is faster). Crossover
+/// measured on gemma-4-26B (D=256): single-pass wins at ~270 tokens, 2-pass
+/// wins at ~2300.
+pub const PAGED_DECODE_TWO_PASS_MIN: i32 = 1024;
+
+const PAGED_ATTENTION_DECODE_KERNEL_SOURCE: &str = r#"
+    threadgroup float s_p[N_MAX];   // scores (pass 1) then exp-weights (pass 2)
+    threadgroup float s_red[TG];    // reduction scratch
+    threadgroup float g_m;
+    threadgroup float g_l;
+
+    uint hq  = threadgroup_position_in_grid.x;
+    uint b   = threadgroup_position_in_grid.y;
+    uint tid = thread_position_in_threadgroup.x;
+
+    uint hkv = hq / uint(KV_REPEAT);
+    float scale = float(scale_arr[0]);
+    uint q_base = b * uint(HQ) * uint(D) + hq * uint(D);
+
+    // arena: [B, HKV, SEQ, D] — block pb owns tokens [pb*BLOCK, (pb+1)*BLOCK).
+    uint ar_t = uint(D);
+    uint ar_h = uint(SEQ) * ar_t;
+    uint ar_b = uint(HKV) * ar_h;
+
+    // --- Pass 1a: scores into s_p, per-thread max over a strided slice of N ---
+    float local_m = -INFINITY;
+    for (uint t = tid; t < uint(N); t += uint(TG)) {
+        int pb = block_table[t / uint(BLOCK)];
+        uint phys_t = uint(pb) * uint(BLOCK) + (t % uint(BLOCK));
+        uint kv_base = b * ar_b + hkv * ar_h + phys_t * ar_t;
+        float score = 0.0;
+        for (uint d = 0; d < uint(D); ++d) {
+            score += float(q[q_base + d]) * float(k_arena[kv_base + d]);
+        }
+        score *= scale;
+        s_p[t] = score;
+        local_m = max(local_m, score);
+    }
+    s_red[tid] = local_m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = uint(TG) >> 1; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] = max(s_red[tid], s_red[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) g_m = s_red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = g_m;
+
+    // --- Pass 1b: exp(score - m) into s_p, per-thread sum ---
+    float local_l = 0.0;
+    for (uint t = tid; t < uint(N); t += uint(TG)) {
+        float e = exp(s_p[t] - m);
+        s_p[t] = e;
+        local_l += e;
+    }
+    s_red[tid] = local_l;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = uint(TG) >> 1; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) g_l = s_red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_l = (g_l > 0.0) ? (1.0 / g_l) : 0.0;
+
+    // --- Pass 2: out[d] = inv_l · Σ_t s_p[t]·V[t][d], D split across threads ---
+    uint o_base = b * uint(HQ) * uint(D) + hq * uint(D);
+    for (uint d = tid; d < uint(D); d += uint(TG)) {
+        float a = 0.0;
+        for (uint t = 0; t < uint(N); ++t) {
+            int pb = block_table[t / uint(BLOCK)];
+            uint phys_t = uint(pb) * uint(BLOCK) + (t % uint(BLOCK));
+            uint kv_base = b * ar_b + hkv * ar_h + phys_t * ar_t;
+            a += s_p[t] * float(v_arena[kv_base + d]);
+        }
+        out[o_base + d] = T(a * inv_l);
+    }
+"#;
+
 static PAGED_ATTENTION_DECODE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
 
 fn create_paged_attention_decode_kernel() -> MetalKernel {
+    create_paged_kernel("paged_attention_decode", PAGED_ATTENTION_DECODE_KERNEL_SOURCE)
+}
+
+/// Shared builder for the paged-attention decode kernels (V1 single-pass and
+/// V2 2-pass) — same inputs/outputs, different source.
+fn create_paged_kernel(name: &str, src: &str) -> MetalKernel {
     unsafe {
         let inputs = mlx_sys::mlx_vector_string_new();
         for n in ["q", "k_arena", "v_arena", "block_table", "scale_arr"] {
@@ -2652,9 +2761,9 @@ fn create_paged_attention_decode_kernel() -> MetalKernel {
         let outputs = mlx_sys::mlx_vector_string_new();
         let out_name = CString::new("out").unwrap();
         mlx_sys::mlx_vector_string_append_value(outputs, out_name.as_ptr());
-        let source = CString::new(PAGED_ATTENTION_DECODE_KERNEL_SOURCE).unwrap();
+        let source = CString::new(src).unwrap();
         let header = CString::new("").unwrap();
-        let name = CString::new("paged_attention_decode").unwrap();
+        let name = CString::new(name).unwrap();
         let kernel = mlx_sys::mlx_fast_metal_kernel_new(
             name.as_ptr(),
             inputs,
@@ -2714,7 +2823,14 @@ pub fn paged_attention_decode(
     };
     let scale_arr = Array::from_slice(&[scale], &[1]);
 
-    let kernel = PAGED_ATTENTION_DECODE_KERNEL.get_or_init(create_paged_attention_decode_kernel);
+    // Pick the kernel by cached length: the register-light 2-pass kernel wins at
+    // long context, the lower-overhead single-pass V1 wins at short context.
+    let two_pass = n_tokens >= PAGED_DECODE_TWO_PASS_MIN;
+    let kernel = if two_pass {
+        PAGED_ATTENTION_DECODE_KERNEL.get_or_init(create_paged_attention_decode_kernel)
+    } else {
+        PAGED_ATTENTION_DECODE_V1_KERNEL.get_or_init(create_paged_attention_decode_v1_kernel)
+    };
     unsafe {
         let stream = mlx_sys::mlx_default_gpu_stream_new();
         let config = mlx_sys::mlx_fast_metal_kernel_config_new();
@@ -2723,12 +2839,10 @@ pub fn paged_attention_decode(
         mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
             config, type_name.as_ptr(), dtype,
         );
-        // Threads per (hq, b) threadgroup that cooperate over the KV length.
-        // Capped so the `tg_acc[TG*D]` threadgroup buffer stays ≤ 16 KB
-        // (4096 f32), well under Metal's ~32 KB limit — for large head_dim
-        // (e.g. 256) a fixed TG=32 would overflow threadgroup memory.
-        let tg: i32 = (4096 / d.max(1)).clamp(1, 32);
-        for (name, value) in [
+        // V2 (2-pass): TG=256 (decoupled from D, no acc[D] array). V1
+        // (single-pass): TG capped so tg_acc[TG*D] stays ≤16KB threadgroup mem.
+        let tg: i32 = if two_pass { 256 } else { (4096 / d.max(1)).clamp(1, 32) };
+        let mut targs: Vec<(&str, i32)> = vec![
             ("D", d),
             ("HQ", hq),
             ("HKV", hkv),
@@ -2738,7 +2852,12 @@ pub fn paged_attention_decode(
             ("N", n_tokens),
             ("KV_REPEAT", kv_repeat),
             ("TG", tg),
-        ] {
+        ];
+        // N_MAX sizes V2's s_p score buffer; V1 doesn't use it.
+        if two_pass {
+            targs.push(("N_MAX", PAGED_DECODE_MAX_KV));
+        }
+        for (name, value) in targs {
             let cname = CString::new(name).unwrap();
             mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
                 config, cname.as_ptr(), value,
