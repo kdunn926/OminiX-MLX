@@ -38,6 +38,7 @@ pub mod qwen3_moe;
 pub use mlx_rs_core::{
     cache::{ConcatKeyValueCache, KVCache, KeyValueCache},
     paged::{BlockTable, PagedKvCache, PagedKvPool, DEFAULT_BLOCK_SIZE as PAGED_BLOCK_SIZE},
+    paged_disk::{block_hashes, PagedBlockDiskCache},
     error::{Error, Result},
     utils::{create_attention_mask, initialize_rope, scaled_dot_product_attention,
             AttentionMask, FloatOrString, SdpaMask},

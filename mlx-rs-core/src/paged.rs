@@ -475,6 +475,32 @@ impl PagedKvCache {
         &self.pool
     }
 
+    /// Append `[B, H, n, D]` K/V (e.g. a disk-loaded prefix block) into the
+    /// cache, growing it — used to preload a sequence from the disk tier.
+    /// Public wrapper over the internal append.
+    pub fn append_tokens(&mut self, keys: &Array, values: &Array) -> Result<(), Exception> {
+        self.append(keys, values)
+    }
+
+    /// Extract each *full* block's K/V (`[B, H, block_size, D]`) in logical
+    /// order, for persisting to the disk tier. Drops a trailing partial block.
+    pub fn full_block_kvs(&self) -> Result<Vec<(Array, Array)>, Exception> {
+        let bs = self.block_size;
+        let n_full = (self.table.n_tokens / bs) as usize;
+        if n_full == 0 {
+            return Ok(Vec::new());
+        }
+        let Some((k, v)) = self.gather()? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(n_full);
+        for b in 0..n_full as i32 {
+            let (lo, hi) = (b * bs, b * bs + bs);
+            out.push((k.index((Ellipsis, lo..hi, ..)), v.index((Ellipsis, lo..hi, ..))));
+        }
+        Ok(out)
+    }
+
     pub fn table(&self) -> &BlockTable {
         &self.table
     }
