@@ -3976,6 +3976,15 @@ impl Gemma4VlModel {
         init_cache::<KVCache>(num_slots)
     }
 
+    /// Paged variant of `new_cache`, parallel to the `MixedKvCache` path used
+    /// by non-VL Gemma4 under `OMINIX_PAGED_ATTENTION=1`. Full-attention layers
+    /// allocate against the shared paged pool; sliding-window layers stay
+    /// contiguous (the "mixed" of `MixedKvCache`).
+    pub fn new_cache_paged(&self) -> Vec<crate::mixed_cache::MixedKvCache> {
+        let num_slots = *self.text.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
+        init_cache::<crate::mixed_cache::MixedKvCache>(num_slots)
+    }
+
     pub fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Array, Error> {
         let (pixel_values, patch_positions, padding_mask) = preprocess_image_gemma4(bytes)?;
         let num_positions = padding_mask.len() as i32;
@@ -4018,12 +4027,15 @@ impl Gemma4VlModel {
         embeds.reshape(&[s1, s2]).map_err(Into::into)
     }
 
-    pub fn prefill_multimodal(
+    pub fn prefill_multimodal<C>(
         &mut self,
         input_ids: &[i32],
         visual_features: &Array,
-        cache: &mut Vec<KVCache>,
-    ) -> Result<Array, Error> {
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
         let image_positions: Vec<usize> = input_ids
             .iter()
             .enumerate()
@@ -4133,12 +4145,15 @@ impl Gemma4VlModel {
     /// Assumes the image tokens form a single contiguous block in
     /// `input_ids` (this is the standard Gemma4-VL prompt shape from
     /// `build_gemma4_vl_chat_tokens`). Returns an error otherwise.
-    pub fn prefill_multimodal_async(
+    pub fn prefill_multimodal_async<C>(
         &mut self,
         input_ids: &[i32],
         visual_features: &Array,
-        cache: &mut Vec<KVCache>,
-    ) -> Result<Array, Error> {
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
         let image_positions: Vec<usize> = input_ids
             .iter()
             .enumerate()
@@ -4240,11 +4255,14 @@ impl Gemma4VlModel {
         ))
     }
 
-    pub fn prefill_text(
+    pub fn prefill_text<C>(
         &mut self,
         input_ids: &[i32],
-        cache: &mut Vec<KVCache>,
-    ) -> Result<Array, Error> {
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
         let input = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
         self.text
             .forward_last_logits(ModelInput {
@@ -4255,11 +4273,14 @@ impl Gemma4VlModel {
             .map_err(Into::into)
     }
 
-    pub fn decode_token(
+    pub fn decode_token<C>(
         &mut self,
         token_id: u32,
-        cache: &mut Vec<KVCache>,
-    ) -> Result<Array, Error> {
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
         let input = Array::from_slice(&[token_id as i32], &[1, 1]);
         self.text
             .forward_last_logits(ModelInput {
