@@ -608,6 +608,76 @@ pub(crate) fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<
         .ok_or_else(|| Error::WeightNotFound(key.to_string()))
 }
 
+/// Load a `MaybeQuantized<nn::Linear>` from packed checkpoint weights.
+///
+/// Selects the quantized path when `<prefix>.scales` is present in the
+/// weight map, and falls back to a plain BF16/FP16 `nn::Linear` otherwise.
+///
+/// This is the path Unsloth Dynamic ("UD") MLX 4-bit checkpoints rely on:
+/// the global config still declares a uniform 4-bit quantization, but
+/// accuracy-sensitive modules (in the Qwen3.6 case the `linear_attn`
+/// projections — `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`,
+/// `out_proj`) ship with only `.weight` and no `.scales`/`.biases`,
+/// meaning they were left at full precision. The canonical model and
+/// every per-module loader site that goes through here keeps working
+/// unchanged because for canonical checkpoints `.scales` is always
+/// present.
+pub(crate) fn make_maybe_quantized_linear(
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<MaybeQuantized<nn::Linear>, Error> {
+    if weights.contains_key(&format!("{}.scales", prefix)) {
+        Ok(MaybeQuantized::Quantized(make_quantized_linear(
+            weights, prefix, group_size, bits,
+        )?))
+    } else {
+        let weight = get_weight(weights, &format!("{}.weight", prefix))?;
+        Ok(MaybeQuantized::Original(nn::Linear {
+            weight: Param::new(weight),
+            bias: Param::new(None),
+        }))
+    }
+}
+
+/// Derive per-tensor `bits` from the weight/scales shape ratio.
+///
+/// For MLX packed quantization the relation is
+///   weight.shape[-1] = in_features / (32 / bits)
+///   scales.shape[-1] = in_features / group_size
+/// ⇒ bits = (weight.shape[-1] × 32) / (scales.shape[-1] × group_size)
+///
+/// Returns the global `fallback` when shapes are unavailable. UD-MLX-4bit
+/// ships heterogeneous quant (attention q/k/v/o @ 8-bit, MLP @ 4-bit) under
+/// a single `bits=4` global config; the canonical (uniform 4-bit) checkpoint
+/// is unaffected — the derivation evaluates to 4 there too.
+pub(crate) fn derive_quant_bits(
+    weight: &Array,
+    scales: &Array,
+    group_size: i32,
+    fallback: i32,
+) -> i32 {
+    let wshape = weight.shape();
+    let sshape = scales.shape();
+    if wshape.len() < 2 || sshape.len() < 2 || group_size <= 0 {
+        return fallback;
+    }
+    let wc = wshape[wshape.len() - 1] as i64;
+    let sc = sshape[sshape.len() - 1] as i64;
+    if sc <= 0 {
+        return fallback;
+    }
+    let derived = (wc * 32 / (sc * group_size as i64)) as i32;
+    // Only 2/3/4/5/6/8 are valid MLX quant bit-widths; anything else is a
+    // mismatch in our derivation and we should not trust it.
+    if matches!(derived, 2 | 3 | 4 | 5 | 6 | 8) {
+        derived
+    } else {
+        fallback
+    }
+}
+
 pub(crate) fn make_quantized_linear(
     weights: &HashMap<String, Array>,
     prefix: &str,
@@ -618,6 +688,8 @@ pub(crate) fn make_quantized_linear(
     let scales = get_weight(weights, &format!("{}.scales", prefix))?;
     let biases = get_weight(weights, &format!("{}.biases", prefix))?;
 
+    let derived_bits = derive_quant_bits(&weight, &scales, group_size, bits);
+
     let inner = nn::Linear {
         weight: Param::new(weight),
         bias: Param::new(None),
@@ -625,7 +697,7 @@ pub(crate) fn make_quantized_linear(
 
     let mut ql = nn::QuantizedLinear {
         group_size,
-        bits,
+        bits: derived_bits,
         scales: Param::new(scales),
         biases: Param::new(biases),
         inner,
@@ -644,13 +716,15 @@ fn make_quantized_embedding(
     let scales = get_weight(weights, &format!("{}.scales", prefix))?;
     let biases = get_weight(weights, &format!("{}.biases", prefix))?;
 
+    let derived_bits = derive_quant_bits(&weight, &scales, group_size, bits);
+
     let inner = nn::Embedding {
         weight: Param::new(weight),
     };
 
     let mut qe = nn::QuantizedEmbedding {
         group_size,
-        bits,
+        bits: derived_bits,
         scales: Param::new(scales),
         biases: Param::new(biases),
         inner,
@@ -685,13 +759,14 @@ pub(crate) fn make_quantized_switch_linear(
     let output_dims = shape[1] as i32;
     let scales_shape = scales.shape();
     let input_dims = (scales_shape[2] as i32) * group_size;
+    let derived_bits = derive_quant_bits(&weight, &scales, group_size, bits);
 
     Ok(QuantizedSwitchLinear {
         num_experts,
         input_dims,
         output_dims,
         group_size,
-        bits,
+        bits: derived_bits,
         weight: Param::new(weight),
         scales: Param::new(scales),
         biases: Param::new(biases),
@@ -1304,31 +1379,35 @@ fn load_gated_deltanet(
     let conv_dim = key_dim * 2 + value_dim;
     let conv_kernel_size = tc.linear_conv_kernel_dim;
 
+    // UD-MLX-4bit checkpoints keep these projections at full precision.
+    // `make_maybe_quantized_linear` chooses between the quantized and plain
+    // paths based on per-module presence of `.scales`, so the canonical
+    // (fully-quantized) checkpoint still loads through the quantized branch.
     Ok(GatedDeltaNet {
-        in_proj_qkv: MaybeQuantized::Quantized(make_quantized_linear(
+        in_proj_qkv: make_maybe_quantized_linear(
             weights,
             &format!("{}.in_proj_qkv", attn_prefix),
             group_size,
             bits,
-        )?),
-        in_proj_z: MaybeQuantized::Quantized(make_quantized_linear(
+        )?,
+        in_proj_z: make_maybe_quantized_linear(
             weights,
             &format!("{}.in_proj_z", attn_prefix),
             group_size,
             bits,
-        )?),
-        in_proj_a: MaybeQuantized::Quantized(make_quantized_linear(
+        )?,
+        in_proj_a: make_maybe_quantized_linear(
             weights,
             &format!("{}.in_proj_a", attn_prefix),
             group_size,
             bits,
-        )?),
-        in_proj_b: MaybeQuantized::Quantized(make_quantized_linear(
+        )?,
+        in_proj_b: make_maybe_quantized_linear(
             weights,
             &format!("{}.in_proj_b", attn_prefix),
             group_size,
             bits,
-        )?),
+        )?,
         conv1d_weight: Param::new(get_weight(
             weights,
             &format!("{}.conv1d.weight", attn_prefix),
@@ -1340,12 +1419,12 @@ fn load_gated_deltanet(
             &format!("{}.norm.weight", attn_prefix),
             tc.rms_norm_eps,
         )?,
-        out_proj: MaybeQuantized::Quantized(make_quantized_linear(
+        out_proj: make_maybe_quantized_linear(
             weights,
             &format!("{}.out_proj", attn_prefix),
             group_size,
             bits,
-        )?),
+        )?,
         num_k_heads,
         num_v_heads,
         key_head_dim,
