@@ -1,0 +1,9 @@
+model,prompt,max_tokens,kv_mode,prefill_s,decode_tps
+gemma-4-26B-A4B-it,short,64,STD,0.87,7.85
+gemma-4-26B-A4B-it,short,64,PAGED,0.84,7.76
+gemma-4-26B-A4B-it,short,256,STD,0.87,7.86
+gemma-4-26B-A4B-it,short,256,PAGED,0.87,7.81
+gemma-4-26B-A4B-it,long,64,STD,6.29,7.95
+gemma-4-26B-A4B-it,long,64,PAGED,6.36,5.26
+gemma-4-26B-A4B-it,long,256,STD,6.57,7.94
+gemma-4-26B-A4B-it,long,256,PAGED,7.05,5.19

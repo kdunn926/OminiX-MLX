@@ -68,6 +68,7 @@ build_examples() {
     "cargo build --release -p qwen3-6-mlx --example generate"
     "cargo build --release -p mtplx-mlx   --example bench_mtplx"
     "cargo build --release -p dflash-mlx  --example bench_dflash"
+    "cargo build --release -p gemma4-mlx  --example ar_bench"
   )
   for c in "${cmds[@]}"; do
     log "  $c"
@@ -215,7 +216,8 @@ prompt_text_for() { [[ "$1" == "long" ]] && printf '%s' "${LONG_PROMPT}" || prin
 
 # Per-sweep parameter sets.
 if [[ "${SWEEP}" == "quick" ]]; then
-  CELL_A_MODELS=("Qwen3.6-27B-4bit")
+  CELL_A_MODELS=("Qwen3.6-27B-4bit" "Qwen3.6-27B-UD-MLX-4bit")
+  CELL_D_MODELS=("gemma-4-e4b-it-4bit")
   PROMPTS=("short")
   MAXTOKS=(64)
   # Include QUANTIZE_KV so the quick sweep measures the F9 fused-quantized-
@@ -229,7 +231,8 @@ if [[ "${SWEEP}" == "quick" ]]; then
   DFLASH_TEMPS=(0.0)
   DFLASH_DDTREE=("off")
 elif [[ "${SWEEP}" == "full" ]]; then
-  CELL_A_MODELS=("Qwen3.6-27B-4bit" "Qwen3.6-35B-A3B-4bit")
+  CELL_A_MODELS=("Qwen3.6-27B-4bit" "Qwen3.6-27B-UD-MLX-4bit" "Qwen3.6-35B-A3B-4bit")
+  CELL_D_MODELS=("gemma-4-e4b-it-4bit" "gemma-4-26B-A4B-it")
   PROMPTS=("short" "long")
   MAXTOKS=(64 256)
   KV_MODES=("unset" "QUANTIZE_KV" "PAGED" "TURBO_KV")
@@ -342,6 +345,38 @@ cell_c() {
   done
 }
 
+# --- Cell D: Gemma4 AR throughput (ar_bench) --------------------------------
+# Standalone harness for Gemma4 variants — paged-vs-standard comparison on the
+# mask-only sliding-window architecture. Covers gemma-4-e4b-it-4bit (the new
+# 4-bit checkpoint) and the original gemma-4-26B-A4B-it baseline. ar_bench
+# emits `prefill_s=` / `decode_tok_s=` in the same format bench_dflash does,
+# so the existing parser captures it as-is.
+cell_d() {
+  local BIN="${BIN_DIR}/ar_bench"
+  for model in "${CELL_D_MODELS[@]}"; do
+    if ! model_present "${model}"; then log "skip missing model ${model}"; continue; fi
+    local mp; mp="$(model_path "${model}")"
+    # UD-MLX-4bit checkpoints (e.g. gemma-4-e4b-it-4bit) ship with the
+    # `language_model.model.*` weight prefix — route ar_bench through the
+    # UD loader to avoid `Weight not found: model.language_model.…`.
+    local loader_env=""; [[ "${model}" == *4bit ]] && loader_env="LOADER=ud"
+    for prompt in "${PROMPTS[@]}"; do
+      local ptext; ptext="$(prompt_text_for "${prompt}")"
+      for mt in "${MAXTOKS[@]}"; do
+        # ar_bench KV modes: standard fp16 (unset) and PAGED (mixed cache —
+        # pages only full-attn layers; sliding stay contiguous).
+        for kv in "unset" "PAGED"; do
+          local env_str="${loader_env}"
+          [[ "${kv}" == "PAGED" ]] && env_str="${env_str:+${env_str} }PAGED_KV=1"
+          run_cell "${env_str}" "${model}" "ar_bench" "${prompt}" "${mt}" \
+            "${kv}" "-" "-" "-" "-" "greedy" "0.0" "off" \
+            -- "${BIN}" "${mp}" "${mt}" "${ptext}"
+        done
+      done
+    done
+  done
+}
+
 # ============================================================================
 main() {
   log "SWEEP=${SWEEP} DRY_RUN=${DRY_RUN} REPS=${REPS} MODELS_DIR=${MODELS_DIR}"
@@ -350,6 +385,7 @@ main() {
   cell_a
   cell_b
   cell_c
+  cell_d
   log "done. results in ${CSV}"
 }
 

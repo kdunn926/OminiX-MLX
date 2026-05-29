@@ -1,0 +1,17 @@
+model,prompt,max_tokens,kv_mode,ttft_s,decode_tps
+Qwen3.6-27B-4bit,short,64,STD,0.87,19.1
+Qwen3.6-27B-4bit,short,64,PAGED,0.87,19.1
+Qwen3.6-27B-4bit,short,256,STD,0.88,19.0
+Qwen3.6-27B-4bit,short,256,PAGED,0.87,19.1
+Qwen3.6-27B-4bit,long,64,STD,21.74,18.8
+Qwen3.6-27B-4bit,long,64,PAGED,21.82,18.7
+Qwen3.6-27B-4bit,long,256,STD,21.75,18.7
+Qwen3.6-27B-4bit,long,256,PAGED,21.72,18.7
+Qwen3.6-35B-A3B-4bit,short,64,STD,2.94,68.6
+Qwen3.6-35B-A3B-4bit,short,64,PAGED,1.08,68.8
+Qwen3.6-35B-A3B-4bit,short,256,STD,1.09,69.5
+Qwen3.6-35B-A3B-4bit,short,256,PAGED,1.06,70.1
+Qwen3.6-35B-A3B-4bit,long,64,STD,6.53,68.6
+Qwen3.6-35B-A3B-4bit,long,64,PAGED,6.51,68.4
+Qwen3.6-35B-A3B-4bit,long,256,STD,6.50,68.3
+Qwen3.6-35B-A3B-4bit,long,256,PAGED,6.52,68.1

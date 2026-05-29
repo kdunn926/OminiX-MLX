@@ -2,9 +2,16 @@
 //! Used to baseline the gemma4 verify-path bottleneck and to compare KV
 //! backends. Set `PAGED_KV=1` to run full-attention layers through the paged
 //! KV cache (fused paged-attention kernel); default is the standard fp16 cache.
+//!
+//! Loader: defaults to the canonical `load_model`. Try
+//! `LOADER=ud ar_bench <model_dir> …` to route through the UD-MLX-4bit
+//! loader for checkpoints that use the `language_model.model.*` prefix
+//! (Unsloth Dynamic, including the multimodal gemma-4-e4b-it-4bit
+//! checkpoint whose text-side weights match the UD layout).
 
 use anyhow::Result;
 use gemma4_mlx::mixed_cache::init_mixed_paged_cache;
+use gemma4_mlx::ud_loader::load_ud_mlx_4bit;
 use gemma4_mlx::{load_model, load_tokenizer, Generate, Model};
 use mlx_rs::Array;
 use mlx_rs_core::cache::{KVCache, KeyValueCache};
@@ -47,7 +54,14 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| "The theory of general relativity".to_string());
 
     let tokenizer = load_tokenizer(&target).map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let mut model = load_model(&target).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let loader_choice = std::env::var("LOADER").unwrap_or_default();
+    let mut model: Model = if loader_choice == "ud" {
+        eprintln!("loader: UD-MLX-4bit (load_ud_mlx_4bit)");
+        load_ud_mlx_4bit(&target).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        eprintln!("loader: canonical (load_model)");
+        load_model(&target).map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
     let enc = tokenizer
         .encode(prompt_str.as_str(), false)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
