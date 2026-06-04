@@ -55,7 +55,11 @@ where
 pub struct Gemma4Config {
     pub model_type: String,
     pub text_config: Gemma4TextConfig,
-    #[serde(default)]
+    // Tolerant: a `vision_config` whose schema this loader doesn't recognize
+    // (e.g. the `gemma4_unified_vision` variant uses `mm_embed_dim` instead of
+    // `hidden_size`) parses to `None`, so text-only `load_model` still works.
+    // `load_vl_model` will surface "Not a Gemma4-VL model: missing vision_config".
+    #[serde(default, deserialize_with = "vision_config_or_none")]
     pub vision_config: Option<Gemma4VisionConfig>,
     #[serde(default)]
     pub vision_soft_tokens_per_image: usize,
@@ -85,6 +89,19 @@ pub struct QuantizationConfig {
 
 fn default_quant_mode() -> String {
     "affine".to_string()
+}
+
+fn vision_config_or_none<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Gemma4VisionConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<Gemma4VisionConfig>(value).ok())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3017,10 +3034,28 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<Gemma4Config, Error
 
 fn keep_language_weight(key: &str) -> bool {
     key.starts_with("model.language_model.")
+        || key.starts_with("language_model.model.")
         || matches!(
             key,
-            "lm_head.weight" | "model.lm_head.weight" | "model.language_model.lm_head.weight"
+            "lm_head.weight"
+                | "model.lm_head.weight"
+                | "model.language_model.lm_head.weight"
+                | "language_model.lm_head.weight"
         )
+}
+
+/// Rewrite multimodal-wrapper naming (`language_model.model.X`,
+/// `language_model.lm_head.X`) to the canonical nested form
+/// (`model.language_model.X`, `lm_head.X`) the loader looks up by.
+/// Other keys pass through unchanged.
+fn normalize_weight_key(key: &str) -> String {
+    if let Some(rest) = key.strip_prefix("language_model.model.") {
+        format!("model.language_model.{rest}")
+    } else if let Some(rest) = key.strip_prefix("language_model.lm_head.") {
+        format!("lm_head.{rest}")
+    } else {
+        key.to_string()
+    }
 }
 
 fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
@@ -3053,7 +3088,7 @@ fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
         let loaded = Array::load_safetensors(&weights_filename)?;
         for (key, value) in loaded {
             if keep_language_weight(&key) {
-                all_weights.insert(key, value);
+                all_weights.insert(normalize_weight_key(&key), value);
             }
         }
     }

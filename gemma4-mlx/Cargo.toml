@@ -19,6 +19,10 @@ name = "chat_gemma4"
 path = "examples/chat_gemma4.rs"
 
 [[example]]
+name = "chat_text"
+path = "examples/chat_text.rs"
+
+[[example]]
 name = "chat_gemma4_ud"
 path = "examples/chat_gemma4_ud.rs"
 
