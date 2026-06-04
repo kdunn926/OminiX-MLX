@@ -301,57 +301,8 @@ fn hann_window(size: usize) -> Vec<f32> {
     window
 }
 
-/// Convert frequency to mel scale
-fn hz_to_mel(hz: f32) -> f32 {
-    2595.0 * (1.0 + hz / 700.0).log10()
-}
-
-/// Convert mel scale to frequency
-fn mel_to_hz(mel: f32) -> f32 {
-    700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
-}
-
-/// Create mel filterbank matrix
-/// Returns [n_mels, n_freqs] matrix
-fn mel_filterbank(n_fft: i32, n_mels: i32, sample_rate: i32, fmin: f32, fmax: f32) -> Vec<f32> {
-    let n_freqs = (n_fft / 2 + 1) as usize;
-
-    // Mel points
-    let mel_min = hz_to_mel(fmin);
-    let mel_max = hz_to_mel(fmax);
-
-    let mut mel_points = Vec::with_capacity(n_mels as usize + 2);
-    for i in 0..=(n_mels + 1) as usize {
-        let mel = mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32;
-        mel_points.push(mel_to_hz(mel));
-    }
-
-    // Convert to FFT bins
-    let fft_freqs: Vec<f32> = (0..n_freqs)
-        .map(|i| i as f32 * sample_rate as f32 / n_fft as f32)
-        .collect();
-
-    // Create filterbank [n_mels, n_freqs]
-    let mut filterbank = vec![0.0f32; n_mels as usize * n_freqs];
-
-    for m in 0..n_mels as usize {
-        let f_left = mel_points[m];
-        let f_center = mel_points[m + 1];
-        let f_right = mel_points[m + 2];
-
-        for k in 0..n_freqs {
-            let freq = fft_freqs[k];
-
-            if freq >= f_left && freq <= f_center {
-                filterbank[m * n_freqs + k] = (freq - f_left) / (f_center - f_left);
-            } else if freq > f_center && freq <= f_right {
-                filterbank[m * n_freqs + k] = (f_right - freq) / (f_right - f_center);
-            }
-        }
-    }
-
-    filterbank
-}
+// Mel-scale helpers live in mlx-rs-core (shared with other audio model crates).
+use mlx_rs_core::audio::mel_filterbank;
 
 // ============================================================================
 // GPU-Accelerated STFT (MLX FFT)
@@ -631,6 +582,7 @@ pub fn samples_to_mel(samples: &[f32], sample_rate: u32, config: &AudioConfig) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs_core::audio::hz_to_mel;
 
     #[test]
     fn test_hann_window() {
