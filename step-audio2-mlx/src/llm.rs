@@ -18,7 +18,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use mlx_rs::{
-    array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
@@ -426,14 +425,7 @@ struct WeightMap {
 // ============================================================================
 
 /// Sample from logits
-pub fn sample(logits: &Array, temperature: f32) -> std::result::Result<Array, Exception> {
-    if temperature == 0.0 {
-        mlx_rs::ops::indexing::argmax_axis(logits, -1, false)
-    } else {
-        let scaled = logits.multiply(&array!(1.0 / temperature))?;
-        mlx_rs::random::categorical(&scaled, None, None, None)
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 /// Apply frequency-based repetition penalty to logits.
 /// For tokens that appear in `generated`, divide positive logits by `penalty`
