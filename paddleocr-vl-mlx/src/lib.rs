@@ -8,6 +8,7 @@
 pub mod config;
 pub mod mrope;
 pub mod position_ids;
+pub mod preprocess;
 pub mod projector;
 pub mod text_model;
 pub mod vision_model;
@@ -24,3 +25,4 @@ pub use vision_model::{
     VisionLayerNorm, VisionMlp, VisionTransformer,
 };
 pub use projector::{build_projector_with_random_weights, MergeKernel, Projector};
+pub use preprocess::{preprocess_image_bytes, smart_resize, PreprocessOutput, PreprocessParams};
