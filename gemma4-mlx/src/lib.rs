@@ -39,7 +39,8 @@ pub use model::{
 pub use vision::{preprocess_image_gemma4, EmbedVision, Gemma4VisionConfig, VisionModel};
 pub use unified_vision::{
     load_unified_4bit_vl, load_unified_embed_vision, load_unified_embedder,
-    Gemma4UnifiedVisionConfig, Gemma4UnifiedVlModel, UnifiedVisionEmbedder,
+    preprocess_image_unified, Gemma4UnifiedVisionConfig, Gemma4UnifiedVlModel,
+    UnifiedVisionEmbedder,
 };
 
 pub struct GemmaVlChatMessage {

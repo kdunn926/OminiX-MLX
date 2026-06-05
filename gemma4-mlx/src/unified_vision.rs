@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use image::imageops::FilterType;
 use mlx_rs::{
     array,
     module::{Module, Param},
@@ -244,6 +245,149 @@ pub struct Gemma4UnifiedVlModel {
     /// Number of vision soft tokens per image; HF surfaces this as
     /// `vision_config.num_soft_tokens` (alias `max_soft_tokens`).
     pub n_vision_tokens: usize,
+}
+
+impl Gemma4UnifiedVlModel {
+    /// One-shot image → soft-tokens encode. Mirrors the canonical
+    /// `Gemma4VlModel::encode_image_bytes` contract used by the API's
+    /// `generate_gemma4_vl_multimodal` so the same splice path works:
+    ///
+    ///   1. Aspect-preserving resize + patchify to `(1, P, model_patch_size² × 3)`.
+    ///   2. `UnifiedVisionEmbedder` forward (LN → Dense → LN → +pos → pos_norm).
+    ///   3. `EmbedVision` projection to LM hidden size.
+    ///   4. Drop padding rows so the returned tensor has shape
+    ///      `(num_real_patches, text_hidden)` — exactly what the LM
+    ///      embedding-splice expects at the `image_token_id` placeholder
+    ///      positions.
+    pub fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Array> {
+        let (pixel_values, pos_ids, n_real) =
+            preprocess_image_unified(bytes, 48, self.n_vision_tokens as i32)?;
+        let hidden = self.vision.forward(&pixel_values, &pos_ids)?;
+        let projected = self.embed_vision.forward(&hidden)?;
+        // (1, max_soft_tokens, hidden) → drop the leading batch + padding tail.
+        let valid = projected.index((0, ..n_real, ..));
+        Ok(valid)
+    }
+}
+
+/// Image preprocessor for the unified vision path.
+///
+/// Mirrors the area-preserving aspect-ratio resize the canonical
+/// [`crate::preprocess_image_gemma4`] does — pick the largest target whose
+/// width and height are multiples of `model_patch_size` and whose total
+/// patch count is `≤ max_soft_tokens`, then bicubic-resize, `1/255`-rescale,
+/// and partition into `model_patch_size × model_patch_size × 3` patches.
+///
+/// Returns
+///   * `pixel_values` — `(1, max_soft_tokens, model_patch_size² × 3)` BF16
+///     tensor; rows past `num_real_patches` are zero-padded.
+///   * `position_ids` — `(1, max_soft_tokens, 2)` int32 (X, Y) grid coords;
+///     rows past `num_real_patches` are `(-1, -1)` per the embedder's
+///     padding convention.
+///   * `num_real_patches` — count of non-padded patches in the leading
+///     prefix of `pixel_values` / `position_ids`.
+pub fn preprocess_image_unified(
+    bytes: &[u8],
+    model_patch_size: i32,
+    max_soft_tokens: i32,
+) -> Result<(Array, Array, i32)> {
+    let image = image::load_from_memory(bytes).map_err(|e| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })?;
+    let rgb = image.to_rgb8();
+    let (width, height) = rgb.dimensions();
+    let width = width as i32;
+    let height = height as i32;
+    if width <= 0 || height <= 0 {
+        return Err(Error::InvalidConfig(
+            "Attempting to resize to a 0x0 image".to_string(),
+        ));
+    }
+
+    // Aspect-preserving fit to ≤ max_soft_tokens patches at model_patch_size².
+    let target_px = max_soft_tokens * model_patch_size * model_patch_size;
+    let factor = ((target_px as f32) / ((height * width) as f32)).sqrt();
+    let mps = model_patch_size;
+    let mut target_h = ((factor * height as f32) / mps as f32).floor() as i32 * mps;
+    let mut target_w = ((factor * width as f32) / mps as f32).floor() as i32 * mps;
+    // Bound by the maximum side length the position table can address (one row
+    // or one column of patches must still fit into `max_soft_tokens`).
+    let max_side = max_soft_tokens * mps;
+    if target_h == 0 && target_w == 0 {
+        return Err(Error::InvalidConfig(
+            "Attempting to resize to a 0x0 image".to_string(),
+        ));
+    }
+    if target_h == 0 {
+        target_h = mps;
+        target_w = ((width as f32 / height as f32).floor() as i32).max(1) * mps;
+        target_w = target_w.min(max_side);
+    } else if target_w == 0 {
+        target_w = mps;
+        target_h = ((height as f32 / width as f32).floor() as i32).max(1) * mps;
+        target_h = target_h.min(max_side);
+    }
+
+    let resized = image
+        .resize_exact(target_w as u32, target_h as u32, FilterType::CatmullRom)
+        .to_rgb8();
+
+    // Partition into (P_y × P_x) macro-patches of model_patch_size × model_patch_size × 3
+    // pixels each, channel-last flattened into a single 6912-element row.
+    let p_h = target_h / mps;
+    let p_w = target_w / mps;
+    let n_real = (p_h * p_w).min(max_soft_tokens);
+    let patch_pixels = (mps * mps * 3) as usize;
+    let mut pixel_values = vec![0f32; max_soft_tokens as usize * patch_pixels];
+    for py in 0..p_h {
+        for px in 0..p_w {
+            let patch_idx = (py * p_w + px) as usize;
+            if patch_idx >= max_soft_tokens as usize {
+                break;
+            }
+            let dst_offset = patch_idx * patch_pixels;
+            for dy in 0..mps {
+                for dx in 0..mps {
+                    let sx = px * mps + dx;
+                    let sy = py * mps + dy;
+                    let pix = resized.get_pixel(sx as u32, sy as u32).0;
+                    let row_offset = (dy * mps + dx) as usize * 3;
+                    pixel_values[dst_offset + row_offset] = pix[0] as f32 / 255.0;
+                    pixel_values[dst_offset + row_offset + 1] = pix[1] as f32 / 255.0;
+                    pixel_values[dst_offset + row_offset + 2] = pix[2] as f32 / 255.0;
+                }
+            }
+        }
+    }
+    let pixel_array = Array::from_slice(
+        &pixel_values,
+        &[1, max_soft_tokens, patch_pixels as i32],
+    );
+
+    // Position IDs: (X, Y) for every real patch, then (-1, -1) padding.
+    let mut pos_ids = Vec::with_capacity(max_soft_tokens as usize * 2);
+    let mut emitted = 0;
+    for py in 0..p_h {
+        for px in 0..p_w {
+            if emitted >= max_soft_tokens {
+                break;
+            }
+            pos_ids.push(px);
+            pos_ids.push(py);
+            emitted += 1;
+        }
+    }
+    while emitted < max_soft_tokens {
+        pos_ids.push(-1);
+        pos_ids.push(-1);
+        emitted += 1;
+    }
+    let pos_array = Array::from_slice(&pos_ids, &[1, max_soft_tokens, 2]);
+
+    Ok((pixel_array, pos_array, n_real))
 }
 
 /// Top-level loader for a UD-MLX-4bit unified checkpoint

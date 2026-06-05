@@ -1,31 +1,37 @@
-//! Smoke test for the encoder-free unified-vision embedder
+//! End-to-end smoke test for the encoder-free unified-vision pipeline
 //! ([`gemma4_mlx::unified_vision`]).
 //!
-//! Loads a Gemma 4 12B `gemma4_unified_vision` checkpoint, builds the
-//! `UnifiedVisionEmbedder` + the shared `EmbedVision` projection from raw
-//! weights, then runs a forward with **synthetic** zero-valued patches and
-//! a small position grid. Verifies the output shape — does NOT verify
-//! pixel-correct embedding values (Phase 2 image preprocessor + a real
-//! image are required for that, and the upstream sglang PR has only been
-//! merged this week so the reference path itself is still being shaken
-//! down).
+//! Two modes:
+//!   * **synthetic** (default — no image arg): runs the embedder over a
+//!     zero-filled 14x14 patch grid and asserts shapes. Verifies that the
+//!     loader path is intact even on hosts without sample images.
+//!   * **real image**: pass an image path as the second arg; the full
+//!     `preprocess → embedder → embed_vision` pipeline is exercised on the
+//!     actual pixels, with shape + non-zero output checks.
+//!
+//! Does NOT verify pixel-correct embedding values; the upstream sglang
+//! reference (sgl-project/sglang#27167) was only merged this week and its
+//! end-to-end accuracy is still being shaken down.
 //!
 //! Usage:
 //!   cargo run --release -p gemma4-mlx --example unified_vision_smoke \
-//!     -- ./models/gemma-4-12B-it-4bit
+//!     -- ./models/gemma-4-12B-it-4bit [./path/to/image.png]
 
 use std::env;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
-use gemma4_mlx::unified_vision::{load_unified_4bit_vl, Gemma4UnifiedVlModel};
+use gemma4_mlx::unified_vision::{
+    load_unified_4bit_vl, preprocess_image_unified, Gemma4UnifiedVlModel,
+};
 use mlx_rs::{ops, Array, Dtype};
 
 fn main() -> Result<()> {
     let model_dir: PathBuf = env::args()
         .nth(1)
-        .ok_or_else(|| anyhow!("usage: unified_vision_smoke <model_dir>"))?
+        .ok_or_else(|| anyhow!("usage: unified_vision_smoke <model_dir> [image_path]"))?
         .into();
+    let image_path: Option<PathBuf> = env::args().nth(2).map(Into::into);
 
     eprintln!("loading {} …", model_dir.display());
     let Gemma4UnifiedVlModel {
@@ -39,24 +45,32 @@ fn main() -> Result<()> {
         "loaded: image_token_id={image_token_id} n_vision_tokens={n_vision_tokens}"
     );
 
-    // Patch layout: 14×14 = 196 model-sized patches, each
-    // model_patch_size×model_patch_size×3 = 6912 raw pixel values.
-    let n_patches = 196_i32;
-    let patch_pixels = 48 * 48 * 3;
-    let pixel_values = ops::zeros::<f32>(&[1, n_patches, patch_pixels]).unwrap();
-
-    // Synthetic position grid: row-major 14×14 over (X, Y); no padding.
-    let mut coords = Vec::with_capacity((n_patches as usize) * 2);
-    for y in 0..14_i32 {
-        for x in 0..14_i32 {
-            coords.push(x);
-            coords.push(y);
+    let (pixel_values, pos_ids, n_real) = match image_path {
+        Some(p) => {
+            eprintln!("preprocessing real image: {}", p.display());
+            let bytes = std::fs::read(&p)?;
+            preprocess_image_unified(&bytes, 48, n_vision_tokens as i32)
+                .map_err(|e| anyhow!(e.to_string()))?
         }
-    }
-    let pos_ids = Array::from_slice(&coords, &[1, n_patches, 2]);
+        None => {
+            eprintln!("synthetic patches (no image arg)");
+            let n_patches = 196_i32;
+            let patch_pixels = 48 * 48 * 3;
+            let pv = ops::zeros::<f32>(&[1, n_patches, patch_pixels]).unwrap();
+            let mut coords = Vec::with_capacity((n_patches as usize) * 2);
+            for y in 0..14_i32 {
+                for x in 0..14_i32 {
+                    coords.push(x);
+                    coords.push(y);
+                }
+            }
+            let pp = Array::from_slice(&coords, &[1, n_patches, 2]);
+            (pv, pp, n_patches)
+        }
+    };
 
     eprintln!(
-        "forward: pixel_values={:?} pos_ids={:?}",
+        "forward: pixel_values={:?} pos_ids={:?} n_real_patches={n_real}",
         pixel_values.shape(),
         pos_ids.shape()
     );
@@ -81,12 +95,26 @@ fn main() -> Result<()> {
     let proj_shape = projected.shape();
     assert_eq!(proj_shape.len(), 3, "expected 3D projection output");
     assert_eq!(proj_shape[0], 1);
-    assert_eq!(proj_shape[1], n_patches);
+    assert!(proj_shape[1] >= n_real, "fewer rows than valid patches");
     assert!(
         matches!(projected.dtype(), Dtype::Bfloat16 | Dtype::Float16 | Dtype::Float32),
         "unexpected output dtype {:?}",
         projected.dtype()
     );
+
+    // For real images we also check that the embedded output is non-trivial
+    // (zero-input synthetic patches pass through the LN biases / pos embeddings
+    // so they won't all be exactly zero either; this is a sanity floor).
+    let absmax = projected
+        .abs()
+        .map_err(|e| anyhow!(e.to_string()))?
+        .max(None)
+        .map_err(|e| anyhow!(e.to_string()))?
+        .as_dtype(Dtype::Float32)
+        .map_err(|e| anyhow!(e.to_string()))?;
+    let absmax_v = absmax.item::<f32>();
+    eprintln!("output |max|={absmax_v}");
+    assert!(absmax_v > 0.0, "projection output is exactly zero");
 
     eprintln!("smoke ok — shape matches expectations");
     Ok(())
