@@ -8,6 +8,7 @@ pub mod model;
 pub mod mtplx_target;
 pub mod quant_switch;
 pub mod ud_loader;
+pub mod unified_vision;
 
 pub use mlx_rs_core::{
     cache::{
@@ -36,6 +37,10 @@ pub use model::{
     Generate, GenerateState, LanguageModel, Model, ModelInput, Router, UnscaledRmsNorm,
 };
 pub use vision::{preprocess_image_gemma4, EmbedVision, Gemma4VisionConfig, VisionModel};
+pub use unified_vision::{
+    load_unified_4bit_vl, load_unified_embed_vision, load_unified_embedder,
+    Gemma4UnifiedVisionConfig, Gemma4UnifiedVlModel, UnifiedVisionEmbedder,
+};
 
 pub struct GemmaVlChatMessage {
     pub role: String,
