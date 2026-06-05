@@ -403,7 +403,18 @@ impl Gemma4UnifiedVlModel {
 
     /// Build a fresh contiguous KV cache sized for `self.text`.
     pub fn new_cache(&self) -> Vec<crate::KVCache> {
-        crate::init_cache(self.text.args.num_hidden_layers as usize)
+        let num_slots = *self.text.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
+        crate::init_cache::<crate::KVCache>(num_slots)
+    }
+
+    /// Paged variant of [`Self::new_cache`] — parallel to
+    /// [`crate::Gemma4VlModel::new_cache_paged`]. Full-attention layers draw
+    /// from the shared paged pool; sliding-window layers stay contiguous (the
+    /// "mixed" of `MixedKvCache`). Used by the API when
+    /// `OMINIX_PAGED_ATTENTION=1` is set.
+    pub fn new_cache_paged(&self) -> Vec<crate::mixed_cache::MixedKvCache> {
+        let num_slots = *self.text.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
+        crate::init_cache::<crate::mixed_cache::MixedKvCache>(num_slots)
     }
 }
 
