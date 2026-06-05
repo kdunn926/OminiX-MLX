@@ -8,7 +8,12 @@
 pub mod config;
 pub mod mrope;
 pub mod position_ids;
+pub mod text_model;
 
 pub use config::{
     load_tokenizer, PaddleOcrVisionConfig, PaddleOcrVlConfig, RopeScaling, SpecialTokens,
+};
+pub use text_model::{
+    build_with_random_weights, AttentionInput, Ernie45Attention, Ernie45DecoderLayer,
+    Ernie45ForCausalLM, Ernie45Mlp, Ernie45Model, LayerInput,
 };
