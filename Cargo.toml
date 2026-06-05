@@ -57,6 +57,7 @@ members = [
     "deepseek-ocr2-mlx",
     "qwen3-vl-mlx",
     "gemma4-mlx",
+    "paddleocr-vl-mlx",
     "ane-vit/coreml-bridge",
     "xtask",
 ]

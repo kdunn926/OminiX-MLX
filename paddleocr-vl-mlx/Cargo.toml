@@ -1,0 +1,11 @@
+[package]
+name = "paddleocr-vl-mlx"
+version = "0.1.0"
+edition = "2021"
+description = "PaddleOCR-VL-1.5 inference on Apple Silicon with MLX (in-progress)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
+mlx-rs-core = { path = "../mlx-rs-core" }
+thiserror = "2"
