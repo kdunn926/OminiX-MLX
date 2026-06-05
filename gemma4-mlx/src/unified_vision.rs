@@ -268,6 +268,143 @@ impl Gemma4UnifiedVlModel {
         let valid = projected.index((0, ..n_real, ..));
         Ok(valid)
     }
+
+    /// Multimodal prefill: embed `input_ids`, splice `visual_features` rows
+    /// into the embeddings at every `image_token_id` position, run a chunked
+    /// PLE-aware prefill, and return the last-position logits.
+    ///
+    /// Mirrors `Gemma4VlModel::prefill_multimodal` byte-for-byte (same
+    /// embedding-scale, host-side scatter via `try_as_slice`, chunk size 32,
+    /// PLE precompute) so the API's existing `generate_gemma4_vl_multimodal`
+    /// can drive this path identically.
+    ///
+    /// If no `image_token_id` positions exist in `input_ids` the call
+    /// degrades to a plain text prefill.
+    pub fn prefill_multimodal<C>(
+        &mut self,
+        input_ids: &[i32],
+        visual_features: &Array,
+        cache: &mut Vec<C>,
+    ) -> Result<Array>
+    where
+        C: mlx_rs_core::cache::KeyValueCache + Default,
+    {
+        let image_positions: Vec<usize> = input_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &id)| (id as u32 == self.image_token_id).then_some(idx))
+            .collect();
+        if image_positions.is_empty() {
+            // No image tokens — fall back to a plain text prefill via Model.
+            let chunk = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let input = crate::ModelInput {
+                inputs: &chunk,
+                mask: None,
+                cache,
+            };
+            return self.text.forward_last_logits(input).map_err(Error::from);
+        }
+
+        let text_embeds = self.text.embed_tokens_slice(input_ids)?;
+        let scale = Array::from((self.text.args.hidden_size as f32).sqrt())
+            .as_dtype(mlx_rs::Dtype::Bfloat16)?
+            .as_dtype(text_embeds.dtype())?;
+        let text_embeds = text_embeds.multiply(&scale)?;
+        let seq_len = input_ids.len();
+        let hidden_size = self.text.args.hidden_size as usize;
+
+        let text_f32 = text_embeds.as_dtype(mlx_rs::Dtype::Float32)?;
+        eval([&text_f32]).map_err(|e| Error::Model(format!("eval text_embeds: {e}")))?;
+        let text_slice = text_f32.try_as_slice::<f32>().map_err(|e| {
+            Error::Model(format!("text embeddings must be contiguous for multimodal scatter: {e}"))
+        })?;
+
+        let vis_len = visual_features.shape()[0] as usize;
+        if vis_len == 0 {
+            return Err(Error::Model(
+                "encode_image_bytes returned zero visual tokens".into(),
+            ));
+        }
+        let vis_f32 = visual_features.as_dtype(mlx_rs::Dtype::Float32)?;
+        eval([&vis_f32]).map_err(|e| Error::Model(format!("eval visual_features: {e}")))?;
+        let vis_slice = vis_f32.try_as_slice::<f32>().map_err(|e| {
+            Error::Model(format!("visual features must be contiguous for multimodal scatter: {e}"))
+        })?;
+
+        let mut combined = text_slice.to_vec();
+        for (out_idx, &token_idx) in image_positions.iter().enumerate() {
+            let src_row = out_idx % vis_len;
+            let dst_start = token_idx * hidden_size;
+            let src_start = src_row * hidden_size;
+            combined[dst_start..dst_start + hidden_size]
+                .copy_from_slice(&vis_slice[src_start..src_start + hidden_size]);
+        }
+
+        let combined_f32 = Array::from_slice(
+            &combined,
+            &[1, seq_len as i32, self.text.args.hidden_size],
+        );
+        eval([&combined_f32]).map_err(|e| Error::Model(format!("eval combined_f32: {e}")))?;
+        let combined = combined_f32.as_dtype(text_embeds.dtype())?;
+        eval([&combined]).map_err(|e| Error::Model(format!("eval combined: {e}")))?;
+
+        // PLE precompute over the full seq (image positions use image_token_id
+        // as the auxiliary; PLE is a secondary modulating input).
+        let input_ids_arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+        let per_layer_inputs_full = self
+            .text
+            .model
+            .compute_per_layer_inputs(&input_ids_arr, &combined)
+            .map_err(|e| Error::Model(format!("compute_per_layer_inputs: {e}")))?;
+
+        const PREFILL_CHUNK: i32 = 32;
+        let total = seq_len as i32;
+        let mut pos: i32 = 0;
+        while pos < total {
+            let end = (pos + PREFILL_CHUNK).min(total);
+            let chunk = combined.index((.., pos..end, ..));
+            let ple_chunk = per_layer_inputs_full
+                .as_ref()
+                .map(|p| p.index((.., pos..end, .., ..)));
+            if end < total {
+                let hidden = self
+                    .text
+                    .model
+                    .forward_from_embeds(&chunk, None, cache, ple_chunk.as_ref())?;
+                eval([&hidden]).map_err(|e| Error::Model(format!("prefill chunk {pos}: {e}")))?;
+            } else {
+                return self
+                    .text
+                    .forward_from_embeds(&chunk, cache, ple_chunk.as_ref())
+                    .map_err(Into::into);
+            }
+            pos = end;
+        }
+        Err(Error::Model(
+            "prefill_multimodal: unexpected empty sequence".into(),
+        ))
+    }
+
+    /// Decode a single token (post-prefill) — same contract as the canonical
+    /// `Gemma4VlModel::decode_token`. The API's decode loop can call this
+    /// uniformly across the canonical and unified VL backends.
+    pub fn decode_token<C>(&mut self, token_id: u32, cache: &mut Vec<C>) -> Result<Array>
+    where
+        C: mlx_rs_core::cache::KeyValueCache + Default,
+    {
+        let chunk = Array::from_slice(&[token_id as i32], &[1, 1]);
+        let input = crate::ModelInput {
+            inputs: &chunk,
+            mask: None,
+            cache,
+        };
+        self.text.forward_last_logits(input).map_err(Error::from)
+    }
+
+    /// Build a fresh contiguous KV cache sized for `self.text`.
+    pub fn new_cache(&self) -> Vec<crate::KVCache> {
+        crate::init_cache(self.text.args.num_hidden_layers as usize)
+    }
 }
 
 /// Image preprocessor for the unified vision path.
