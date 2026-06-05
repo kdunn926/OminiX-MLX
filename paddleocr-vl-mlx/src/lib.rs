@@ -5,5 +5,10 @@
 //! text decoder, SigLIP-style vision encoder, 2x2 spatial-merge Projector,
 //! variable-resolution preprocessor) lives in `docs/paddleocr-vl-1.5-plan.md`.
 
+pub mod config;
 pub mod mrope;
 pub mod position_ids;
+
+pub use config::{
+    load_tokenizer, PaddleOcrVisionConfig, PaddleOcrVlConfig, RopeScaling, SpecialTokens,
+};
