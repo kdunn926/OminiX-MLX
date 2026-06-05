@@ -6,3 +6,4 @@
 //! variable-resolution preprocessor) lives in `docs/paddleocr-vl-1.5-plan.md`.
 
 pub mod mrope;
+pub mod position_ids;
