@@ -163,10 +163,10 @@ impl VisionEmbeddings {
     ///
     /// * `pixel_values` — `(B, C, H, W)` channels-first per the HF
     ///   convention. Internally transposed to MLX's channels-last layout
-    ///   `(B, H, W, C)` before the Conv2d call.
-    ///   `H` and `W` must currently equal the canonical `image_size`
-    ///   (variable-resolution input requires bilinear pos-embed
-    ///   interpolation, which is a follow-up).
+    ///   `(B, H, W, C)` before the Conv2d call. Variable-resolution input
+    ///   is supported: when the input patch grid differs from the
+    ///   canonical pre-trained grid (`sqrt(num_positions) × sqrt(num_positions)`),
+    ///   the position embedding is bilinearly interpolated to match.
     pub fn forward(&mut self, pixel_values: &Array) -> Result<Array> {
         // (B, C, H, W) → (B, H, W, C) for MLX Conv2d.
         let bhwc = pixel_values
@@ -180,21 +180,56 @@ impl VisionEmbeddings {
         let w_prime = s[2];
         let oc = s[3];
         let n_patches = h_prime * w_prime;
-        if n_patches != self.num_positions {
-            return Err(Error::Model(format!(
-                "VisionEmbeddings: input patch grid ({h_prime}, {w_prime}) = {n_patches} patches \
-                 does not match position_embedding's canonical num_positions = {} — \
-                 variable-resolution input requires bilinear pos-embed interpolation, \
-                 which isn't wired yet (TODO).",
-                self.num_positions
-            )));
-        }
         let flat = conv_out
             .reshape(&[b, n_patches, oc])
             .map_err(Error::from)?;
-        let pos = self.position_embedding.forward(&self.position_ids).map_err(Error::from)?;
-        // pos shape: (num_positions, hidden); broadcast against flat (B, N, hidden).
+        let pos = self.position_embedding_for_grid(h_prime, w_prime)?;
         flat.add(&pos).map_err(Error::from)
+    }
+
+    /// Return position embeddings of shape `(num_patches=h*w, hidden)`,
+    /// resizing the pre-trained `(sqrt(num_positions) × sqrt(num_positions))`
+    /// grid via bilinear interpolation when the input grid differs.
+    fn position_embedding_for_grid(&mut self, h: i32, w: i32) -> Result<Array> {
+        // Fast path: input grid matches pre-trained grid — no interp.
+        let pre_grid = (self.num_positions as f64).sqrt().round() as i32;
+        if pre_grid * pre_grid != self.num_positions {
+            return Err(Error::Model(format!(
+                "VisionEmbeddings: position_embedding's num_positions = {} is not a perfect \
+                 square — bilinear interpolation can't proceed (TODO: rect grids)",
+                self.num_positions
+            )));
+        }
+        let raw = self
+            .position_embedding
+            .forward(&self.position_ids)
+            .map_err(Error::from)?;
+        if h == pre_grid && w == pre_grid {
+            return Ok(raw);
+        }
+        // Reshape (pre_grid², hidden) → (1, pre_grid, pre_grid, hidden) for
+        // MLX Upsample (channels-last). Bilinearly resize the spatial dims
+        // to (h, w), reshape back to (h*w, hidden), then broadcast against
+        // the conv output.
+        let grid4 = raw
+            .reshape(&[1, pre_grid, pre_grid, self.embed_dim])
+            .map_err(Error::from)?;
+        let scale_h = h as f32 / pre_grid as f32;
+        let scale_w = w as f32 / pre_grid as f32;
+        let upsample = mlx_rs::nn::Upsample::new(
+            mlx_rs::utils::SingleOrVec::Vec(vec![scale_h, scale_w]),
+            mlx_rs::nn::UpsampleMode::Linear { align_corners: false },
+        );
+        let mut upsample = upsample;
+        let resized = upsample.forward(&grid4).map_err(Error::from)?;
+        let rs = resized.shape();
+        if rs[1] != h || rs[2] != w {
+            return Err(Error::Model(format!(
+                "VisionEmbeddings: pos-embed Upsample produced ({}, {}) but expected ({h}, {w})",
+                rs[1], rs[2]
+            )));
+        }
+        resized.reshape(&[h * w, self.embed_dim]).map_err(Error::from)
     }
 }
 
@@ -367,17 +402,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_variable_resolution_until_interp_wired() {
+    fn variable_resolution_bilinearly_interpolates() {
+        // Tiny ViT: canonical pre_grid = 8/4 = 2, num_positions = 4.
+        // Feed an off-canonical input (12×12 → 3×3 grid = 9 patches);
+        // bilinear interp should resize the position table from 2×2 to
+        // 3×3 and the forward must succeed at shape (1, 9, hidden).
         let cfg = tiny_vision_config();
         let mut tower = build_vision_with_random_weights(&cfg).unwrap();
-        // Off-canonical input: (B=1, C=3, H=12, W=12) → 3×3 = 9 patches,
-        // but position table is sized for 4. Should be rejected.
         let pixels = uniform::<_, f32>(-1.0, 1.0, &[1, 3, 12, 12], None).unwrap();
-        let err = tower.forward(&pixels);
-        assert!(
-            err.is_err(),
-            "off-canonical resolution must be rejected until bilinear pos-embed interp is wired"
-        );
+        let out = tower.forward(&pixels).unwrap();
+        assert_eq!(out.shape(), &[1, 9, cfg.hidden_size]);
     }
 
     #[test]

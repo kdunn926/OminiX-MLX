@@ -6,6 +6,7 @@
 //! variable-resolution preprocessor) lives in `docs/paddleocr-vl-1.5-plan.md`.
 
 pub mod config;
+pub mod loader;
 pub mod mrope;
 pub mod position_ids;
 pub mod preprocess;
@@ -26,3 +27,4 @@ pub use vision_model::{
 };
 pub use projector::{build_projector_with_random_weights, MergeKernel, Projector};
 pub use preprocess::{preprocess_image_bytes, smart_resize, PreprocessOutput, PreprocessParams};
+pub use loader::{load_from_path, splice_image_tokens, PaddleOcrVlModel};
