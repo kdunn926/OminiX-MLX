@@ -8,6 +8,7 @@
 pub mod config;
 pub mod mrope;
 pub mod position_ids;
+pub mod projector;
 pub mod text_model;
 pub mod vision_model;
 
@@ -22,3 +23,4 @@ pub use vision_model::{
     build_vision_with_random_weights, VisionAttention, VisionEmbeddings, VisionEncoderLayer,
     VisionLayerNorm, VisionMlp, VisionTransformer,
 };
+pub use projector::{build_projector_with_random_weights, MergeKernel, Projector};
