@@ -7,6 +7,8 @@
 
 pub mod config;
 pub mod error;
+pub mod mrope;
+pub mod position_ids;
 pub mod preprocessor;
 pub mod text;
 pub mod vision;
