@@ -11,6 +11,7 @@ pub mod mrope;
 pub mod position_ids;
 pub mod preprocessor;
 pub mod text;
+pub mod text_decoder;
 pub mod vision;
 
 use std::path::Path;
@@ -39,31 +40,15 @@ pub fn load_tokenizer(model_dir: impl AsRef<Path>) -> Result<tokenizers::Tokeniz
     tokenizers::Tokenizer::from_file(&path).map_err(|e| Error::Tokenizer(e.to_string()))
 }
 
-/// Load a GLM-OCR model directory. Scaffold version: parses configs,
-/// loads tokenizer + safetensors weight map, constructs the encoder /
-/// decoder shells. Encoder/decoder forward is still stubbed — only
-/// shape / load-path errors surface here.
-pub fn load_model(model_dir: impl AsRef<Path>) -> Result<GlmOcrModel, Error> {
-    let model_dir = model_dir.as_ref();
-    let config = load_config(model_dir)?;
-    if config.model_type != "glm_ocr" {
-        return Err(Error::Config(format!(
-            "expected model_type=glm_ocr, got {}",
-            config.model_type
-        )));
-    }
-    let preprocessor = load_preprocessor_config(model_dir)?;
-    let tokenizer = load_tokenizer(model_dir)?;
-    let weights = load_weights(model_dir)?;
-    let vision = VisionEncoder::load_from_weights(config.vision_config.clone(), &weights)?;
-    let text = TextDecoder::load_from_weights(config.text_config.clone(), &weights)?;
-    Ok(GlmOcrModel {
-        config,
-        preprocessor,
-        tokenizer,
-        vision,
-        text,
-    })
+/// Old scaffold entry point. The real safetensors loader lands in
+/// phase 4; until then this returns an error so external callers fail
+/// loudly rather than spinning up an empty `GlmOcrModel`.
+pub fn load_model(_model_dir: impl AsRef<Path>) -> Result<GlmOcrModel, Error> {
+    Err(Error::Model(
+        "glm-ocr-mlx::load_model is being replaced by load_from_path in phase 4; \
+         the scaffold path no longer wires weights"
+            .to_string(),
+    ))
 }
 
 /// Load every safetensors file in the model dir into a single
