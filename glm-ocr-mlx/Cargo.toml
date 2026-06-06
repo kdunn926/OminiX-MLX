@@ -21,3 +21,7 @@ anyhow = "1"
 [[example]]
 name = "generate_glm_ocr"
 path = "examples/generate_glm_ocr.rs"
+
+[[example]]
+name = "load_smoke"
+path = "examples/load_smoke.rs"

@@ -187,29 +187,30 @@ pub fn preprocess_image_bytes(
     let n_patches = grid_t * grid_h * grid_w;
     let mut patches = vec![0.0_f32; n_patches * patch_len];
 
+    // Row layout: (t, P, P, c) — MLX channels-last Conv3d weight has axis
+    // order (out_ch, kT, kH, kW, in_ch), so the input row must flatten in
+    // (t, h, w, c) to match. For each (gh, gw) we emit `t_raw` slots of
+    // identical (P, P, c) blocks (still-image temporal replication).
     for gh in 0..grid_h {
         for gw in 0..grid_w {
             let row = gh * grid_w + gw;
             let dst_start = row * patch_len;
-            // Layout: for each channel c, for each t slot, write (P×P) pixels.
-            // The same (P×P) block is written T_raw times along the t axis.
-            for c in 0..3 {
-                // Extract the (P×P) block from chw once per channel.
-                let mut block = [0.0_f32; 4 * 4]; // unused; replaced by p*p Vec below
-                let _ = block;
-                let mut spatial = vec![0.0_f32; p * p];
-                for py in 0..p {
-                    for px in 0..p {
-                        let src_y = gh * p + py;
-                        let src_x = gw * p + px;
+            // (P, P, 3) block: outer y, then x, then channel.
+            let mut block = vec![0.0_f32; p * p * 3];
+            for py in 0..p {
+                for px in 0..p {
+                    let src_y = gh * p + py;
+                    let src_x = gw * p + px;
+                    for c in 0..3 {
                         let src = c * chan_stride + src_y * w + src_x;
-                        spatial[py * p + px] = chw[src];
+                        block[(py * p + px) * 3 + c] = chw[src];
                     }
                 }
-                for t in 0..t_raw {
-                    let dst = dst_start + (c * t_raw + t) * (p * p);
-                    patches[dst..dst + p * p].copy_from_slice(&spatial);
-                }
+            }
+            let block_len = p * p * 3;
+            for t in 0..t_raw {
+                let dst = dst_start + t * block_len;
+                patches[dst..dst + block_len].copy_from_slice(&block);
             }
         }
     }
@@ -329,9 +330,8 @@ mod tests {
 
     #[test]
     fn duplicated_temporal_slots_inside_row_are_identical() {
-        // For each channel, the `t` temporal slots inside a row must
-        // hold the same (P×P) spatial block — the still-image
-        // replication invariant.
+        // Each row is laid out as t consecutive (P, P, 3) blocks; for a
+        // still image the t blocks must be byte-identical.
         let w = 56;
         let h = 56;
         let mut buf = image::RgbImage::new(w, h);
@@ -349,8 +349,8 @@ mod tests {
         let (_, gh, gw) = out.image_grid_thw;
         let t_raw = cfg.temporal_patch_size as usize;
         let p = cfg.patch_size as usize;
-        let pp = p * p;
-        let patch_len = 3 * t_raw * pp;
+        let block_len = p * p * 3;
+        let patch_len = t_raw * block_len;
         let f32_patches = out
             .patches
             .as_dtype(mlx_rs::Dtype::Float32)
@@ -359,18 +359,17 @@ mod tests {
         let slice = f32_patches.try_as_slice::<f32>().unwrap();
         for row in 0..(gh * gw) as usize {
             let row_start = row * patch_len;
-            for c in 0..3 {
-                let slot0 = row_start + (c * t_raw) * pp;
-                for t in 1..t_raw {
-                    let slott = row_start + (c * t_raw + t) * pp;
-                    for k in 0..pp {
-                        assert!(
-                            (slice[slot0 + k] - slice[slott + k]).abs() < 1e-6,
-                            "row={row} c={c} t={t} k={k} differs",
-                        );
-                    }
+            let slot0 = row_start;
+            for t in 1..t_raw {
+                let slott = row_start + t * block_len;
+                for k in 0..block_len {
+                    assert!(
+                        (slice[slot0 + k] - slice[slott + k]).abs() < 1e-6,
+                        "row={row} t={t} k={k} differs",
+                    );
                 }
             }
         }
     }
+
 }
