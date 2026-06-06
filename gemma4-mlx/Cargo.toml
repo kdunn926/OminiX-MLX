@@ -58,7 +58,16 @@ path = "examples/mtplx_chat.rs"
 name = "draft_verify_spike"
 path = "examples/draft_verify_spike.rs"
 
+[[example]]
+name = "model_parity"
+path = "examples/model_parity.rs"
+
+[[example]]
+name = "decode_consistency"
+path = "examples/decode_consistency.rs"
+
 [dev-dependencies]
 anyhow = "1"
 coreml-bridge = { path = "../ane-vit/coreml-bridge" }
+npyz = "0.8"
 
