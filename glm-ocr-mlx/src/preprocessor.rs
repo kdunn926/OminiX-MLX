@@ -8,16 +8,20 @@
 //!      pixel count lands in `[shortest_edge, longest_edge]`. Bicubic.
 //!   3. Rescale `pixel /= 255` → `[0, 1]`.
 //!   4. Normalize per-channel with ImageNet `mean` / `std`.
-//!   5. Patchify: reshape `[3, H, W]` → `[T_patches, P*P*3]` where
-//!      `T_patches = (H/P) * (W/P) * temporal_patch_size`. For still
-//!      images the same patch is duplicated `temporal_patch_size` times
-//!      along the leading axis — this is the trick GLM-OCR uses to
-//!      reuse a video-style ViT for stills.
+//!   5. Patchify: pack each (gh, gw) patch as a flattened
+//!      `(C=3, t=temporal_patch_size, P, P)` cube → length `3*t*P*P`.
+//!      The output matrix is `(grid_t * gh * gw, 3*t*P*P)` where
+//!      `grid_t = 1` for stills. The temporal dim is **embedded inside
+//!      each row's patch features** (matching the Qwen2-VL convention
+//!      Glm46V's Conv3d-style patch_embed consumes); the same spatial
+//!      patch is replicated across the `t` slots within a row so the
+//!      Conv3d kernel sees identical frames.
 //!
-//! Output: a single `Array` of shape `(T_patches, P*P*3)` (f32, ready
-//! for the ViT) plus an `image_grid_thw = (T_raw, H_grid, W_grid)`
-//! descriptor where `T_raw = temporal_patch_size`. The grid drives the
-//! position-id builder and the post-encoder spatial merger.
+//! Output: an `Array` of shape `(grid_t * gh * gw, 3 * t * P * P)` ready
+//! for the ViT's patch-embed Linear, plus an
+//! `image_grid_thw = (T_raw, H_grid, W_grid)` descriptor where
+//! `T_raw = temporal_patch_size`. The grid drives the position-id
+//! builder and the post-encoder spatial merger.
 
 use image::imageops::FilterType;
 use mlx_rs::Array;
@@ -108,7 +112,10 @@ fn read_triplet(v: &serde_json::Value, key: &str, default: [f32; 3]) -> [f32; 3]
 
 /// Loaded image patches ready for the vision encoder.
 pub struct PreprocessedImage {
-    /// Shape `(T_patches, P*P*3)`, dtype f32. `T_patches = T_raw * grid_h * grid_w`.
+    /// Shape `(grid_t * grid_h * grid_w, 3 * t * P * P)`, dtype f32, where
+    /// `grid_t = 1` for stills. Each row is one patch flattened in
+    /// `(C, t, P, P)` order so the patch-embed Linear can ingest it as if
+    /// it were the input to a Conv3d kernel.
     pub patches: Array,
     /// `(T_raw, grid_h, grid_w)` — `T_raw = temporal_patch_size` for stills.
     /// This is the descriptor the position-id builder + spatial merger consume.
@@ -164,34 +171,45 @@ pub fn preprocess_image_bytes(
         }
     }
 
-    // Patchify: (3, H, W) → (T_raw * grid_h * grid_w, 3 * P * P), with the
-    // same patch duplicated `T_raw` times along the leading axis.
+    // Patchify: (3, H, W) → (grid_t * grid_h * grid_w, 3 * t * P * P)
+    // with `grid_t = 1` for stills. Each row holds one patch flattened in
+    // (C, t, P, P) order: outer axis = channel, then t-slot, then row,
+    // then col. For still images the t-axis is filled by replicating the
+    // spatial patch across `t` slots so the Conv3d kernel (which sees
+    // `t = temporal_patch_size` frames simultaneously) gets identical
+    // frames — matches the HF Glm46VImageProcessor `_preprocess`.
     let p = cfg.patch_size as usize;
     let grid_h = (h_bar / cfg.patch_size) as usize;
     let grid_w = (w_bar / cfg.patch_size) as usize;
     let t_raw = cfg.temporal_patch_size as usize;
-    let n_patches = t_raw * grid_h * grid_w;
-    let patch_len = 3 * p * p;
+    let grid_t: usize = 1;
+    let patch_len = 3 * t_raw * p * p;
+    let n_patches = grid_t * grid_h * grid_w;
     let mut patches = vec![0.0_f32; n_patches * patch_len];
 
     for gh in 0..grid_h {
         for gw in 0..grid_w {
-            let mut buf = vec![0.0_f32; patch_len];
+            let row = gh * grid_w + gw;
+            let dst_start = row * patch_len;
+            // Layout: for each channel c, for each t slot, write (P×P) pixels.
+            // The same (P×P) block is written T_raw times along the t axis.
             for c in 0..3 {
+                // Extract the (P×P) block from chw once per channel.
+                let mut block = [0.0_f32; 4 * 4]; // unused; replaced by p*p Vec below
+                let _ = block;
+                let mut spatial = vec![0.0_f32; p * p];
                 for py in 0..p {
                     for px in 0..p {
                         let src_y = gh * p + py;
                         let src_x = gw * p + px;
                         let src = c * chan_stride + src_y * w + src_x;
-                        let dst = c * (p * p) + py * p + px;
-                        buf[dst] = chw[src];
+                        spatial[py * p + px] = chw[src];
                     }
                 }
-            }
-            for t in 0..t_raw {
-                let row = t * grid_h * grid_w + gh * grid_w + gw;
-                let dst_start = row * patch_len;
-                patches[dst_start..dst_start + patch_len].copy_from_slice(&buf);
+                for t in 0..t_raw {
+                    let dst = dst_start + (c * t_raw + t) * (p * p);
+                    patches[dst..dst + p * p].copy_from_slice(&spatial);
+                }
             }
         }
     }
@@ -286,6 +304,7 @@ mod tests {
 
     #[test]
     fn preprocess_produces_expected_patch_shape() {
+        // (grid_t * gh * gw, 3 * t * P * P) with grid_t = 1 for stills.
         let w = 300;
         let h = 200;
         let mut buf = image::RgbImage::new(w, h);
@@ -304,15 +323,15 @@ mod tests {
         assert_eq!(s.len(), 2);
         let (t_raw, grid_h, grid_w) = out.image_grid_thw;
         assert_eq!(t_raw, cfg.temporal_patch_size);
-        assert_eq!(s[0], t_raw * grid_h * grid_w);
-        assert_eq!(s[1], 3 * cfg.patch_size * cfg.patch_size);
-        assert_eq!(s[0] % cfg.temporal_patch_size, 0);
+        assert_eq!(s[0], grid_h * grid_w); // grid_t = 1 for stills
+        assert_eq!(s[1], 3 * t_raw * cfg.patch_size * cfg.patch_size);
     }
 
     #[test]
-    fn duplicated_temporal_patches_are_identical() {
-        // For still images, the temporal duplication invariant: every
-        // (gh, gw) patch must appear byte-identical in all T_raw slots.
+    fn duplicated_temporal_slots_inside_row_are_identical() {
+        // For each channel, the `t` temporal slots inside a row must
+        // hold the same (P×P) spatial block — the still-image
+        // replication invariant.
         let w = 56;
         let h = 56;
         let mut buf = image::RgbImage::new(w, h);
@@ -327,24 +346,29 @@ mod tests {
             .unwrap();
         let cfg = PreprocessorConfig::default();
         let out = preprocess_image_bytes(&png, &cfg).unwrap();
-        let (t_raw, gh, gw) = out.image_grid_thw;
-        let block = (gh * gw) as usize;
-        let patch_dim = (3 * cfg.patch_size * cfg.patch_size) as usize;
+        let (_, gh, gw) = out.image_grid_thw;
+        let t_raw = cfg.temporal_patch_size as usize;
+        let p = cfg.patch_size as usize;
+        let pp = p * p;
+        let patch_len = 3 * t_raw * pp;
         let f32_patches = out
             .patches
             .as_dtype(mlx_rs::Dtype::Float32)
             .unwrap();
         mlx_rs::transforms::eval([&f32_patches]).unwrap();
         let slice = f32_patches.try_as_slice::<f32>().unwrap();
-        for t in 1..t_raw as usize {
-            for i in 0..block {
-                let base = i * patch_dim;
-                let dup = (t * block + i) * patch_dim;
-                for k in 0..patch_dim {
-                    assert!(
-                        (slice[base + k] - slice[dup + k]).abs() < 1e-6,
-                        "t={t} i={i} k={k} differs",
-                    );
+        for row in 0..(gh * gw) as usize {
+            let row_start = row * patch_len;
+            for c in 0..3 {
+                let slot0 = row_start + (c * t_raw) * pp;
+                for t in 1..t_raw {
+                    let slott = row_start + (c * t_raw + t) * pp;
+                    for k in 0..pp {
+                        assert!(
+                            (slice[slot0 + k] - slice[slott + k]).abs() < 1e-6,
+                            "row={row} c={c} t={t} k={k} differs",
+                        );
+                    }
                 }
             }
         }
