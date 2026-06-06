@@ -82,6 +82,13 @@ pub struct PaddleOcrVlModel {
     pub vit: VisionTransformer,
     pub projector: Projector,
     pub llm: Ernie45ForCausalLM,
+    /// `SigLIPRotaryEmbedding` inv_freq table for vision RoPE — cached at
+    /// load so we don't recompute the tiny `(head_dim/4,)` vector every
+    /// image. Drives [`crate::vision_model::vision_rope_cos_sin`].
+    pub vision_rope_inv_freq: Array,
+    /// Vision head_dim = `vision_hidden / num_vision_heads`. Cached so the
+    /// `encode_image_bytes` call site doesn't have to walk the config.
+    pub vision_head_dim: i32,
 }
 
 impl PaddleOcrVlModel {
@@ -96,7 +103,18 @@ impl PaddleOcrVlModel {
     /// wire-up can hand off identically.
     pub fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<(Array, ImageGrid)> {
         let prep = preprocess_image_bytes(bytes, &self.preprocess_params)?;
-        let feats = self.vit.forward(&prep.pixel_values)?;
+        let (_t, gh, gw) = prep.image_grid_thw;
+        // Production vision path: feed the patch-grid `(grid_h, grid_w)`
+        // into the encoder so each layer applies 2-D vision RoPE on Q/K.
+        // The HF reference *always* calls `self.visual(..., use_rope=True)`
+        // for inference; skipping the rotary collapses the encoder to OOD.
+        let feats = self.vit.forward_with_grid(
+            &prep.pixel_values,
+            gh,
+            gw,
+            &self.vision_rope_inv_freq,
+            self.vision_head_dim,
+        )?;
         let soft = self.projector.forward_batched(&feats, prep.image_grid_thw)?;
         Ok((soft, prep.image_grid_thw))
     }
@@ -160,6 +178,21 @@ pub fn load_from_path(model_dir: impl AsRef<Path>) -> Result<PaddleOcrVlModel> {
         );
     }
 
+    // Vision RoPE inv_freq: cached once at load. PaddleOCR-VL's
+    // SigLIPRotaryEmbedding uses `theta = 10000.0` and `dim = head_dim/2`.
+    let vision_head_dim = {
+        let vh = config.vision_config.hidden_size;
+        let nh = config.vision_config.num_attention_heads;
+        if nh == 0 || vh % nh != 0 {
+            return Err(Error::InvalidConfig(format!(
+                "vision: hidden_size {vh} not divisible by num_attention_heads {nh}"
+            )));
+        }
+        vh / nh
+    };
+    let vision_rope_inv_freq =
+        crate::vision_model::vision_inv_freq(vision_head_dim, 10_000.0);
+
     Ok(PaddleOcrVlModel {
         config,
         preprocess_params,
@@ -168,6 +201,8 @@ pub fn load_from_path(model_dir: impl AsRef<Path>) -> Result<PaddleOcrVlModel> {
         vit,
         projector,
         llm,
+        vision_rope_inv_freq,
+        vision_head_dim,
     })
 }
 

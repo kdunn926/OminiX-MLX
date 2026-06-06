@@ -7,13 +7,29 @@
 //! Scope reductions relative to the HF reference:
 //!   * Single image, single sequence (`B = 1`) — no batched packing /
 //!     `cu_seqlens` / `sample_indices` machinery.
-//!   * `use_rope = False` (the simple path; the OCR processor doesn't
-//!     emit `height_position_ids` / `width_position_ids`).
 //!   * No pooler head: the `Projector` (phase 4) consumes the pre-pool
 //!     `(num_patches, hidden)` features directly. Pooler weights in the
 //!     checkpoint can be ignored at load time.
 //!   * No window attention, no flash-attn-specific path — plain SDPA
 //!     with no mask.
+//!
+//! What the reference DOES do (and so must we) at inference time: the
+//! parent `PaddleOCRVLForConditionalGeneration.forward` always calls
+//! `self.visual(..., use_rope=True, ...)`. The encoder then builds 2-D
+//! **vision RoPE** from `(height_position_ids, width_position_ids)` per
+//! image (see `modeling_paddleocr_vl.py:1440..1474`) and applies it to
+//! Q/K inside `PaddleOCRAttention`. Skipping this rotary step puts the
+//! Q/K projections off-distribution and the downstream text decoder
+//! degenerates into n-gram loops (verified empirically on the
+//! `228 - ListenUp - Month 35c.pdf` invoice page).
+//!
+//! Implementation notes for vision RoPE:
+//!   * `SigLIPRotaryEmbedding(dim = head_dim / 2)` with `theta = 10000`.
+//!     `inv_freq[i] = 1 / 10000^(2i / (head_dim/2))` for `i ∈ [0, head_dim/4)`.
+//!   * Per token at grid (h, w): cos/sin = concat(freq_h, freq_w, freq_h, freq_w)
+//!     (the `repeat(1, 2)` in the reference) — length `head_dim`.
+//!   * Applied via `q*cos.unsqueeze(-2) + rotate_half(q)*sin.unsqueeze(-2)`
+//!     (and the same for k), so cos/sin broadcast over the head axis.
 //!
 //! What's preserved:
 //!   * `Conv2d` patch embedding at `stride = patch_size`.
@@ -35,6 +51,148 @@ use mlx_rs_core::error::{Error, Result};
 use mlx_rs_core::utils::{scaled_dot_product_attention, SdpaMask};
 
 use crate::config::PaddleOcrVisionConfig;
+
+/// `SigLIPRotaryEmbedding` inv-freq table.
+///
+/// Mirrors `SigLIPRotaryEmbedding(dim = head_dim / 2, theta = 10000.0)` in
+/// `modeling_paddleocr_vl.py:1808`. Returns an `Array` of shape
+/// `(head_dim / 4,)` — half the rotation dim — with
+/// `inv_freq[i] = 1 / theta^(2i / (head_dim/2))`.
+pub fn vision_inv_freq(head_dim: i32, theta: f32) -> Array {
+    let dim = head_dim / 2; // half of head_dim is rotated; SigLIPRotaryEmbedding(dim=head_dim//2)
+    let n = (dim / 2) as usize;
+    let mut data = Vec::with_capacity(n);
+    for i in 0..n {
+        let exp = (2 * i) as f32 / dim as f32;
+        data.push(1.0_f32 / theta.powf(exp));
+    }
+    Array::from_slice(&data, &[n as i32])
+}
+
+/// Build the per-token vision-RoPE `(cos, sin)` for a single image with
+/// patch grid `(grid_h, grid_w)`. Returns `(cos, sin)` each of shape
+/// `(L, head_dim)` where `L = grid_h * grid_w` (temporal `t=1`).
+///
+/// Mirrors `modeling_paddleocr_vl.py:1440..1474` for the OCR (`t=1`) case:
+///
+/// ```text
+/// h_pids = floor(arange(h*w) / w)  # row index per token, length L
+/// w_pids = arange(h*w) % w          # col index per token, length L
+/// max_grid = max(h_pids, w_pids) + 1
+/// freqs    = outer(arange(max_grid), inv_freq)   # (max_grid, head_dim/4)
+/// rope_h   = freqs[h_pids]          # (L, head_dim/4)
+/// rope_w   = freqs[w_pids]          # (L, head_dim/4)
+/// emb      = cat([rope_h, rope_w], dim=-1)            # (L, head_dim/2)
+/// emb      = emb.repeat(1, 2)                         # (L, head_dim)
+/// cos, sin = emb.cos(), emb.sin()
+/// ```
+pub fn vision_rope_cos_sin(
+    grid_h: i32,
+    grid_w: i32,
+    inv_freq: &Array,
+    head_dim: i32,
+) -> Result<(Array, Array)> {
+    if grid_h <= 0 || grid_w <= 0 {
+        return Err(Error::InvalidConfig(format!(
+            "vision_rope_cos_sin: non-positive grid ({grid_h}, {grid_w})"
+        )));
+    }
+    let l = (grid_h * grid_w) as usize;
+    let inv_n = inv_freq.shape()[0]; // = head_dim/4
+    if inv_n * 4 != head_dim {
+        return Err(Error::InvalidConfig(format!(
+            "vision_rope_cos_sin: inv_freq has {inv_n} entries but expected head_dim/4 = {}",
+            head_dim / 4
+        )));
+    }
+
+    // Compute freqs[s, i] = s * inv_freq[i] for s ∈ [0, max_grid). Then
+    // gather rope_h[t] = freqs[h_pids[t]] and rope_w[t] = freqs[w_pids[t]].
+    // We do it host-side: the tables are tiny (≤ a few KB) and the loop runs
+    // exactly once per image.
+    use mlx_rs::Dtype;
+    let inv_slice = inv_freq
+        .as_dtype(Dtype::Float32)
+        .map_err(Error::from)?
+        .try_as_slice::<f32>()
+        .map_err(|e| Error::Model(format!("vision_inv_freq → slice: {e}")))?
+        .to_vec();
+    let max_grid = grid_h.max(grid_w) as usize;
+    let mut freqs = vec![0_f32; max_grid * inv_n as usize];
+    for s in 0..max_grid {
+        for i in 0..inv_n as usize {
+            freqs[s * inv_n as usize + i] = s as f32 * inv_slice[i];
+        }
+    }
+
+    // For each of the L tokens, write [rope_h | rope_w | rope_h | rope_w]
+    // into the (head_dim)-row of the cos/sin buffers, then apply cos/sin.
+    let inv_n_us = inv_n as usize;
+    let hd = head_dim as usize;
+    let mut emb = vec![0_f32; l * hd];
+    for t in 0..l {
+        let h = t / grid_w as usize;
+        let w = t % grid_w as usize;
+        let row_h_off = h * inv_n_us;
+        let row_w_off = w * inv_n_us;
+        // First half: [rope_h, rope_w], second half: same (repeat(1, 2)).
+        for half in 0..2 {
+            let base = t * hd + half * (hd / 2);
+            emb[base..base + inv_n_us]
+                .copy_from_slice(&freqs[row_h_off..row_h_off + inv_n_us]);
+            emb[base + inv_n_us..base + 2 * inv_n_us]
+                .copy_from_slice(&freqs[row_w_off..row_w_off + inv_n_us]);
+        }
+    }
+    let emb_arr = Array::from_slice(&emb, &[l as i32, head_dim]);
+    let cos = emb_arr.cos().map_err(Error::from)?;
+    let sin = emb_arr.sin().map_err(Error::from)?;
+    Ok((cos, sin))
+}
+
+/// `rotate_half([x0, x1]) = [-x1, x0]` along the last (head_dim) axis.
+/// For a 4-D `(B, L, H, D)` input, splits the trailing `D` axis.
+fn rotate_half_4d(x: &Array) -> Result<Array> {
+    let dim = *x.shape().last().unwrap();
+    let half = dim / 2;
+    let x1 = x.index((.., .., .., ..half));
+    let x2 = x.index((.., .., .., half..));
+    ops::concatenate_axis(&[&x2.negative().map_err(Error::from)?, &x1], -1)
+        .map_err(Error::from)
+}
+
+/// Apply 2-D vision RoPE to `(q, k)` of shape `(B, L, H, head_dim)`.
+/// `cos`, `sin` of shape `(L, head_dim)` — broadcast over (B, H) by
+/// expanding both ends to `(1, L, 1, head_dim)`.
+fn apply_vision_rotary(
+    q: &Array,
+    k: &Array,
+    cos: &Array,
+    sin: &Array,
+) -> Result<(Array, Array)> {
+    // cos/sin → (1, L, 1, head_dim) so broadcasting handles (B, L, H, D).
+    let cos_b = cos
+        .expand_dims(0)
+        .map_err(Error::from)?
+        .expand_dims(2)
+        .map_err(Error::from)?;
+    let sin_b = sin
+        .expand_dims(0)
+        .map_err(Error::from)?
+        .expand_dims(2)
+        .map_err(Error::from)?;
+    let q_rot = q
+        .multiply(&cos_b)
+        .map_err(Error::from)?
+        .add(&rotate_half_4d(q)?.multiply(&sin_b).map_err(Error::from)?)
+        .map_err(Error::from)?;
+    let k_rot = k
+        .multiply(&cos_b)
+        .map_err(Error::from)?
+        .add(&rotate_half_4d(k)?.multiply(&sin_b).map_err(Error::from)?)
+        .map_err(Error::from)?;
+    Ok((q_rot, k_rot))
+}
 
 /// Convenience wrapper around `mlx_rs::fast::layer_norm` so we can store
 /// weight/bias as plain `Array`s and reuse the fast Metal kernel.
@@ -64,7 +222,16 @@ pub struct VisionAttention {
 }
 
 impl VisionAttention {
-    pub fn forward(&mut self, x: &Array) -> Result<Array> {
+    /// Forward with optional vision RoPE. When `rope = Some((cos, sin))`,
+    /// the rotation is applied to Q and K **before** the head transpose,
+    /// matching the reference order:
+    /// `q.view(B, L, H, D) → apply_rotary → transpose(1, 2)` so SDPA sees
+    /// the standard `(B, H, L, D)` layout.
+    pub fn forward(
+        &mut self,
+        x: &Array,
+        rope: Option<(&Array, &Array)>,
+    ) -> Result<Array> {
         let shape = x.shape();
         let b = shape[0];
         let n = shape[1];
@@ -72,16 +239,29 @@ impl VisionAttention {
         let q = self.q_proj.forward(x).map_err(Error::from)?;
         let k = self.k_proj.forward(x).map_err(Error::from)?;
         let v = self.v_proj.forward(x).map_err(Error::from)?;
-        // (B, N, hidden) → (B, num_heads, N, head_dim)
-        let reshape = |a: &Array| -> Result<Array> {
+        // (B, N, hidden) → (B, N, num_heads, head_dim).
+        let to_bnhd = |a: &Array| -> Result<Array> {
             a.reshape(&[b, n, self.num_heads, self.head_dim])
-                .map_err(Error::from)?
-                .transpose_axes(&[0, 2, 1, 3])
                 .map_err(Error::from)
         };
-        let q = reshape(&q)?;
-        let k = reshape(&k)?;
-        let v = reshape(&v)?;
+        let q_bnhd = to_bnhd(&q)?;
+        let k_bnhd = to_bnhd(&k)?;
+        let v_bnhd = to_bnhd(&v)?;
+
+        // Optional 2-D vision RoPE on Q/K in (B, N, H, D) layout.
+        let (q_bnhd, k_bnhd) = if let Some((cos, sin)) = rope {
+            apply_vision_rotary(&q_bnhd, &k_bnhd, cos, sin)?
+        } else {
+            (q_bnhd, k_bnhd)
+        };
+
+        // (B, N, H, D) → (B, H, N, D) for SDPA.
+        let to_bhnd = |a: &Array| -> Result<Array> {
+            a.transpose_axes(&[0, 2, 1, 3]).map_err(Error::from)
+        };
+        let q = to_bhnd(&q_bnhd)?;
+        let k = to_bhnd(&k_bnhd)?;
+        let v = to_bhnd(&v_bnhd)?;
         // SDPA without a cache (this is a one-shot vision pass; nothing to
         // memoise between calls). `_cache: None::<KVCache>` lets the type
         // parameter resolve to a concrete `KeyValueCache` impl that the
@@ -130,9 +310,13 @@ pub struct VisionEncoderLayer {
 }
 
 impl VisionEncoderLayer {
-    pub fn forward(&mut self, x: &Array) -> Result<Array> {
+    pub fn forward(
+        &mut self,
+        x: &Array,
+        rope: Option<(&Array, &Array)>,
+    ) -> Result<Array> {
         let normed = self.layer_norm1.forward(x)?;
-        let attn = self.self_attn.forward(&normed)?;
+        let attn = self.self_attn.forward(&normed, rope)?;
         let h = x.add(&attn).map_err(Error::from)?;
         let normed = self.layer_norm2.forward(&h)?;
         let mlp = self.mlp.forward(&normed)?;
@@ -242,10 +426,33 @@ pub struct VisionTransformer {
 }
 
 impl VisionTransformer {
+    /// Backwards-compatible forward: no RoPE (kept for callers that haven't
+    /// been updated; the production path uses [`Self::forward_with_grid`]).
     pub fn forward(&mut self, pixel_values: &Array) -> Result<Array> {
         let mut h = self.embeddings.forward(pixel_values)?;
         for layer in self.layers.iter_mut() {
-            h = layer.forward(&h)?;
+            h = layer.forward(&h, None)?;
+        }
+        self.post_layernorm.forward(&h)
+    }
+
+    /// Forward with the grid `(grid_h, grid_w)` of the input image's patch
+    /// layout. Computes 2-D vision RoPE once from the grid and feeds the
+    /// same `(cos, sin)` into every encoder layer. This is the path the
+    /// production code calls — without it the encoder produces
+    /// out-of-distribution features (see module doc).
+    pub fn forward_with_grid(
+        &mut self,
+        pixel_values: &Array,
+        grid_h: i32,
+        grid_w: i32,
+        rope_inv_freq: &Array,
+        head_dim: i32,
+    ) -> Result<Array> {
+        let (cos, sin) = vision_rope_cos_sin(grid_h, grid_w, rope_inv_freq, head_dim)?;
+        let mut h = self.embeddings.forward(pixel_values)?;
+        for layer in self.layers.iter_mut() {
+            h = layer.forward(&h, Some((&cos, &sin)))?;
         }
         self.post_layernorm.forward(&h)
     }
@@ -421,5 +628,115 @@ mod tests {
         cfg.patch_size = 3; // 8 % 3 != 0
         let r = build_vision_with_random_weights(&cfg);
         assert!(r.is_err());
+    }
+
+    /// Tight TDD check against the HF reference for the PaddleOCR-VL-1.5
+    /// vision tower's `SigLIPRotaryEmbedding`:
+    ///   * `head_dim = 1152 / 16 = 72`  → `dim = head_dim / 2 = 36`
+    ///   * `inv_freq[i] = 1 / 10000^(2i / 36)` for `i ∈ [0, 18)`
+    ///
+    /// This vector is exactly what HF computes (and what we dumped to
+    /// `vision_inv_freq.npy` from the live model). Asserting bit-near
+    /// equality here guarantees the rotary table is correctly seeded.
+    #[test]
+    fn vision_inv_freq_matches_hf_reference() {
+        use mlx_rs::Dtype;
+        let head_dim = 72_i32;
+        let inv = vision_inv_freq(head_dim, 10_000.0);
+        let n = (head_dim / 4) as usize;
+        assert_eq!(inv.shape(), &[n as i32]);
+        let got = inv
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .try_as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        // Independent reference — formula matches HF SigLIPRotaryEmbedding.
+        let mut want = vec![0_f32; n];
+        for i in 0..n {
+            let exp = (2 * i) as f32 / 36.0;
+            want[i] = 1.0 / (10_000.0_f32).powf(exp);
+        }
+        let max_abs = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0_f32, f32::max);
+        assert!(
+            max_abs < 1e-7,
+            "vision_inv_freq must match HF; got max abs diff {max_abs}\n  got={:?}\n  want={:?}",
+            got, want
+        );
+    }
+
+    /// Tight TDD check on the per-token `(cos, sin)` table for a small
+    /// non-square grid. Verifies the canonical formula:
+    ///   * `h_pids[t] = t / w`, `w_pids[t] = t % w`
+    ///   * `emb[t, :] = [freqs(h_pids[t]), freqs(w_pids[t]),
+    ///                   freqs(h_pids[t]), freqs(w_pids[t])]`
+    ///   * `cos = emb.cos()`, `sin = emb.sin()`
+    #[test]
+    fn vision_rope_cos_sin_matches_brute_force() {
+        use mlx_rs::Dtype;
+        let head_dim = 72_i32;
+        let inv = vision_inv_freq(head_dim, 10_000.0);
+        let grid_h = 5_i32;
+        let grid_w = 7_i32; // exercises non-square + max_grid = max(h, w) = 7
+        let (cos, sin) = vision_rope_cos_sin(grid_h, grid_w, &inv, head_dim).unwrap();
+        let l = (grid_h * grid_w) as i32;
+        assert_eq!(cos.shape(), &[l, head_dim]);
+        assert_eq!(sin.shape(), &[l, head_dim]);
+
+        let inv_f = inv
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .try_as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let n_q = inv_f.len(); // head_dim / 4 = 18
+        let hd = head_dim as usize;
+        let mut cos_ref = vec![0_f32; l as usize * hd];
+        let mut sin_ref = vec![0_f32; l as usize * hd];
+        for t in 0..(l as usize) {
+            let h_pos = (t / grid_w as usize) as f32;
+            let w_pos = (t % grid_w as usize) as f32;
+            let mut row = vec![0_f32; hd];
+            for i in 0..n_q {
+                // First half: [h freqs, w freqs]
+                row[i] = h_pos * inv_f[i];
+                row[n_q + i] = w_pos * inv_f[i];
+                // Second half: same (repeat(1, 2))
+                row[hd / 2 + i] = h_pos * inv_f[i];
+                row[hd / 2 + n_q + i] = w_pos * inv_f[i];
+            }
+            for j in 0..hd {
+                cos_ref[t * hd + j] = row[j].cos();
+                sin_ref[t * hd + j] = row[j].sin();
+            }
+        }
+        let cos_got = cos
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .try_as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let sin_got = sin
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .try_as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let cos_diff = cos_got
+            .iter()
+            .zip(cos_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0_f32, f32::max);
+        let sin_diff = sin_got
+            .iter()
+            .zip(sin_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0_f32, f32::max);
+        assert!(cos_diff < 1e-6, "cos max abs diff {cos_diff}");
+        assert!(sin_diff < 1e-6, "sin max abs diff {sin_diff}");
     }
 }

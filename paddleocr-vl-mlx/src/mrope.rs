@@ -370,4 +370,120 @@ mod tests {
         let r = MropePartition::new(&[1, 1, 4], 16);
         assert!(r.is_err(), "must reject section/head_dim mismatch");
     }
+
+    /// Tight TDD check against an explicit brute-force re-implementation of
+    /// HF `apply_multimodal_rotary_pos_emb` for PaddleOCR-VL's actual config
+    /// (`mrope_section=[16,24,24]`, `head_dim=128`, `rope_theta=500_000`).
+    ///
+    /// Brute-force formula (mirrors the HF Python line-for-line):
+    ///   sections2 = [16, 24, 24, 16, 24, 24]   # mrope_section * 2
+    ///   for each output dim `d` in [0, head_dim):
+    ///       walk sections2 until `d` lands in chunk `j` (cumulative offset)
+    ///       chan = j % 3                          # 0=t, 1=h, 2=w
+    ///       pos  = position_ids[chan, b, t]
+    ///       freq = pos * inv_freq[d % (head_dim/2)]
+    ///       cos[b, t, d] = cos(freq) ; sin[b, t, d] = sin(freq)
+    ///
+    /// Tests a mix of text-only and image-grid positions to exercise every
+    /// branch of the channel selector.
+    #[test]
+    fn matches_hf_brute_force_for_paddleocr_partition() {
+        let head_dim = 128_i32;
+        let section = vec![16_i32, 24, 24];
+        let rope_theta = 500_000.0_f32;
+        let part = MropePartition::new(&section, head_dim).unwrap();
+        let inv = inv_freq(head_dim, rope_theta);
+
+        // 6 tokens: 2 text-before, 3 image-grid (t=2, h=0..1, w=0..1 slice),
+        // 1 text-after. Channel-major (3, B=1, T=6).
+        // text-before: positions (0,0,0), (1,1,1)
+        // image t=2: (2,2,2), (2,2,3), (2,3,2)
+        // text-after: positions (4,4,4)
+        let pos_data: Vec<i32> = vec![
+            // t-channel
+            0, 1, 2, 2, 2, 4,
+            // h-channel
+            0, 1, 2, 2, 3, 4,
+            // w-channel
+            0, 1, 2, 3, 2, 4,
+        ];
+        let position_ids = Array::from_slice(&pos_data, &[3, 1, 6]);
+
+        let (cos_actual, sin_actual) =
+            build_cos_sin(&inv, &position_ids, &part).unwrap();
+        assert_eq!(cos_actual.shape(), &[1, 6, head_dim]);
+
+        // Brute-force reference, host-side.
+        let inv_f32 = inv
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .try_as_slice::<f32>()
+            .unwrap()
+            .to_vec();
+        let half = (head_dim / 2) as usize;
+        assert_eq!(inv_f32.len(), half);
+
+        // For each output dim d, precompute which sections2 chunk it lives in.
+        let sections2: Vec<i32> = section
+            .iter()
+            .copied()
+            .chain(section.iter().copied())
+            .collect();
+        let mut dim_to_chan = vec![0i32; head_dim as usize];
+        {
+            let mut cum = 0i32;
+            for (j, &sec) in sections2.iter().enumerate() {
+                for d in cum..cum + sec {
+                    dim_to_chan[d as usize] = (j % 3) as i32;
+                }
+                cum += sec;
+            }
+            assert_eq!(cum, head_dim);
+        }
+
+        let t_seq = 6usize;
+        let mut cos_ref = vec![0_f32; t_seq * head_dim as usize];
+        let mut sin_ref = vec![0_f32; t_seq * head_dim as usize];
+        for t in 0..t_seq {
+            for d in 0..head_dim as usize {
+                let chan = dim_to_chan[d] as usize;
+                let pos = pos_data[chan * t_seq + t] as f32;
+                let freq = pos * inv_f32[d % half];
+                let idx = t * head_dim as usize + d;
+                cos_ref[idx] = freq.cos();
+                sin_ref[idx] = freq.sin();
+            }
+        }
+        let cos_ref_arr = Array::from_slice(&cos_ref, &[1, t_seq as i32, head_dim]);
+        let sin_ref_arr = Array::from_slice(&sin_ref, &[1, t_seq as i32, head_dim]);
+
+        let cos_max_abs = cos_actual
+            .subtract(&cos_ref_arr)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .item::<f32>();
+        let sin_max_abs = sin_actual
+            .subtract(&sin_ref_arr)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            cos_max_abs < 1e-5,
+            "build_cos_sin must match HF brute-force on PaddleOCR partition; cos max abs diff {cos_max_abs}"
+        );
+        assert!(
+            sin_max_abs < 1e-5,
+            "build_cos_sin must match HF brute-force on PaddleOCR partition; sin max abs diff {sin_max_abs}"
+        );
+    }
 }
