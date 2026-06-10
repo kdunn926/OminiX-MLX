@@ -9,6 +9,19 @@ pub trait KeyValueCache {
     /// Returns the current offset (number of tokens in cache)
     fn offset(&self) -> i32;
 
+    /// Returns the *physical* length of the cache buffer (how many KV slots
+    /// `update_and_fetch` would emit on its next return). For standard caches
+    /// this equals [`Self::offset`]; sliding-window caches that physically
+    /// cap the buffer at `window` entries return `min(offset, window)` here
+    /// so callers can size their attention mask to the physical key length
+    /// instead of the (potentially much larger) logical token count.
+    ///
+    /// Default impl: same as `offset()`. Override only in caches that
+    /// decouple logical position from physical buffer length.
+    fn physical_offset(&self) -> i32 {
+        self.offset()
+    }
+
     /// Returns the maximum cache size (for sliding window), if any
     fn max_size(&self) -> Option<i32>;
 
@@ -65,6 +78,19 @@ pub trait KeyValueCache {
         Err(Exception::custom(
             "KeyValueCache::trim_kv: this cache impl does not support trim",
         ))
+    }
+
+    /// Compact the cache to keep only the last `n` entries (dropping the
+    /// oldest prefix). Used by sliding-window caches to bound the
+    /// physical buffer between attention forwards — call AFTER SDPA so
+    /// the current step still sees the full buffer.
+    ///
+    /// Default impl is a no-op so unbounded caches (`KVCache`,
+    /// `PagedKvCache`, …) can be called uniformly without effect. Only
+    /// `SlidingKVCache` (or a future `RotatingKVCache`) needs to
+    /// override.
+    fn compact_to_last_n(&mut self, _n: i32) -> Result<(), Exception> {
+        Ok(())
     }
 
     /// Compact the cache to keep only positions in `keep_indices` from
