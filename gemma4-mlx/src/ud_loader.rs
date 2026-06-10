@@ -45,7 +45,7 @@ fn translate_key(key: &str) -> String {
     }
 }
 
-fn translate_keys(raw: HashMap<String, Array>) -> HashMap<String, Array> {
+pub(crate) fn translate_keys(raw: HashMap<String, Array>) -> HashMap<String, Array> {
     raw.into_iter()
         .map(|(k, v)| (translate_key(&k), v))
         .collect()
@@ -115,7 +115,7 @@ pub fn load_ud_mlx_4bit_vl(model_dir: impl AsRef<Path>) -> Result<Gemma4VlModel,
 
     let text = build_model_from_weights(&config, config.text_config.clone(), &weights)?;
     let vision = load_vision_model(&weights, &vision_config)?;
-    let embed_vision = load_embed_vision(&weights, vision_config.rms_norm_eps)?;
+    let embed_vision = load_embed_vision(&weights, vision_config.rms_norm_eps, config.quantization.as_ref())?;
 
     Ok(Gemma4VlModel {
         text,

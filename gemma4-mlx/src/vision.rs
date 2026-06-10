@@ -6,6 +6,7 @@ use mlx_rs::{
     module::{Module, Param},
     nn,
     ops::{self, indexing::IndexOp},
+    quantization::MaybeQuantized,
     transforms::eval,
     Array, Dtype,
 };
@@ -104,6 +105,91 @@ pub fn rotate_half(x: &Array) -> Result<Array> {
     Ok(rotated)
 }
 
+/// Precomputed 2-D RoPE rotation tables: per spatial dim, `(cos, sin)`
+/// shaped `[B, L, 1, channels_per_dim]`. The tables depend only on the
+/// patch positions and `rope_theta`, so the encoder computes them once per
+/// forward and every layer reuses them for both `q` and `k` — instead of
+/// rebuilding identical tables (and syncing on `positions`) twice per
+/// layer. Built with lazy MLX ops only, so `VisionModel::forward_lazy`
+/// stays genuinely eval-free.
+pub struct Rope2dTables {
+    channels_per_dim: i32,
+    dims: [(Array, Array); 2],
+}
+
+pub fn compute_rope_2d_tables(
+    positions: &Array,
+    head_dim: i32,
+    rope_theta: f32,
+    dtype: mlx_rs::Dtype,
+) -> Result<Rope2dTables> {
+    let pos_shape = positions.shape();
+    if pos_shape.len() != 3 || pos_shape[2] != 2 {
+        return Err(Error::Model(format!(
+            "2D RoPE expects positions [B, L, 2], got {:?}",
+            pos_shape
+        )));
+    }
+    let (b, l) = (pos_shape[0], pos_shape[1]);
+    let ndim = 2;
+    let channels_per_dim = 2 * (head_dim / (2 * ndim));
+    let half_per_dim = channels_per_dim / 2;
+    let timescales: Vec<f32> = (0..half_per_dim)
+        .map(|i| rope_theta.powf((2.0 / channels_per_dim as f32) * i as f32))
+        .collect();
+    let timescales = Array::from_slice(&timescales, &[1, 1, half_per_dim]);
+
+    let mut dims = Vec::with_capacity(ndim as usize);
+    for d in 0..ndim {
+        let pos_d = positions
+            .index((.., .., d))
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .reshape(&[b, l, 1])?;
+        let angles = pos_d.divide(&timescales)?; // [B, L, half]
+        let cos = ops::cos(&angles)?;
+        let sin = ops::sin(&angles)?;
+        // Duplicate halves: [cos, cos] / [sin, sin] → [B, L, 1, channels],
+        // matching the rotate_half pairing below.
+        let cos = ops::concatenate_axis(&[&cos, &cos], -1)?
+            .reshape(&[b, l, 1, channels_per_dim])?
+            .as_dtype(dtype)?;
+        let sin = ops::concatenate_axis(&[&sin, &sin], -1)?
+            .reshape(&[b, l, 1, channels_per_dim])?
+            .as_dtype(dtype)?;
+        dims.push((cos, sin));
+    }
+    let d1 = dims.pop().expect("two dims");
+    let d0 = dims.pop().expect("two dims");
+    Ok(Rope2dTables {
+        channels_per_dim,
+        dims: [d0, d1],
+    })
+}
+
+/// Apply precomputed 2-D RoPE tables to `q`/`k` of shape `[B, L, H, D]`.
+pub fn apply_rope_2d_tables(x: &Array, tables: &Rope2dTables) -> Result<Array> {
+    let shape = x.shape();
+    if shape.len() != 4 {
+        return Err(Error::Model(format!(
+            "2D RoPE expects [B, L, H, D], got {:?}",
+            shape
+        )));
+    }
+    let c = tables.channels_per_dim;
+    let mut parts = Vec::with_capacity(tables.dims.len());
+    for (d, (cos, sin)) in tables.dims.iter().enumerate() {
+        let d = d as i32;
+        let x_part = x.index((.., .., .., (d * c)..((d + 1) * c)));
+        let rotated = rotate_half(&x_part)?;
+        parts.push(x_part.multiply(cos)?.add(&rotated.multiply(sin)?)?);
+    }
+    let refs: Vec<&Array> = parts.iter().collect();
+    ops::concatenate_axis(&refs, -1).map_err(Into::into)
+}
+
+/// One-shot convenience wrapper: build tables for this call only and apply
+/// them. Prefer [`compute_rope_2d_tables`] + [`apply_rope_2d_tables`] when
+/// applying RoPE more than once for the same positions (the encoder path).
 pub fn apply_multidimensional_rope_2d(
     q: &Array,
     positions: &Array,
@@ -116,61 +202,8 @@ pub fn apply_multidimensional_rope_2d(
             shape
         )));
     }
-    let pos_shape = positions.shape();
-    if pos_shape.len() != 3 || pos_shape[2] != 2 {
-        return Err(Error::Model(format!(
-            "2D RoPE expects positions [B, L, 2], got {:?}",
-            pos_shape
-        )));
-    }
-
-    let b = shape[0] as usize;
-    let l = shape[1] as usize;
-    let head_dim = shape[3] as usize;
-    let ndim = 2usize;
-    let channels_per_dim = 2 * (head_dim / (2 * ndim));
-    let half_per_dim = channels_per_dim / 2;
-    eval(std::slice::from_ref(positions)).map_err(|e| Error::Model(format!("eval positions for 2D RoPE: {e}")))?;
-    let pos_data = positions.try_as_slice::<i32>().map_err(|e| {
-        Error::Model(format!("positions must be contiguous int32 for 2D RoPE: {e}"))
-    })?;
-
-    let mut parts = Vec::with_capacity(ndim);
-    for d in 0..ndim {
-        let x_part = q.index((.., .., .., (d * channels_per_dim) as i32..((d + 1) * channels_per_dim) as i32));
-        let mut cos_vals = vec![0f32; b * l * channels_per_dim];
-        let mut sin_vals = vec![0f32; b * l * channels_per_dim];
-        let mut timescales = Vec::with_capacity(half_per_dim);
-        for i in 0..half_per_dim {
-            let freq_exp = (2.0f32 / channels_per_dim as f32) * i as f32;
-            timescales.push(rope_theta.powf(freq_exp));
-        }
-        for batch in 0..b {
-            for token in 0..l {
-                let pos_idx = (batch * l + token) * 2 + d;
-                let pos = pos_data[pos_idx] as f32;
-                let base = (batch * l + token) * channels_per_dim;
-                for i in 0..half_per_dim {
-                    let angle = pos / timescales[i];
-                    let cos = angle.cos();
-                    let sin = angle.sin();
-                    cos_vals[base + i] = cos;
-                    cos_vals[base + half_per_dim + i] = cos;
-                    sin_vals[base + i] = sin;
-                    sin_vals[base + half_per_dim + i] = sin;
-                }
-            }
-        }
-        let cos = Array::from_slice(&cos_vals, &[shape[0], shape[1], 1, channels_per_dim as i32])
-            .as_dtype(q.dtype())?;
-        let sin = Array::from_slice(&sin_vals, &[shape[0], shape[1], 1, channels_per_dim as i32])
-            .as_dtype(q.dtype())?;
-        let rotated = rotate_half(&x_part)?;
-        parts.push(x_part.multiply(&cos)?.add(&rotated.multiply(&sin)?)?);
-    }
-
-    let refs: Vec<&Array> = parts.iter().collect();
-    ops::concatenate_axis(&refs, -1).map_err(Into::into)
+    let tables = compute_rope_2d_tables(positions, shape[3], rope_theta, q.dtype())?;
+    apply_rope_2d_tables(q, &tables)
 }
 
 pub struct PatchEmbedder {
@@ -245,7 +278,7 @@ impl VisionAttention {
     pub fn forward(
         &mut self,
         x: &Array,
-        positions: &Array,
+        rope: &Rope2dTables,
         mask: Option<&Array>,
     ) -> Result<Array> {
         let shape = x.shape();
@@ -268,7 +301,9 @@ impl VisionAttention {
 
         q = self.q_norm.forward(&q)?;
         k = self.k_norm.forward(&k)?;
-        let v = self.v_norm.forward(&v)?;        q = apply_multidimensional_rope_2d(&q, positions, self.rope_theta)?;        k = apply_multidimensional_rope_2d(&k, positions, self.rope_theta)?;
+        let v = self.v_norm.forward(&v)?;
+        q = apply_rope_2d_tables(&q, rope)?;
+        k = apply_rope_2d_tables(&k, rope)?;
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
@@ -310,9 +345,9 @@ pub struct VisionEncoderLayer {
 }
 
 impl VisionEncoderLayer {
-    pub fn forward(&mut self, x: &Array, positions: &Array, mask: Option<&Array>) -> Result<Array> {
+    pub fn forward(&mut self, x: &Array, rope: &Rope2dTables, mask: Option<&Array>) -> Result<Array> {
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward(&normed, positions, mask)?;
+        let attn_out = self.self_attn.forward(&normed, rope, mask)?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
         let h = x.add(&attn_out)?;
         let normed_h = self.pre_feedforward_layernorm.forward(&h)?;
@@ -328,11 +363,20 @@ pub struct VisionEncoder {
 
 impl VisionEncoder {
     pub fn forward(&mut self, hidden_states: &Array, positions: &Array, mask: &Array) -> Result<Array> {
+        let Some(first) = self.layers.first() else {
+            return Ok(hidden_states.clone());
+        };
+        // All layers share rope_theta/head_dim, so the cos/sin tables are
+        // computed once here and reused by every layer's q and k.
+        let rope = compute_rope_2d_tables(
+            positions,
+            first.self_attn.head_dim,
+            first.self_attn.rope_theta,
+            hidden_states.dtype(),
+        )?;
         let mut hidden = hidden_states.clone();
-        for (idx, layer) in self.layers.iter_mut().enumerate() {            hidden = layer.forward(&hidden, positions, Some(mask))?;
-            // Force eval every 5 layers to catch errors early
-            if idx % 5 == 4 {
-                eval([&hidden]).map_err(|e| Error::Model(format!("eval after encoder layer {idx}: {e}")))?;            }
+        for layer in self.layers.iter_mut() {
+            hidden = layer.forward(&hidden, &rope, Some(mask))?;
         }
         Ok(hidden)
     }
@@ -630,7 +674,7 @@ impl VisionModel {
 
 pub struct EmbedVision {
     pub embedding_pre_projection_norm: VisionRmsNormNoScale,
-    pub embedding_projection: nn::Linear,
+    pub embedding_projection: MaybeQuantized<nn::Linear>,
 }
 
 impl EmbedVision {
@@ -638,11 +682,17 @@ impl EmbedVision {
         // The vision encoder may run in a different dtype (e.g. Float32) than the
         // embedding projection weights (e.g. Bfloat16). Cast here so the linear op
         // sees consistent dtypes.
-        let weight_dtype = self.embedding_projection.weight.dtype();
+        let weight_dtype = match &self.embedding_projection {
+            MaybeQuantized::Original(l) => l.weight.dtype(),
+            MaybeQuantized::Quantized(q) => q.inner.weight.dtype(),
+        };
         let hidden_states = hidden_states.as_dtype(weight_dtype)?;
         let normed = self.embedding_pre_projection_norm.forward(&hidden_states)?;
-        eval([&normed]).map_err(|e| Error::Model(format!("eval normed: {e}")))?;        let proj = self.embedding_projection.forward(&normed).map_err(|e| Error::Model(e.to_string()))?;
-        eval([&proj]).map_err(|e| Error::Model(format!("eval projection: {e}")))?;        Ok(proj)
+        // No eval here: `encode_image_bytes_async` relies on this graph
+        // staying lazy so vision kernels overlap with the first prefill chunk.
+        self.embedding_projection
+            .forward(&normed)
+            .map_err(|e| Error::Model(e.to_string()))
     }
 }
 
@@ -843,12 +893,19 @@ pub fn load_vision_model(
     })
 }
 
-pub fn load_embed_vision(weights: &HashMap<String, Array>, rms_eps: f32) -> Result<EmbedVision> {
+pub fn load_embed_vision(
+    weights: &HashMap<String, Array>,
+    rms_eps: f32,
+    quant: Option<&crate::model::QuantizationConfig>,
+) -> Result<EmbedVision> {
+    let projection = crate::model::make_mq_linear(
+        weights,
+        "model.embed_vision.embedding_projection",
+        quant,
+    )
+    .map_err(|e| Error::Model(e.to_string()))?;
     Ok(EmbedVision {
         embedding_pre_projection_norm: VisionRmsNormNoScale { eps: rms_eps },
-        embedding_projection: make_linear(get_weight(
-            weights,
-            "model.embed_vision.embedding_projection.weight",
-        )?),
+        embedding_projection: projection,
     })
 }

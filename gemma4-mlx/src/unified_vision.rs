@@ -24,6 +24,7 @@ use mlx_rs::{
     module::{Module, Param},
     nn,
     ops::{self, indexing::IndexOp},
+    quantization::MaybeQuantized,
     transforms::eval,
     Array,
 };
@@ -31,7 +32,6 @@ use mlx_rs_core::error::{Error, Result};
 use serde::Deserialize;
 
 use crate::model::{get_model_args, load_all_weights_unfiltered, Model};
-use crate::ud_loader::load_ud_mlx_4bit;
 use crate::vision::{EmbedVision, VisionRmsNormNoScale};
 
 /// Vision config for the `gemma4_unified_vision` schema (12B+).
@@ -226,7 +226,7 @@ pub fn load_unified_embed_vision(
         embedding_pre_projection_norm: VisionRmsNormNoScale {
             eps: config.rms_norm_eps,
         },
-        embedding_projection: projection,
+        embedding_projection: MaybeQuantized::Original(projection),
     })
 }
 
@@ -289,12 +289,7 @@ impl Gemma4UnifiedVlModel {
     where
         C: mlx_rs_core::cache::KeyValueCache + Default,
     {
-        let image_positions: Vec<usize> = input_ids
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &id)| (id as u32 == self.image_token_id).then_some(idx))
-            .collect();
-        if image_positions.is_empty() {
+        if !input_ids.iter().any(|&id| id as u32 == self.image_token_id) {
             // No image tokens — fall back to a plain text prefill via Model.
             let chunk = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let input = crate::ModelInput {
@@ -304,85 +299,13 @@ impl Gemma4UnifiedVlModel {
             };
             return self.text.forward_last_logits(input).map_err(Error::from);
         }
-
-        let text_embeds = self.text.embed_tokens_slice(input_ids)?;
-        let scale = Array::from((self.text.args.hidden_size as f32).sqrt())
-            .as_dtype(mlx_rs::Dtype::Bfloat16)?
-            .as_dtype(text_embeds.dtype())?;
-        let text_embeds = text_embeds.multiply(&scale)?;
-        let seq_len = input_ids.len();
-        let hidden_size = self.text.args.hidden_size as usize;
-
-        let text_f32 = text_embeds.as_dtype(mlx_rs::Dtype::Float32)?;
-        eval([&text_f32]).map_err(|e| Error::Model(format!("eval text_embeds: {e}")))?;
-        let text_slice = text_f32.try_as_slice::<f32>().map_err(|e| {
-            Error::Model(format!("text embeddings must be contiguous for multimodal scatter: {e}"))
-        })?;
-
-        let vis_len = visual_features.shape()[0] as usize;
-        if vis_len == 0 {
-            return Err(Error::Model(
-                "encode_image_bytes returned zero visual tokens".into(),
-            ));
-        }
-        let vis_f32 = visual_features.as_dtype(mlx_rs::Dtype::Float32)?;
-        eval([&vis_f32]).map_err(|e| Error::Model(format!("eval visual_features: {e}")))?;
-        let vis_slice = vis_f32.try_as_slice::<f32>().map_err(|e| {
-            Error::Model(format!("visual features must be contiguous for multimodal scatter: {e}"))
-        })?;
-
-        let mut combined = text_slice.to_vec();
-        for (out_idx, &token_idx) in image_positions.iter().enumerate() {
-            let src_row = out_idx % vis_len;
-            let dst_start = token_idx * hidden_size;
-            let src_start = src_row * hidden_size;
-            combined[dst_start..dst_start + hidden_size]
-                .copy_from_slice(&vis_slice[src_start..src_start + hidden_size]);
-        }
-
-        let combined_f32 = Array::from_slice(
-            &combined,
-            &[1, seq_len as i32, self.text.args.hidden_size],
-        );
-        eval([&combined_f32]).map_err(|e| Error::Model(format!("eval combined_f32: {e}")))?;
-        let combined = combined_f32.as_dtype(text_embeds.dtype())?;
-        eval([&combined]).map_err(|e| Error::Model(format!("eval combined: {e}")))?;
-
-        // PLE precompute over the full seq (image positions use image_token_id
-        // as the auxiliary; PLE is a secondary modulating input).
-        let input_ids_arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
-        let per_layer_inputs_full = self
-            .text
-            .model
-            .compute_per_layer_inputs(&input_ids_arr, &combined)
-            .map_err(|e| Error::Model(format!("compute_per_layer_inputs: {e}")))?;
-
-        const PREFILL_CHUNK: i32 = 32;
-        let total = seq_len as i32;
-        let mut pos: i32 = 0;
-        while pos < total {
-            let end = (pos + PREFILL_CHUNK).min(total);
-            let chunk = combined.index((.., pos..end, ..));
-            let ple_chunk = per_layer_inputs_full
-                .as_ref()
-                .map(|p| p.index((.., pos..end, .., ..)));
-            if end < total {
-                let hidden = self
-                    .text
-                    .model
-                    .forward_from_embeds(&chunk, None, cache, ple_chunk.as_ref())?;
-                eval([&hidden]).map_err(|e| Error::Model(format!("prefill chunk {pos}: {e}")))?;
-            } else {
-                return self
-                    .text
-                    .forward_from_embeds(&chunk, cache, ple_chunk.as_ref())
-                    .map_err(Into::into);
-            }
-            pos = end;
-        }
-        Err(Error::Model(
-            "prefill_multimodal: unexpected empty sequence".into(),
-        ))
+        crate::Gemma4VlModel::prefill_multimodal_scatter(
+            &mut self.text,
+            self.image_token_id,
+            input_ids,
+            visual_features,
+            cache,
+        )
     }
 
     /// Decode a single token (post-prefill) — same contract as the canonical
@@ -451,8 +374,7 @@ impl Gemma4UnifiedVlModel {
     /// "mixed" of `MixedKvCache`). Used by the API when
     /// `OMINIX_PAGED_ATTENTION=1` is set.
     pub fn new_cache_paged(&self) -> Vec<crate::mixed_cache::MixedKvCache> {
-        let num_slots = *self.text.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
-        crate::init_cache::<crate::mixed_cache::MixedKvCache>(num_slots)
+        crate::mixed_cache::init_mixed_paged_cache(&self.text)
     }
 }
 
@@ -599,17 +521,20 @@ pub fn load_unified_4bit_vl(model_dir: impl AsRef<Path>) -> Result<Gemma4Unified
         )));
     }
 
-    // Text uses the same UD layout as gemma-4-26B-A4B-it-UD-MLX-4bit:
-    // `language_model.model.*` prefix, heterogeneous quantization. Delegate.
-    let text = load_ud_mlx_4bit(model_dir)?;
-
-    // Vision-side weights aren't translated by the text loader; reload the
-    // raw weight map for the unified vision modules.
+    // Load the multi-GB weight map once: the unified vision modules read it
+    // under the raw (untranslated) names, then the text side consumes it via
+    // the same UD-prefix translation `load_ud_mlx_4bit` uses.
     let raw = load_all_weights_unfiltered(model_dir)?;
     let vision = load_unified_embedder(&raw, &vision_config)?;
     let embed_vision = load_unified_embed_vision(&raw, &vision_config)?;
 
     let full_cfg = get_model_args(model_dir)?;
+    let weights = crate::ud_loader::translate_keys(raw);
+    let text = crate::model::build_model_from_weights(
+        &full_cfg,
+        full_cfg.text_config.clone(),
+        &weights,
+    )?;
     let n_vision_tokens = if vision_config.num_soft_tokens > 0 {
         vision_config.num_soft_tokens as usize
     } else {

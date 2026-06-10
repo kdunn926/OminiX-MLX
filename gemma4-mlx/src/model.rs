@@ -3106,15 +3106,29 @@ fn keep_language_weight(key: &str) -> bool {
         )
 }
 
-/// Rewrite multimodal-wrapper naming (`language_model.model.X`,
-/// `language_model.lm_head.X`) to the canonical nested form
-/// (`model.language_model.X`, `lm_head.X`) the loader looks up by.
-/// Other keys pass through unchanged.
+/// Rewrite multimodal-wrapper naming to the canonical form the loaders look
+/// up by.  Handles two checkpoint layouts:
+///
+/// | On-disk prefix                 | Canonical key                     |
+/// |--------------------------------|-----------------------------------|
+/// | `language_model.model.X`       | `model.language_model.X`          |
+/// | `language_model.lm_head.X`     | `lm_head.X`                       |
+/// | `vision_tower.X`               | `model.vision_tower.X`            |
+/// | `embed_vision.X`               | `model.embed_vision.X`            |
+/// | `embed_audio.X`                | `model.embed_audio.X`             |
+///
+/// Keys that already start with `model.` pass through unchanged.
 fn normalize_weight_key(key: &str) -> String {
     if let Some(rest) = key.strip_prefix("language_model.model.") {
         format!("model.language_model.{rest}")
     } else if let Some(rest) = key.strip_prefix("language_model.lm_head.") {
         format!("lm_head.{rest}")
+    } else if let Some(rest) = key.strip_prefix("vision_tower.") {
+        format!("model.vision_tower.{rest}")
+    } else if let Some(rest) = key.strip_prefix("embed_vision.") {
+        format!("model.embed_vision.{rest}")
+    } else if let Some(rest) = key.strip_prefix("embed_audio.") {
+        format!("model.embed_audio.{rest}")
     } else {
         key.to_string()
     }
@@ -3182,7 +3196,12 @@ pub fn load_all_weights_unfiltered(model_dir: &Path) -> Result<HashMap<String, A
 
     let mut all_weights = HashMap::new();
     for weights_filename in weight_files {
-        all_weights.extend(Array::load_safetensors(&weights_filename)?);
+        // Normalize key format so builders always see `model.language_model.*`
+        // regardless of whether the checkpoint uses `language_model.model.*`
+        // (e.g. E4B, 12B) or already uses the canonical form.
+        for (key, value) in Array::load_safetensors(&weights_filename)? {
+            all_weights.insert(normalize_weight_key(&key), value);
+        }
     }
     Ok(all_weights)
 }
@@ -3198,11 +3217,6 @@ fn get_weight_optional(weights: &HashMap<String, Array>, key: &str) -> Option<Ar
     weights.get(key).cloned()
 }
 
-fn get_first_weight(weights: &HashMap<String, Array>, keys: &[&str]) -> Option<Array> {
-    keys.iter()
-        .find_map(|key| get_weight_optional(weights, key))
-}
-
 fn make_linear(weight: Array) -> nn::Linear {
     nn::Linear {
         weight: Param::new(weight),
@@ -3214,7 +3228,7 @@ fn make_linear(weight: Array) -> nn::Linear {
 /// prefix.scales, prefix.biases)` triplet is present, returns a
 /// `Quantized` variant for native `quantized_matmul`. Otherwise returns the
 /// `Original` BF16 path.
-fn make_mq_linear(
+pub(crate) fn make_mq_linear(
     weights: &HashMap<String, Array>,
     prefix: &str,
     quant: Option<&QuantizationConfig>,
@@ -3645,7 +3659,6 @@ pub fn build_model_from_weights(
             kv_store_layers.insert(ref_idx);
         }
     }
-    let num_cache_slots = next_slot;
 
     let mut layers = Vec::with_capacity(num_layers);
     for layer_idx_u in 0..num_layers {
@@ -4078,8 +4091,7 @@ impl Gemma4VlModel {
     /// allocate against the shared paged pool; sliding-window layers stay
     /// contiguous (the "mixed" of `MixedKvCache`).
     pub fn new_cache_paged(&self) -> Vec<crate::mixed_cache::MixedKvCache> {
-        let num_slots = *self.text.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
-        init_cache::<crate::mixed_cache::MixedKvCache>(num_slots)
+        crate::mixed_cache::init_mixed_paged_cache(&self.text)
     }
 
     pub fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Array, Error> {
@@ -4133,22 +4145,45 @@ impl Gemma4VlModel {
     where
         C: KeyValueCache + Default,
     {
+        if !input_ids.iter().any(|&id| id as u32 == self.image_token_id) {
+            return self.prefill_text(input_ids, cache);
+        }
+        Self::prefill_multimodal_scatter(
+            &mut self.text,
+            self.image_token_id,
+            input_ids,
+            visual_features,
+            cache,
+        )
+    }
+
+    /// Shared body of [`Gemma4VlModel::prefill_multimodal`] and the unified
+    /// VL backend's `prefill_multimodal`: scatter one visual-feature row
+    /// into each image-token position of the embedded prompt, then run a
+    /// chunked prefill. Callers handle the text-only fallback; `input_ids`
+    /// must contain at least one `image_token_id`.
+    pub(crate) fn prefill_multimodal_scatter<C>(
+        text: &mut Model,
+        image_token_id: u32,
+        input_ids: &[i32],
+        visual_features: &Array,
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
         let image_positions: Vec<usize> = input_ids
             .iter()
             .enumerate()
-            .filter_map(|(idx, &id)| (id as u32 == self.image_token_id).then_some(idx))
+            .filter_map(|(idx, &id)| (id as u32 == image_token_id).then_some(idx))
             .collect();
-        if image_positions.is_empty() {
-            return self.prefill_text(input_ids, cache);
-        }
-
-        let text_embeds = self.text.embed_tokens_slice(input_ids)?;
-        let scale = Array::from((self.text.args.hidden_size as f32).sqrt())
+        let text_embeds = text.embed_tokens_slice(input_ids)?;
+        let scale = Array::from((text.args.hidden_size as f32).sqrt())
             .as_dtype(Dtype::Bfloat16)?
             .as_dtype(text_embeds.dtype())?;
         let text_embeds = text_embeds.multiply(&scale)?;
         let seq_len = input_ids.len();
-        let hidden_size = self.text.args.hidden_size as usize;
+        let hidden_size = text.args.hidden_size as usize;
         let text_f32 = text_embeds.as_dtype(Dtype::Float32)?;
         eval([&text_f32]).map_err(|e| Error::Model(format!("eval text_embeds: {e}")))?;
         let text_slice = text_f32.try_as_slice::<f32>().map_err(|e| {
@@ -4165,18 +4200,28 @@ impl Gemma4VlModel {
             Error::Model(format!("visual features must be contiguous for multimodal scatter: {e}"))
         })?;
 
+        // One visual-feature row per image token — a mismatch means the
+        // prompt and the encoded image(s) disagree (e.g. multi-image prompt
+        // with single-image features); wrapping around would silently reuse
+        // image 1's features for image 2. Mirrors the async path's check.
+        if image_positions.len() != vis_len {
+            return Err(Error::Model(format!(
+                "prefill_multimodal: {} image tokens in prompt but {} visual feature rows",
+                image_positions.len(),
+                vis_len
+            )));
+        }
         let mut combined = text_slice.to_vec();
         for (out_idx, &token_idx) in image_positions.iter().enumerate() {
-            let src_row = out_idx % vis_len;
             let dst_start = token_idx * hidden_size;
-            let src_start = src_row * hidden_size;
+            let src_start = out_idx * hidden_size;
             combined[dst_start..dst_start + hidden_size]
                 .copy_from_slice(&vis_slice[src_start..src_start + hidden_size]);
         }
 
         let combined_f32 = Array::from_slice(
             &combined,
-            &[1, seq_len as i32, self.text.args.hidden_size],
+            &[1, seq_len as i32, text.args.hidden_size],
         );
         eval([&combined_f32]).map_err(|e| Error::Model(format!("eval combined_f32: {e}")))?;
         let combined = combined_f32.as_dtype(text_embeds.dtype())?;
@@ -4187,8 +4232,7 @@ impl Gemma4VlModel {
         // use image_token_id as the auxiliary token — acceptable because PLE is a
         // secondary modulating input, not the primary feature stream.
         let input_ids_arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
-        let per_layer_inputs_full = self
-            .text
+        let per_layer_inputs_full = text
             .model
             .compute_per_layer_inputs(&input_ids_arr, &combined)
             .map_err(|e| Error::Model(format!("compute_per_layer_inputs: {e}")))?;
@@ -4210,16 +4254,14 @@ impl Gemma4VlModel {
                 .map(|p| p.index((.., pos..end, .., ..)));
             if end < total {
                 // Intermediate chunk: update KV cache, discard hidden states.
-                let hidden = self
-                    .text
+                let hidden = text
                     .model
                     .forward_from_embeds(&chunk, None, cache, ple_chunk.as_ref())?;
                 eval([&hidden])
                     .map_err(|e| Error::Model(format!("prefill chunk {pos}: {e}")))?;
             } else {
                 // Final chunk: apply lm_head and return logits.
-                return self
-                    .text
+                return text
                     .forward_from_embeds(&chunk, cache, ple_chunk.as_ref())
                     .map_err(Into::into);
             }
@@ -4400,7 +4442,7 @@ pub fn load_vl_model(model_dir: impl AsRef<Path>) -> Result<Gemma4VlModel, Error
 
     let text = build_model_from_weights(&config, config.text_config.clone(), &weights)?;
     let vision = load_vision_model(&weights, &vision_config)?;
-    let embed_vision = load_embed_vision(&weights, vision_config.rms_norm_eps)?;
+    let embed_vision = load_embed_vision(&weights, vision_config.rms_norm_eps, config.quantization.as_ref())?;
 
     Ok(Gemma4VlModel {
         text,
@@ -4420,6 +4462,11 @@ pub struct Generate<'a, C, S: Sampler = DefaultSampler> {
     temp: f32,
     state: GenerateState<'a>,
     token_count: usize,
+    /// `GEMMA4_PROFILE_DECODE` — read once at construction (env lookups in
+    /// the per-token loop are measurable overhead).
+    profile: bool,
+    /// `GEMMA4_CACHE_CLEAR_INTERVAL` — read once at construction.
+    cache_clear_interval: usize,
 }
 
 pub enum GenerateState<'a> {
@@ -4475,6 +4522,11 @@ where
             temp,
             state: GenerateState::Prefill { prompt_token },
             token_count: 0,
+            profile: std::env::var("GEMMA4_PROFILE_DECODE").is_ok(),
+            cache_clear_interval: std::env::var("GEMMA4_CACHE_CLEAR_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
         }
     }
 
@@ -4537,13 +4589,12 @@ where
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(256);
-                let PREFILL_CHUNK = prefill_chunk;
                 let seq_len = prompt_token.shape()[1];
 
-                if seq_len > PREFILL_CHUNK {
+                if seq_len > prefill_chunk {
                     let mut pos = 0;
                     while pos < seq_len {
-                        let end = (pos + PREFILL_CHUNK).min(seq_len);
+                        let end = (pos + prefill_chunk).min(seq_len);
                         let chunk = prompt_token.index((.., pos..end));
                         let input = ModelInput {
                             inputs: &chunk,
@@ -4575,7 +4626,7 @@ where
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(4);
                         if cache_clear_every > 0
-                            && ((pos / PREFILL_CHUNK + 1) % cache_clear_every == 0)
+                            && ((pos / prefill_chunk + 1) % cache_clear_every == 0)
                         {
                             let _ = mlx_rs_core::memory::clear_cache();
                         }
@@ -4603,7 +4654,6 @@ where
                     let logits = tri!(self.model.forward_last_logits(input));
                     let y = tri!(self.sampler.sample(&logits, self.temp));
 
-                    tri!(mlx_rs::transforms::async_eval([&y]));
                     tri!(mlx_rs::transforms::eval([&y]));
 
                     let next_y = tri!(self.compute_next(&y));
@@ -4617,7 +4667,7 @@ where
                 // Optional per-step profiling. GEMMA4_PROFILE_DECODE=1 reports
                 // (compute_next_ms, cache_eval_ms) every 16 steps via stderr.
                 // Adds two cheap clocks; no-op when env unset.
-                let profile = std::env::var("GEMMA4_PROFILE_DECODE").is_ok();
+                let profile = self.profile;
                 let t0 = profile.then(std::time::Instant::now);
                 let next_y = tri!(self.compute_next(&current_y));
                 tri!(mlx_rs::transforms::async_eval([&next_y]));
@@ -4647,10 +4697,7 @@ where
                 // = global stalls, too rare = peak memory grows. Env-tune
                 // via GEMMA4_CACHE_CLEAR_INTERVAL (0 disables entirely).
                 self.token_count += 1;
-                let cache_clear_interval: usize = std::env::var("GEMMA4_CACHE_CLEAR_INTERVAL")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(256);
+                let cache_clear_interval = self.cache_clear_interval;
                 if cache_clear_interval > 0 && self.token_count % cache_clear_interval == 0 {
                     unsafe {
                         mlx_sys::mlx_clear_cache();
