@@ -15,14 +15,50 @@ private func computeUnits(from code: Int32) -> MLComputeUnits {
     case 1: return .cpuOnly
     case 2: return .cpuAndGPU
     case 3: return .cpuAndNeuralEngine
-    case 4:
-        if #available(macOS 14.0, *) {
-            return .all   // No `.neuralEngineOnly` exists; pick `.cpuAndNeuralEngine` and rely on fallback.
-        }
-        return .cpuAndNeuralEngine
+    // No `.neuralEngineOnly` exists; "neural-engine-preferred" maps to
+    // `.cpuAndNeuralEngine` (matches the Rust enum docs and build.rs).
+    case 4: return .cpuAndNeuralEngine
     default:
         return .all
     }
+}
+
+// Resolve a (possibly uncompiled) model URL to a compiled .mlmodelc.
+//
+// `MLModel.compileModel` writes a fresh .mlmodelc into a temp dir on every
+// call, and Apple's docs make the caller responsible for moving/cleaning
+// it. The old code recompiled on every `coreml_load` and leaked the temp
+// dirs. Compiled models are now cached under
+// ~/Library/Caches/ominix-coreml-bridge keyed by package name + mtime.
+private func compiledModelURL(for url: URL) throws -> URL {
+    if url.path.hasSuffix(".mlmodelc") { return url }
+    let fm = FileManager.default
+    let mtime = (try? fm.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
+        .flatMap { $0 }?.timeIntervalSince1970 ?? 0
+    let cacheRoot = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ominix-coreml-bridge", isDirectory: true)
+    try fm.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
+    let cached = cacheRoot.appendingPathComponent(
+        "\(url.deletingPathExtension().lastPathComponent)-\(UInt64(mtime)).mlmodelc")
+    if fm.fileExists(atPath: cached.path) { return cached }
+    let tmp = try MLModel.compileModel(at: url)
+    do {
+        try fm.moveItem(at: tmp, to: cached)
+    } catch {
+        // A racing process may have populated the cache first; otherwise
+        // clean up the temp dir and propagate.
+        try? fm.removeItem(at: tmp)
+        if !fm.fileExists(atPath: cached.path) { throw error }
+    }
+    return cached
+}
+
+// Expected element count of the model's input MLMultiArray (and the shape).
+private func inputShape(of handle: Handle) -> [NSNumber] {
+    let inputDesc = handle.model.modelDescription.inputDescriptionsByName[handle.inputName]
+    return (inputDesc?.multiArrayConstraint?.shape).flatMap {
+        $0.isEmpty ? nil : $0
+    } ?? [1, 3, 224, 224].map { NSNumber(value: $0) }
 }
 
 // Container the Rust side holds via opaque pointer.
@@ -48,11 +84,7 @@ public func coreml_load(_ pathPtr: UnsafePointer<CChar>?,
     do {
         let config = MLModelConfiguration()
         config.computeUnits = computeUnits(from: computeUnitsCode)
-        // Compile mlpackage on the fly; if caller passed a precompiled
-        // .mlmodelc directly, skip the compile step.
-        let compiledURL: URL = path.hasSuffix(".mlmodelc")
-            ? url
-            : try MLModel.compileModel(at: url)
+        let compiledURL = try compiledModelURL(for: url)
         let model = try MLModel(contentsOf: compiledURL, configuration: config)
 
         // Pick first input + output by convention.
@@ -92,10 +124,16 @@ public func coreml_predict_zero_copy(_ rawHandle: UnsafeMutableRawPointer?,
 
     let handle = Unmanaged<Handle>.fromOpaque(rawHandle).takeUnretainedValue()
     do {
-        let inputDesc = handle.model.modelDescription.inputDescriptionsByName[handle.inputName]
-        let shape: [NSNumber] = (inputDesc?.multiArrayConstraint?.shape).flatMap {
-            $0.isEmpty ? nil : $0
-        } ?? [1, 3, 224, 224].map { NSNumber(value: $0) }
+        let shape = inputShape(of: handle)
+        // The MLMultiArray below is a view over exactly shape-product
+        // floats of caller memory; a shorter Rust buffer would let Core ML
+        // read out of bounds of Rust-owned memory.
+        let expected = shape.reduce(1) { $0 * $1.intValue }
+        guard Int(pixelCount) == expected else {
+            FileHandle.standardError.write(Data(
+                "coreml_predict_zero_copy: pixelCount \(pixelCount) != model input size \(expected)\n".utf8))
+            return -10
+        }
         // Row-major float32 strides.
         var strides: [NSNumber] = Array(repeating: NSNumber(value: 1), count: shape.count)
         var acc = 1
@@ -168,13 +206,20 @@ public func coreml_predict(_ rawHandle: UnsafeMutableRawPointer?,
 
     do {
         // Build input MLMultiArray. Shape pulled from model description.
-        let inputDesc = handle.model.modelDescription.inputDescriptionsByName[handle.inputName]
-        let shape: [NSNumber] = (inputDesc?.multiArrayConstraint?.shape).flatMap {
-            $0.isEmpty ? nil : $0
-        } ?? [1, 3, 224, 224].map { NSNumber(value: $0) }
+        let shape = inputShape(of: handle)
+        // The fresh MLMultiArray holds exactly shape-product floats;
+        // copying `pixelCount` unvalidated caller floats into it was a
+        // heap buffer overflow for oversized inputs (and left the tail
+        // uninitialized for undersized ones).
+        let expected = shape.reduce(1) { $0 * $1.intValue }
+        guard Int(pixelCount) == expected else {
+            FileHandle.standardError.write(Data(
+                "coreml_predict: pixelCount \(pixelCount) != model input size \(expected)\n".utf8))
+            return -10
+        }
         let arr = try MLMultiArray(shape: shape, dataType: .float32)
-        let buf = arr.dataPointer.bindMemory(to: Float.self, capacity: Int(pixelCount))
-        buf.update(from: pixels, count: Int(pixelCount))
+        let buf = arr.dataPointer.bindMemory(to: Float.self, capacity: expected)
+        buf.update(from: pixels, count: expected)
 
         let provider = try MLDictionaryFeatureProvider(
             dictionary: [handle.inputName: MLFeatureValue(multiArray: arr)]

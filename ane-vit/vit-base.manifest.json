@@ -3,6 +3,8 @@
   "output": "ane-vit-spike/vit-base.mlpackage",
   "image_size": 224,
   "patch_size": 16,
+  "num_patches": 196,
+  "hidden_size": 768,
   "input_name": "pixels",
   "input_shape": [
     1,
@@ -11,5 +13,6 @@
     224
   ],
   "compute_units": "all",
+  "recommended_units": "cpuAndNeuralEngine",
   "precision": "float16"
 }

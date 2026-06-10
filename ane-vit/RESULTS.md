@@ -375,6 +375,175 @@ work first.
    ~150-300 ms saved on the vision step, partially overlapped with the
    text prefill if invoked asynchronously.
 
+## Async-overlap experiment (2026-06-10) — SHIP/CLOSE DECISION
+
+Branch `spike/async-vision-prefill` implemented the background-thread ANE overlap
+approach: spawn an OS thread to run `CoreMlModel::predict`, while the GPU
+simultaneously runs `model.prefill_text(prefix_ids)` on all tokens before the
+`<BOI>` marker, then join before the image span.
+
+### Bench setup
+
+- Model: `gemma-4-e4b-it-4bit` (quantized), `gemma4-e4b-vit.mlpackage` (CpuAndGpu)
+- Image: `bench_results/img1.png` (230 KB)
+- 5 iters after warmup; short and long system prompts tested
+
+### Results
+
+**Sync ANE baseline (short system prompt ~15 prefix tokens)**
+
+| Stage  | mean (ms) | p50 | min  | max  |
+|--------|-----------|-----|------|------|
+| vision | 28.2      | 28.1| 28.0 | 28.4 |
+| prefill| 160.1     | 160.6|157.9|161.2|
+| **TTFT**|**188.4** |189.0|186.1|189.5|
+
+Vision share: 15.0% of TTFT.
+
+**Overlap mode, short system prompt**
+
+| Stage      | mean (ms) |
+|------------|-----------|
+| prefix     | 2.2       |
+| ANE (net)  | 25.6      |
+| prefill    | 182.4     |
+| **TTFT**   | **210.3** |
+
+Overlap TTFT is **22 ms WORSE** than sync. With only 2 ms of prefix to hide
+28 ms of ANE work, the split-path overhead (lm_head on prefix tokens, two graph
+boundaries) dominates.
+
+**Overlap mode, long system prompt (~140 prefix tokens)**
+
+| Stage      | mean (ms) |
+|------------|-----------|
+| prefix     | 2.2       |
+| ANE (net)  | 26.1      |
+| prefill    | 261.1     |
+| **TTFT**   | **289.4** |
+
+Prefix measurement is still 2.2 ms despite ~140 extra tokens. TTFT increased by
+~100 ms (the extra system prompt tokens, correctly accounted in the continuation
+prefill).
+
+### Benchmark bug discovered
+
+`eval([] as [&Array; 0])` — used to flush GPU work after `prefill_text` — is a
+**no-op** in MLX. `mlx_eval` with an empty `VectorArray` enqueues no Metal work
+and returns immediately. Consequence: the 2.2 ms "prefix" measures only CPU-side
+Metal command encoding (graph build + dispatch latency), not GPU execution time.
+The actual prefix computation executes inside the continuation prefill's wall time.
+
+This doesn't change the conclusion — it reveals the overlap implementation would
+need a real flush (eval on the returned logits array, not on `[]`) to work as
+designed — but the deeper finding stands:
+
+### Why this doesn't ship
+
+1. **Wrong accelerator for this ViT.** E4B's 576-patch / hidden-768 ViT runs at
+   28 ms on GPU (`CpuAndGpu`). There's nothing to gain from hiding it — 28 ms is
+   already 15% of a 188 ms TTFT. Even a perfect hide-to-zero save is 15%.
+
+2. **The split path has inherent overhead.** `prefill_text` calls
+   `forward_last_logits`, which runs the full lm_head matmul on prefix tokens.
+   That computation doesn't happen in the sync path (which runs `prefill_multimodal`
+   once over the full sequence). For a 140-token prefix at E4B's scale, this is a
+   real penalty that partially cancels the overlap benefit.
+
+3. **Long prefix doesn't help either.** With a broken eval the overlap provides no
+   measurable benefit at any prefix length tested.
+
+### What would make this viable
+
+The overlap approach is architecturally sound but needs three conditions to pay off:
+- **Small ViT (≤200 patches)**: ANE runs at 6 ms (vit-base/196 patches RESULTS.md
+  table). GPU prefill of 140 prefix tokens ≈ 130 ms → ANE fully hidden, net save
+  ≈ 6 ms.
+- **Fixed eval call**: Replace `eval([] as [&Array; 0])` with `eval([&prefix_logits])?`
+  to correctly fence GPU work.
+- **Prefix-only forward** (avoid lm_head on prefix): add a `forward_no_logits`
+  method that skips the final `lm_head` matmul and returns only the residual stream.
+  Cuts prefix cost by ~20% (lm_head is ~single large matmul).
+
+### Decision: CLOSE for E4B; infrastructure retained
+
+The async-overlap vision carve-out does **not ship** for `gemma-4-e4b-it` at its
+current 576-patch ViT size. The decision matrix from the 768² retrace section
+(ANE-768→GPU at 1.06× speedup) remains the production recommendation.
+
+Infrastructure built on this branch that is worth keeping:
+
+| Artifact | Value |
+|----------|-------|
+| `ComputeUnits::recommended_for(patches, hidden)` | Empirical dispatch policy |
+| Manifest `recommended_units` field + reader | Runtime unit selection from sidecar |
+| `--parity-check` bench mode | Cosine-sim ANE vs MLX ViT validation |
+| `--overlap` bench mode | Correct scaffold for future small-ViT experiment |
+| `convert_qwen3_asr_encoder.py` | ANE-eligible (13 tokens, conv-dominated) |
+| `--enumerated-sizes` converter flag | Multi-res per-size mlpackages |
+
+Re-open if: a model family ships with a small ViT (≤200 patches) where ANE
+delivers its 3–7× advantage and the token-count-match constraint doesn't push
+resolution above the ANE-sweet-spot boundary.
+
+## Qwen3-ASR encoder bench (2026-06-10)
+
+Bench: `qwen3-asr-mlx/examples/asr_ane_bench.rs`.
+Model: `models/qwen3-asr-1.7b` (8-bit Q, 1.7B params).
+Conversion: `ane-vit/converters/convert_qwen3_asr_encoder.py` (standalone
+safetensors loader, no transformers runtime required).
+Shape: `[1, 128, 100]` mel chunk → `[13, 2048]` audio tokens. 16 iters after warmup.
+
+### Results (single 100-frame chunk, 13 audio tokens out)
+
+| Path                         | mean (ms) | p50  | min   | max   |
+|------------------------------|-----------|------|-------|-------|
+| MLX Metal/GPU (baseline)     | 14.02     | 13.77| 13.56 | 16.02 |
+| Core ML `cpuAndNeuralEngine` | 10.89     | 10.88| 10.77 | 11.25 |
+| **Core ML `cpuAndGpu`** ⭐   | **7.91**  | 7.62 | 7.36  | 10.57 |
+| Core ML `cpuOnly`            | 75.44     | 72.91| 70.86 | 111.28|
+
+Core ML `cpuAndGpu` wins: **1.8× faster than MLX**, 1.4× faster than ANE.
+
+`cpuAndNeuralEngine` loses to GPU despite only 13 tokens. The encoder
+hidden_size is 1024 (above the empirical 768 threshold from ViT benches),
+and 24 attention layers of 16-head SDPA over 13 tokens is still enough
+compute to keep the GPU ahead of ANE. The `recommended_for` heuristic
+(≤200 patches AND ≤768 hidden → ANE) correctly predicts this result.
+
+### Streaming overlap verdict: FULLY HIDDEN ✓
+
+In a streaming ASR pipeline the encoder for chunk N+1 runs on Core ML
+while the text decoder processes chunk N's output. The overlap window is:
+
+```
+Text decode speed:          ~60 tok/s → 16.7 ms/tok
+Typical text tokens/chunk:  ~4        → 66.7 ms decode window
+Core ML encode (cpuAndGpu): 7.91 ms
+→ FULLY HIDDEN (7.9 ms < 66.7 ms decode window)
+Min speech density required: 0.5 text tokens/chunk (~28 tok/s speech)
+```
+
+The 0.5 tok/chunk threshold is well below any real speech signal — this
+overlap is unconditionally free in practice. Parallel encode + decode
+reduces per-chunk latency by ~(14ms / (14ms + 66ms)) ≈ 17%, or ~6 ms per
+chunk, entirely from moving the encode off the GPU decode-critical path.
+
+### Dispatch recommendation
+
+Use `CpuAndGpu` for Qwen3-ASR chunk encoding (updated in the manifest
+sidecar). Converter default stays `cpuAndNeuralEngine` to preserve the
+original ANE-target package; specify `--ane-units gpu` at runtime or read
+the manifest `recommended_units` field.
+
+### Parity check (pending)
+
+The converter was built from the architecture in `qwen3-asr-mlx/src/encoder.rs`
+without a Python reference model, so a cosine-similarity parity check between
+the MLX and Core ML encode paths is still outstanding. Add `--parity` to
+`asr_ane_bench` (cf. the `--parity-check` mode in `vit_ttft_bench.rs`) before
+using the Core ML path in a production transcription pipeline.
+
 ## Files added on `spike/ane-vit`
 
 - `ane-vit-spike/README.md` — spike scope + architecture

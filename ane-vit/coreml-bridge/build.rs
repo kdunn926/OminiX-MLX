@@ -82,8 +82,25 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=swiftCore");
     println!("cargo:rustc-link-lib=dylib=swiftFoundation");
     println!("cargo:rustc-link-lib=dylib=objc");
-    // Path to Swift toolchain's runtime libs.
-    let toolchain_lib = "/Library/Developer/CommandLineTools/usr/lib/swift/macosx";
+    // Path to Swift toolchain's runtime libs — derive from the active
+    // toolchain (`xcode-select` may point at either the Command Line
+    // Tools or a full Xcode.app; hardcoding the CLT path broke the link
+    // under Xcode toolchains).
+    let toolchain_lib = Command::new("xcrun")
+        .args(["--find", "swiftc"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|p| {
+            // .../usr/bin/swiftc → .../usr/lib/swift/macosx
+            let swiftc = std::path::PathBuf::from(p.trim());
+            let usr = swiftc.parent()?.parent()?.to_path_buf();
+            Some(usr.join("lib/swift/macosx").display().to_string())
+        })
+        .unwrap_or_else(|| {
+            "/Library/Developer/CommandLineTools/usr/lib/swift/macosx".to_string()
+        });
     println!("cargo:rustc-link-search=native={}", toolchain_lib);
     println!(
         "cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift,-rpath,{}",

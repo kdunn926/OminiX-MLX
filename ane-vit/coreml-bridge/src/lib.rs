@@ -19,6 +19,8 @@ pub enum CoreMlError {
     Path(String),
     #[error("output buffer too small: needed {needed}, had {had}")]
     BufferTooSmall { needed: usize, had: usize },
+    #[error("input length {given} does not match the model's input size")]
+    InputSizeMismatch { given: usize },
     #[error("not supported on this platform")]
     Unsupported,
 }
@@ -27,13 +29,33 @@ pub enum CoreMlError {
 /// macOS 14+ "neural-engine-preferred" variant we map to
 /// `.cpuAndNeuralEngine` (Core ML has no `.neuralEngineOnly`).
 #[repr(i32)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeUnits {
     All = 0,
     CpuOnly = 1,
     CpuAndGpu = 2,
     CpuAndNeuralEngine = 3,
     NeuralEnginePreferred = 4,
+}
+
+impl ComputeUnits {
+    /// Empirically-recommended compute units for a ViT workload.
+    ///
+    /// Derived from benches in `ane-vit/RESULTS.md`:
+    /// - `patch_count ≤ 200` AND `hidden_size ≤ 768` → ANE wins (~3.4× over GPU,
+    ///   e.g. ViT-base/224 at 197 patches / hidden 768).
+    /// - Larger ViTs → `CpuAndGpu` wins decisively (Gemma4-VL 576 patches: GPU
+    ///   1.8× faster; 768² ViT: GPU 4.2× faster).
+    ///
+    /// `ComputeUnits::All` (Core ML auto-dispatch) is NOT returned: empirically
+    /// it misroutes large ViTs to ANE and produces the worst latency.
+    pub fn recommended_for(patch_count: usize, hidden_size: usize) -> Self {
+        if patch_count <= 200 && hidden_size <= 768 {
+            Self::CpuAndNeuralEngine
+        } else {
+            Self::CpuAndGpu
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -120,6 +142,7 @@ impl CoreMlModel {
                     needed: actual as usize,
                     had: out.len(),
                 }),
+                -10 => Err(CoreMlError::InputSizeMismatch { given: pixels.len() }),
                 code => Err(CoreMlError::Predict(code)),
             }
         }
@@ -148,6 +171,7 @@ impl CoreMlModel {
                     needed: actual as usize,
                     had: out.len(),
                 }),
+                -10 => Err(CoreMlError::InputSizeMismatch { given: pixels.len() }),
                 code => Err(CoreMlError::Predict(code)),
             }
         }
