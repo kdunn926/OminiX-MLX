@@ -53,15 +53,7 @@ fn hann_window(size: i32) -> Array {
     Array::from_slice(&window, &[size])
 }
 
-/// Convert frequency to mel scale
-fn hz_to_mel(freq: f32) -> f32 {
-    2595.0 * (1.0 + freq / 700.0).log10()
-}
-
-/// Convert mel to frequency
-fn mel_to_hz(mel: f32) -> f32 {
-    700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
-}
+use mlx_rs_core::audio::{hz_to_mel, mel_to_hz};
 
 /// Create mel filterbank matrix
 ///

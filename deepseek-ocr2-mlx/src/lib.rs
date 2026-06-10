@@ -769,14 +769,8 @@ impl Iterator for Generate<'_> {
 }
 
 pub fn sample(logits: &Array, temp: f32) -> std::result::Result<Array, Exception> {
-    let token = if temp == 0.0 {
-        mlx_rs::argmax_axis!(logits, -1)?
-    } else {
-        let scaled = logits.multiply(array!(1.0 / temp))?;
-        mlx_rs::categorical!(&scaled)?
-    };
     // argmax/categorical return uint32, cast to int32 for consistency
-    token.as_dtype(Dtype::Int32)
+    mlx_rs_core::sampler::sample(logits, temp)?.as_dtype(Dtype::Int32)
 }
 
 // ============================================================================

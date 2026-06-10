@@ -107,7 +107,17 @@ impl Qwen36TargetAdapter {
         // path drives only L=1 decode steps when running outside of the
         // multi-token verify burst; multi-token verify (L > 1) falls
         // back to the standard SDPA path inside `GatedAttention`.
-        let kv_cache_mode = if std::env::var("TURBO_KV").is_ok() {
+        let paged = matches!(
+            std::env::var("OMINIX_PAGED_ATTENTION").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        let kv_cache_mode = if paged {
+            // Paged full-attention KV (per-layer pools). Speculative rollback is
+            // CoW-safe: `verify_snapshot.clone()` forks the block tables, so a
+            // verify burst's appends copy-on-write rather than clobbering the
+            // snapshot; `trim_gdn` → `PagedKvCache::trim_kv` rewinds the offset.
+            KVCacheMode::Paged
+        } else if std::env::var("TURBO_KV").is_ok() {
             KVCacheMode::TurboQuant
         } else {
             KVCacheMode::Standard

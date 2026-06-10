@@ -21,7 +21,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{argmax_axis, Array};
 use qwen3_6_mlx::{HybridCache, Model};
 
-use crate::acceptance::{accept_speculative, default_rng, AcceptanceMode};
+use crate::acceptance::{accept_greedy, accept_speculative, default_rng, AcceptanceMode};
 use crate::graph_bank::{GraphBank, GraphKey};
 use crate::MtpError;
 
@@ -268,6 +268,7 @@ impl MtplxSession {
         // Step 0 anchors on the target's hidden + embed(ar_next).
         // Step i (i>=1) anchors on MTP's own pre-norm hidden + embed(d_{i-1}).
         let mut drafted: Vec<i32> = Vec::with_capacity(k);
+        let mut draft_logit_rows: Vec<Array> = Vec::with_capacity(k);
         let mut mtp_pre_hidden = hidden.clone();
         let mut next_embed_token = ar_next;
         for _ in 0..k {
@@ -290,19 +291,20 @@ impl MtplxSession {
                 }
             };
             let d = argmax_id(&mtp_logits)?;
+            draft_logit_rows.push(mtp_logits); // [1, V], kept for speculative accept
             drafted.push(d);
             mtp_pre_hidden = pre;
             next_embed_token = d;
         }
 
-        // Step 3: target verify on K tokens: [ar_next, d_0, ..., d_{K-2}].
-        // The K-th draft (d_{K-1}) doesn't need to be in the input — we
-        // only verify K positions, each predicting the next slot.
-        let mut verify_tokens: Vec<i32> = Vec::with_capacity(k);
+        // Step 3: target verify on K+1 tokens [ar_next, d_0, ..., d_{K-1}].
+        // Position j predicts the successor of input token j, so positions
+        // 0..K verify drafted[0..K] (the last draft d_{K-1} is now included —
+        // it was previously dropped, leaving it accepted unverified) and
+        // position K is the bonus distribution used on full acceptance.
+        let mut verify_tokens: Vec<i32> = Vec::with_capacity(k + 1);
         verify_tokens.push(ar_next);
-        for d in drafted.iter().take(k - 1) {
-            verify_tokens.push(*d);
-        }
+        verify_tokens.extend_from_slice(&drafted);
         let verify_in =
             Array::from_slice(&verify_tokens, &[1, verify_tokens.len() as i32]);
         let verify_key = GraphKey::new(
@@ -310,55 +312,71 @@ impl MtplxSession {
             GraphKey::shape_sig_for(&[&verify_in]),
         );
         self.graph_bank.observe(&verify_key);
-        // forward returns per-position logits [B, T, V].
-        let verify_logits_full = self.model.forward(&verify_in, cache)?;
+        // Verify forward returns per-position logits [B, K+1, V] AND a per-layer
+        // rollback snapshot. The snapshots let recurrent (GDN) layers roll back
+        // on rejection — `HybridCache::trim` is a no-op for them, which would
+        // otherwise leave GDN state advanced past the accepted prefix while KV
+        // layers are trimmed (silent corruption).
+        let (verify_logits_full, gdn_snapshots) =
+            self.model.forward_verify_with_snapshots(&verify_in, cache)?;
+        let vocab = *verify_logits_full
+            .shape()
+            .last()
+            .expect("logits have a vocab axis");
 
-        // Walk: find first j where target's argmax at logit position j
-        // does not match drafted[j]. Accept j drafts + 1 correction.
-        let mut n_accepted: usize = 0;
-        let mut correction: i32 = ar_next; // unused fallback
-        for j in 0..k {
-            let pos_logits = verify_logits_full.index((.., j as i32, ..));
-            let target_at = argmax_id(&pos_logits)?;
-            let d = drafted[j];
-            let accept = target_at == d;
-            if std::env::var("MTPLX_DEBUG_ACCEPT").is_ok() {
-                eprintln!(
-                    "[mtp-dbg] cycle (k={k}) j={j} drafted={d} target={target_at} {}",
-                    if accept { "ACCEPT" } else { "REJECT" }
-                );
-            }
-            if accept {
-                n_accepted += 1;
-            } else {
-                correction = target_at;
-                break;
-            }
-        }
-
-        // Roll back caches by the rejected count.
-        //  Target cache: verify appended K positions ([ar_next, d_0..d_{K-2}]).
-        //  We keep n_accepted accepted-prefix slots; trim (K - n_accepted) - 0_if_full_accept.
-        //    - if n_accepted == K (full accept): keep all K verify positions.
-        //    - if n_accepted == j < K: keep ar_next + d_0..d_{j-1} = j+1 positions.
-        //  Trim count = verify_len - kept = K - (n_accepted_corrected).
-        let verify_len = verify_tokens.len() as i32;
-        let target_keep: i32 = if n_accepted == k {
-            verify_len
+        // Acceptance. Greedy (or T=0) compares argmaxes; Speculative applies
+        // Leviathan-Chen probability-ratio acceptance with residual `(p-q)+`
+        // correction, preserving the target distribution at temperature.
+        let drafted_u32: Vec<u32> = drafted.iter().map(|&d| d as u32).collect();
+        let result = if matches!(self.cfg.acceptance, AcceptanceMode::Greedy)
+            || self.cfg.temp <= 0.0
+        {
+            // Rows 0..K predict drafted[0..K]; row K is the bonus.
+            let target_k = verify_logits_full
+                .index((.., ..k as i32, ..))
+                .reshape(&[k as i32, vocab])?;
+            let bonus = argmax_id(&verify_logits_full.index((.., k as i32, ..)))? as u32;
+            accept_greedy(&target_k, &drafted_u32, bonus)?
         } else {
-            // ar_next + n_accepted drafts cached; correction not yet cached.
-            (n_accepted as i32) + 1
+            let target_2d = verify_logits_full.reshape(&[(k + 1) as i32, vocab])?;
+            let draft_refs: Vec<&Array> = draft_logit_rows.iter().collect();
+            let draft_2d = mlx_rs::ops::concatenate_axis(&draft_refs, 0)?;
+            accept_speculative(
+                &target_2d,
+                &draft_2d,
+                &drafted_u32,
+                self.cfg.temp,
+                default_rng,
+            )?
         };
-        let target_trim = verify_len - target_keep;
+        let n_accepted = result.accepted.len();
+
+        if std::env::var("MTPLX_DEBUG_ACCEPT").is_ok() {
+            eprintln!(
+                "[mtp-dbg] k={k} accepted={n_accepted} all={} correction={}",
+                result.all_accepted, result.correction
+            );
+        }
+
+        // Roll back caches by the rejected count. Verify appended K+1 positions
+        // ([ar_next, d_0..d_{K-1}]); the kept prefix is ar_next plus the
+        // n_accepted accepted drafts (1 + n_accepted positions). The
+        // correction/bonus token is committed as the next anchor and appended
+        // by the next cycle, so it is not in the cache yet.
+        let verify_len = verify_tokens.len() as i32; // K + 1
+        let target_keep = 1 + n_accepted as i32;
+        let target_trim = verify_len - target_keep; // == K - n_accepted
         if target_trim > 0 {
-            for c in cache.iter_mut() {
-                let _ = c.trim(target_trim);
+            // Full-attention layers drop trailing KV; recurrent (GDN) layers
+            // replay the accepted-prefix tape from the captured snapshot.
+            // Errors propagate instead of being swallowed (the previous `let _`
+            // hid the GDN no-op and the QuantizedKV "not implemented").
+            for (c, snap) in cache.iter_mut().zip(gdn_snapshots.iter()) {
+                c.trim_gdn(target_trim, verify_len, snap.as_ref())?;
             }
         }
 
-        // MTP cache: appended k positions. Keep n_accepted positions; trim
-        // (k - n_accepted). When n_accepted == k we keep all — the next
-        // cycle's draft step 0 will pick up from MTP cache offset k.
+        // MTP cache: appended k positions. Keep n_accepted; trim the rest.
         let mtp_trim = (k - n_accepted) as i32;
         if mtp_trim > 0 {
             if let Some(mtp) = self.model.mtp_head() {
@@ -366,27 +384,15 @@ impl MtplxSession {
             }
         }
 
-        // Assemble committed tokens.
-        // - ar_next is always committed.
-        // - n_accepted drafted tokens follow.
-        // - If full accept: next_anchor = d_{K-1} (last drafted, kept).
-        //   Otherwise: next_anchor = correction.
+        // Assemble committed tokens: ar_next (always) + accepted drafts. The
+        // correction (residual sample on rejection, or bonus target sample on
+        // full acceptance) becomes the next cycle's anchor.
         let mut extra: Vec<i32> = Vec::with_capacity(n_accepted + 1);
         extra.push(ar_next);
-        for j in 0..n_accepted.saturating_sub(if n_accepted == k { 1 } else { 0 }) {
-            extra.push(drafted[j]);
+        for a in &result.accepted {
+            extra.push(*a as i32);
         }
-        let next_anchor = if n_accepted == k {
-            // All accepted: last draft becomes the anchor; its KV is in
-            // target cache so next cycle's step-1 forward will re-prefill
-            // it (slight redundancy but simpler than threading it through).
-            // Actually — we just kept it in target KV via verify's append
-            // of [ar_next, d_0..d_{K-2}], so d_{K-1} is NOT in cache yet.
-            // Use it as anchor; next cycle will append it.
-            drafted[k - 1]
-        } else {
-            correction
-        };
+        let next_anchor = result.correction as i32;
 
         Ok((extra, next_anchor, k, n_accepted))
     }

@@ -49,7 +49,224 @@ this graph.
    (`dataType=65552`). The Swift shim widens via `vImage` Accelerate
    routine; Rust callers see fp32 as expected.
 
-## Qwen3-VL conversion attempt (deferred)
+## Qwen3-VL conversion (LANDED 2026-05-21)
+
+Successfully converted `Qwen/Qwen3-VL-2B-Instruct` vision tower to
+`qwen3-vl-2b-vit.mlpackage` (582 MB, float16). Five
+architecture-specific tracing blockers resolved in sequence:
+
+1. ✅ Pre-patchified input shape — added inline patchifier wrapper.
+2. ✅ Deepstack list-of-tensors output — `deepstack_visual_indexes = []`.
+3. ✅ BaseModelOutputWithPooling unpacking — wrapper returns
+   `out.last_hidden_state`.
+4. ✅ Windowed-attention `cu_seqlens.tolist()` Python loop —
+   monkey-patched `Qwen3VLVisionAttention.forward` to a single full
+   SDPA (semantically equivalent for the single-image square case).
+5. ✅ Mixed-dtype stack op from `transformers.vision_utils` —
+   `get_vision_bilinear_indices_and_weights`, `get_vision_position_ids`,
+   `get_vision_cu_seqlens` all `tolist()`-iterate and build
+   `[int, float, float, float]` stacks. Fixed by rebinding the module-level
+   helpers in `modeling_qwen3_vl` to return precomputed constants
+   for the fixed input shape.
+
+### Bench (Qwen3-VL ViT, 448×448, 16 iters)
+
+| Compute units                | Mean (ms) | p50 (ms) | p99 (ms) |
+|------------------------------|-----------|----------|----------|
+| `cpuOnly`                    | 734       | 732      | 780      |
+| `cpuAndNeuralEngine`         | 341       | 341      | 346      |
+| `all` (auto, lands on GPU)   | 221       | 221      | 226      |
+| **`cpuAndGpu`** ⭐           | **165**   | **165**  | **168**  |
+
+Unlike the small ViT-base/224 case (where ANE was 6.7× faster than CPU
+and 3.4× over GPU), the bigger Qwen3-VL ViT (hidden=4096, 784 patches,
+24 layers) lands fastest on GPU. ANE still beats CPU 2.2× but loses to
+GPU 2.1×. Suspected reason: the windowed-attention bypass + a few ops
+that don't pattern-match ANE tiles force partial CPU fallback that
+breaks ANE's pipelined-layer execution. Practical implication:
+**dispatch Qwen3-VL ViT to `CpuAndGpu`, not `CpuAndNeuralEngine`** —
+the `VisionTowerClass::Qwen36Vl` selector in `engines/ane_vision.rs`
+should encode this.
+
+## Gemma4-VL conversion (LANDED 2026-05-21)
+
+Successfully converted `google/gemma-4-E4B-it` vision tower to
+`gemma4-e4b-vit.mlpackage` (291 MB, float16). Three model-specific
+tracing fixes:
+
+1. ✅ `F.one_hot` on fp32 indices — coremltools doesn't preserve
+   int64 through `.clamp(min=0)`. Precomputed
+   `patch_embedder._position_embeddings(fixed_pos, fake_padding)`
+   for the fixed grid and rebound the method to return the constant.
+2. ✅ `pooler._avg_pool_by_positions` (same one_hot blocker) —
+   precomputed the pooling weight matrix + mask, rebound the method.
+3. ✅ `create_bidirectional_mask` uses `attention_mask.new_ones(...)`
+   which has no coremltools translator. Replaced the encoder.forward
+   to call layers with `attention_mask=None` (no padding case = attend
+   to everything).
+4. ✅ Skipped data-dependent `hidden_states[pooler_mask]` slice
+   (all-True mask in the no-padding case) and dataclass return.
+
+### Bench (Gemma4-VL ViT, 384×384, 16 iters)
+
+| Compute units                | Mean (ms) | p50 (ms) | p99 (ms) |
+|------------------------------|-----------|----------|----------|
+| `cpuOnly`                    | 183       | 179      | 196      |
+| `cpuAndNeuralEngine`         | 51        | 51       | 51       |
+| `all` (auto, lands on ANE)   | 51        | 51       | 51       |
+| **`cpuAndGpu`** ⭐           | **29**    | **28**   | **31**   |
+
+Smaller than Qwen3-VL (hidden=768 vs 4096) but same dispatch
+verdict: **GPU wins on the multimodal-LLM-sized ViT class**.
+ANE 3.6× over CPU; GPU 6.3× over CPU and 1.8× over ANE.
+`VisionTowerClass::Gemma4Vl` selector should dispatch to
+`CpuAndGpu`.
+
+## End-to-end TTFT (MLX baseline, Gemma4-VL E4B, 2026-05-22)
+
+Bench: `gemma4-mlx/examples/vit_ttft_bench.rs` with
+`models/gemma-4-E4B-it` and a 230 KB PNG. Each iter runs:
+1. `model.encode_image_bytes(bytes)` — preprocess + ViT forward +
+   `embed_vision` projection.
+2. `model.prefill_multimodal(input_ids, visual_features, &mut cache)` —
+   text+image embed scatter + full LLM prefill via lm_head.
+3. Greedy argmax of the last-position logits.
+
+| Stage             | mean (ms) | p50 (ms) | note |
+|-------------------|-----------|----------|------|
+| vision encode     | 283       | 278      | 255 soft tokens (variable-res, ~768×768 internal) |
+| LLM prefill       | 1 653     | 1 648    | 283 prompt tokens total (28 text + 255 image) |
+| **Total TTFT**    | **1 936** | **1 927**| 5 iters after warmup |
+| vision share      | 14.6%     | —        | of TTFT |
+
+### Why this matters for the ANE comparison
+
+The ANE/GPU mlpackage stays fixed at 384×384 → 64 soft tokens. The MLX
+production path scales the same input image up to ~768×768 → 256 soft
+tokens (4× more visual tokens fed into the LLM prefill). So a naive
+"swap ANE for MLX vision" save is double-edged:
+
+- **Vision-stage save** (apples-to-apples at the ViT cost):
+  283 ms → 29 ms (GPU mlpackage) = **−254 ms / −13% TTFT**.
+- **Soft-token count save** (much larger): going from 255 → 64 image
+  tokens shrinks prefill from 1 653 ms to an extrapolated
+  ~537 ms (linear in seq len, 4× fewer image tokens) = **−1 116 ms
+  / −58% TTFT**.
+- Total projected ANE-path TTFT ≈ 29 + 537 + 22 = **~588 ms (3.3× faster)** —
+  but with a real quality loss (4× fewer visual tokens, accuracy not
+  validated).
+
+To get the "ANE-path latency win with no quality loss" number we'd
+need a second mlpackage traced at 768×768 fixed (→ 256 soft tokens).
+That ViT call would be ~4× the ANE/GPU work (~120 ms on GPU
+extrapolated) but the LLM prefill stays at MLX-baseline length.
+Projected TTFT: 120 + 1 653 + 22 ≈ **1 795 ms (1.08× faster)** — a
+real but modest win driven entirely by the vision delta. Tighter
+overlap (async vision + prefill) would amortize the vision cost
+further but doesn't help bandwidth-bound prefill.
+
+### Decision matrix
+
+| Want                          | Use                                         |
+|-------------------------------|---------------------------------------------|
+| Best TTFT, lossy is OK        | ANE-path at 384, 64 tokens (~3.3× faster)   |
+| Best TTFT, no quality loss    | ANE-path at 768, 256 tokens (~1.08× faster) |
+| Best accuracy                 | Current MLX path                            |
+| Best TTFT *and* accuracy      | Overlap MLX vision with prefill (async pipeline; future work) |
+
+## End-to-end TTFT wired through ANE (2026-05-22)
+
+Spike branch `spike/async-vision-prefill` now drives the MLX
+`embed_vision` projection from the converted Gemma4-VL mlpackage's
+output, replacing the MLX vision tower. Bench
+`gemma4-mlx/examples/vit_ttft_bench.rs` with `--ane <mlpackage>` and
+`--ane-units {gpu|ane|cpu|all}`.
+
+### Three-way A/B (gemma-4-E4B-it, img1.png, 5 iters)
+
+| Path                                  | vision  | prefill (tokens) | **TTFT**  | first  |
+|---------------------------------------|---------|------------------|-----------|--------|
+| MLX baseline (255 soft tokens, ~768²) | 300 ms  | 1 710 ms (283)   | **2 011** | "This" |
+| **ANE→GPU** (64 soft tokens, 384²) ⭐ | 30 ms   | 513 ms (92)      | **544**   | "The"  |
+| ANE→ANE (64 soft tokens, 384²)        | 54 ms   | 511 ms (92)      | 566       | "Please" |
+
+**3.7× faster TTFT, 1.47 s saved**. Vision delta is 270 ms; prefill
+delta is 1 197 ms. Confirms the central finding: **soft-token count
+dominates which-accelerator choice**. The image-token positions in
+the LLM prefill scale linearly (~6 ms each on E4B prefill at this
+context length), so cutting image tokens 4× saves ~5× more wall time
+than the ViT speedup does.
+
+### Accuracy caveats
+
+- First tokens diverge across all three paths ("This" / "The" /
+  "Please") — same prompt, different visual encodings. The 384/64 ANE
+  path is a real lossy trade, not just a latency one.
+- ANE→GPU and ANE→ANE produce different first tokens from the *same*
+  mlpackage. Known Core ML quirk: compute-unit backends have small
+  numerical deltas that propagate into the downstream LLM.
+- For an accuracy-preserving comparison, need a second mlpackage
+  traced at 768×768 / 256 soft tokens. Projected TTFT for that
+  retrace ≈ 1 760 ms (~13% faster vs MLX baseline) — modest gain
+  because prefill (not vision) dominates when image-token counts are
+  matched.
+
+### 768²/256-token retrace (measured 2026-05-22)
+
+Second mlpackage `gemma4-e4b-vit-768.mlpackage` (295 MB, fp16,
+`--image-size 768`) for accuracy-preserving comparison. Same bench,
+5 iters each:
+
+| Path                              | vision   | prefill    | **TTFT**    | first  |
+|-----------------------------------|----------|------------|-------------|--------|
+| ANE-768→**GPU** ⭐                | 138 ms   | 1 753 ms   | **1 891**   | "The"  |
+| ANE-768→ANE                       | 578 ms   | 1 753 ms   | 2 330       | "I"    |
+| ANE-768→All (auto picks ANE)      | 571 ms   | 1 741 ms   | 2 311       | "I"    |
+
+**1.06× faster vs MLX baseline, ~120 ms saved.** Matches the
+1.08× projection. Findings:
+
+1. **ANE compute unit collapses at this shape.** 578 ms on ANE vs
+   138 ms on GPU (4.2× slower). Hidden=4096-class ViT at 768²
+   falls off ANE's tile sweet spot — same pattern as Qwen3-VL ViT.
+   Core ML's `all` policy auto-picks ANE → 2 311 ms TTFT, so
+   leaving dispatch on auto actively *hurts*. **Empirical winner
+   at scale is `cpuAndGpu`**; the per-class dispatch policy in
+   `ane_vision.rs` already encodes this.
+2. **First token still diverges from MLX** ("The" vs "This") even
+   with matched 256-token count. Two contributors: (a) Core ML's
+   fp16 GPU kernels aren't bit-identical to MLX's bf16 ViT
+   implementation, (b) preprocess differs — MLX preserves aspect
+   ratio (img1 → ~816×720 grid); the converter squashes to fixed
+   768×768 to keep the traced graph static-shape. The retrace
+   closes the *capacity* gap but not the *fidelity* gap.
+
+### Decision matrix (final)
+
+| Want                            | Use                                            | Expected TTFT |
+|---------------------------------|------------------------------------------------|---------------|
+| Best TTFT, lossy is OK          | ANE-384→GPU (3.7× faster)                      | ~544 ms       |
+| Best TTFT, matched token count  | ANE-768→GPU (1.06× faster)                     | ~1 891 ms     |
+| Best accuracy                   | MLX baseline                                   | ~2 011 ms     |
+| Worst-case                      | ANE-768→ANE (Core ML auto)                     | ~2 330 ms     |
+
+The 1.06× retrace win is modest because prefill (1.7 s) dwarfs the
+vision delta. Three follow-ups would change the picture:
+
+- **Background-thread ANE call**: if the 138 ms ANE-768 prediction
+  runs while MLX builds prefill chunk 0, vision cost effectively
+  → 0 ms, projecting ~1 750 ms TTFT (1.15× faster). Needs
+  `std::thread::spawn` + `mpsc::channel` for the FFI call;
+  CoreMlModel is `Send` (Swift's `MLModel` is thread-safe for
+  prediction).
+- **Variable-resolution mlpackage**: re-trace with a few discrete
+  resolutions (e.g. 768×768, 768×576, 576×768) and dispatch by
+  aspect ratio to close the preprocess fidelity gap.
+- **Quantize the LLM prefill path**: this is where the win lives
+  for image-heavy prompts. Image tokens cost ~6 ms each on E4B
+  prefill; reducing prefill ms/token is the broadest lever.
+
+## Earlier Qwen3-VL attempt (superseded by the LANDED section above)
 
 Tried `Qwen/Qwen3-VL-2B-Instruct` via `convert_qwen3_vl_vit.py`. Hit four
 architecture-specific tracing blockers in sequence:

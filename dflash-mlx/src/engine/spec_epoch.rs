@@ -357,24 +357,6 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                     return Some(Err(err));
                 }
             };
-            let posterior =
-                match argmax_axis!(&verify_logits, -1).and_then(|a| a.as_dtype(Dtype::Uint32)) {
-                    Ok(tokens) => tokens,
-                    Err(err) => {
-                        finished = true;
-                        return Some(Err(err.into()));
-                    }
-                };
-            let posterior_tokens = posterior.index((0, ..drafted_count as i32));
-
-            let n_accepted = match match_acceptance_length(&drafted_tokens, &posterior_tokens) {
-                Ok(n) => n,
-                Err(err) => {
-                    finished = true;
-                    return Some(Err(err));
-                }
-            };
-
             let drafted_vec = match array_to_vec_u32(&drafted_tokens) {
                 Ok(tokens) => tokens,
                 Err(err) => {
@@ -382,16 +364,38 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                     return Some(Err(err));
                 }
             };
-            for token in drafted_vec.iter().take(n_accepted) {
-                pending.push_back(Ok(*token));
-            }
 
-            let target_token = if n_accepted < drafted_count {
-                let correction_logits = verify_logits.index((.., n_accepted as i32, ..));
+            // Acceptance. At T=0 use greedy longest-prefix matching (accepted
+            // tokens == target argmax). At T>0 use distribution-preserving
+            // speculative acceptance: accept drafted[i] with probability
+            // p_i(drafted[i]) and sample the correction from the residual, so
+            // the committed tokens follow the target distribution rather than
+            // the argmax (greedy accept + tempered correction was biased).
+            let (n_accepted, target_token) = if temp <= 0.0 {
+                let posterior = match argmax_axis!(&verify_logits, -1)
+                    .and_then(|a| a.as_dtype(Dtype::Uint32))
+                {
+                    Ok(tokens) => tokens,
+                    Err(err) => {
+                        finished = true;
+                        return Some(Err(err.into()));
+                    }
+                };
+                let posterior_tokens = posterior.index((0, ..drafted_count as i32));
+                let n = match match_acceptance_length(&drafted_tokens, &posterior_tokens) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        finished = true;
+                        return Some(Err(err));
+                    }
+                };
+                // Correction at the reject slot, or the bonus slot on full accept.
+                let corr_idx = if n < drafted_count { n } else { drafted_count } as i32;
+                let corr_logits = verify_logits.index((.., corr_idx, ..));
                 let token = match self
                     .target
-                    .sample(&correction_logits, temp)
-                    .and_then(|token| scalar_token(&token))
+                    .sample(&corr_logits, temp)
+                    .and_then(|t| scalar_token(&t))
                 {
                     Ok(token) => token,
                     Err(err) => {
@@ -399,41 +403,44 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                         return Some(Err(err));
                     }
                 };
-                if let Err(err) = self.draft.rollback(n_accepted) {
-                    finished = true;
-                    return Some(Err(err));
-                }
-                if let Err(err) = self.target.rollback_kv(1 + n_accepted) {
-                    finished = true;
-                    return Some(Err(err));
-                }
-                if let Some(h) = self.target.last_target_hidden() {
-                    self.draft.set_target_hidden(h);
-                }
-                token
+                (n, token)
             } else {
-                // Full acceptance: correction logit is at index drafted_count (the position
-                // after the last drafted token in verify_logits).
-                let correction_logits = verify_logits.index((.., drafted_count as i32, ..));
-                if let Err(err) = self.draft.rollback(n_accepted) {
-                    finished = true;
-                    return Some(Err(err));
-                }
-                if let Some(h) = self.target.last_target_hidden() {
-                    self.draft.set_target_hidden(h);
-                }
-                match self
-                    .target
-                    .sample(&correction_logits, temp)
-                    .and_then(|token| scalar_token(&token))
-                {
-                    Ok(token) => token,
+                let mut rng = crate::engine::acceptance::default_rng;
+                match crate::engine::acceptance::speculative_accept(
+                    &verify_logits,
+                    &drafted_vec,
+                    temp,
+                    &mut rng,
+                ) {
+                    Ok(res) => (res.n_accepted, res.correction),
                     Err(err) => {
                         finished = true;
                         return Some(Err(err));
                     }
                 }
             };
+
+            for token in drafted_vec.iter().take(n_accepted) {
+                pending.push_back(Ok(*token));
+            }
+
+            // Roll back the rejected draft suffix. The target's KV is trimmed
+            // only on a partial accept (full acceptance keeps all verify
+            // positions); the draft context is rolled back either way, then the
+            // post-rollback target hidden is handed to the drafter.
+            if let Err(err) = self.draft.rollback(n_accepted) {
+                finished = true;
+                return Some(Err(err));
+            }
+            if n_accepted < drafted_count {
+                if let Err(err) = self.target.rollback_kv(1 + n_accepted) {
+                    finished = true;
+                    return Some(Err(err));
+                }
+            }
+            if let Some(h) = self.target.last_target_hidden() {
+                self.draft.set_target_hidden(h);
+            }
             pending.push_back(Ok(target_token));
 
             // Extend the CopySpec index with everything that got committed
@@ -462,15 +469,12 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
             } else {
                 self.metrics.total_drafted as f32 / self.metrics.total_cycles as f32
             };
-            // v0.1.7 adaptive verify needs real per-cycle wall time so it
-            // can compare reduced vs probe throughput honestly. Force an
-            // eval on the just-pushed correction token so the timer
-            // reflects actual GPU work this cycle, not just MLX graph
-            // construction.
-            // (No-op when pending was already eval'd elsewhere.)
-            if let Some(Ok(t_arr)) = pending.back() {
-                let _ = t_arr;
-            }
+            // v0.1.7 adaptive verify needs real per-cycle wall time. This cycle's
+            // draft + verify GPU work is already forced before we get here:
+            // `array_to_vec_u32` (drafted tokens) and either `scalar_token` (greedy
+            // correction) or `speculative_accept`'s host-side softmax read all call
+            // `eval`/`as_slice`, which materialize the verify logits. So
+            // `cycle_wall_s` reflects real GPU work, not just MLX graph build.
             let cycle_wall_s = cycle_start
                 .map(|s| s.elapsed().as_secs_f32())
                 .unwrap_or(0.0);

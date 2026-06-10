@@ -26,7 +26,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use mlx_rs::{
-    array,
     builder::Builder,
     macros::ModuleParameters,
     module::{Module, Param},
@@ -443,14 +442,7 @@ pub fn normalize_siglip(img: &Array) -> Result<Array> {
 // Generation
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> std::result::Result<Array, mlx_rs::error::Exception> {
-    if temp == 0.0 {
-        mlx_rs::argmax_axis!(logits, -1)
-    } else {
-        let logits = logits.multiply(array!(1.0 / temp))?;
-        mlx_rs::categorical!(logits)
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 /// Token generator for VLM inference.
 pub struct Generate<'a, C> {

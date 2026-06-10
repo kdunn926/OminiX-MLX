@@ -12,9 +12,8 @@ use std::{
 };
 
 use mlx_rs::{
-    argmax_axis, array,
+    array,
     builder::Builder,
-    categorical,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt, Param},
@@ -1125,15 +1124,7 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
 // Generation
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
-        }
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,

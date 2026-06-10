@@ -55,7 +55,11 @@ where
 pub struct Gemma4Config {
     pub model_type: String,
     pub text_config: Gemma4TextConfig,
-    #[serde(default)]
+    // Tolerant: a `vision_config` whose schema this loader doesn't recognize
+    // (e.g. the `gemma4_unified_vision` variant uses `mm_embed_dim` instead of
+    // `hidden_size`) parses to `None`, so text-only `load_model` still works.
+    // `load_vl_model` will surface "Not a Gemma4-VL model: missing vision_config".
+    #[serde(default, deserialize_with = "vision_config_or_none")]
     pub vision_config: Option<Gemma4VisionConfig>,
     #[serde(default)]
     pub vision_soft_tokens_per_image: usize,
@@ -85,6 +89,19 @@ pub struct QuantizationConfig {
 
 fn default_quant_mode() -> String {
     "affine".to_string()
+}
+
+fn vision_config_or_none<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Gemma4VisionConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<Gemma4VisionConfig>(value).ok())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -618,9 +635,23 @@ where
             cache.update_and_fetch(new_k, new_v)?
         };
 
+        // Mask sizing must match the *physical* key length the cache returned,
+        // not the logical token count. For unbounded `KVCache` /
+        // `PagedKvCache` they're identical (default `physical_offset()` ==
+        // `offset()`), so this matches the legacy path of using `rope_offset`.
+        //
+        // For `SlidingKVCache` the physical buffer is capped at `window`
+        // even when `offset()` reports a much larger logical position —
+        // we must size the mask to `[L, physical_post]` where
+        // `physical_post = cache.physical_offset()` *after* the update,
+        // i.e. the length of the K tensor SDPA just received. The
+        // `create_causal_mask(L, past, window)` call builds a `[L, past+L]`
+        // mask, so we pass `past = physical_post - L`.
+        let physical_post = keys.shape()[2] as i32;
+        let mask_offset = physical_post - L;
         let sliding_mask = match (mask, self.sliding_window) {
             (None, Some(window)) => {
-                Some(create_causal_mask(L, Some(rope_offset), Some(window), None)?)
+                Some(create_causal_mask(L, Some(mask_offset), Some(window), None)?)
             }
             _ => None,
         };
@@ -638,6 +669,25 @@ where
         )?
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[B, L, -1])?;
+
+        // For sliding-window layers, bound the KV buffer to the last
+        // `window` entries now that SDPA has consumed it. No-op for any
+        // cache impl that didn't override `compact_to_last_n` (default
+        // returns Ok(())) — so unbounded `KVCache` / `PagedKvCache`
+        // behavior is unchanged. Only `SlidingKVCache` actually trims.
+        //
+        // Important: compaction MUST come after SDPA, never inside
+        // `update_and_fetch`. During chunked prefill (L > 1), the early
+        // queries in the chunk need to attend back into the previous
+        // `window - 1` cached positions; truncating before SDPA would
+        // drop the oldest `L` of those, leaving early queries with a
+        // shorter effective window than the model was trained on. By
+        // compacting *after*, the next forward starts with a clean
+        // `window`-bounded buffer while the current forward's SDPA saw
+        // the full `prev_window + L` keys.
+        if let Some(window) = self.sliding_window {
+            cache.compact_to_last_n(window)?;
+        }
 
         self.o_proj.forward(&output)
     }
@@ -2629,6 +2679,35 @@ impl Model {
         Ok(logits)
     }
 
+    /// Like [`Self::forward_from_embeds`] but returns the lm-head logits at
+    /// **every** input position (shape `[B, T, vocab]`) instead of only the
+    /// last. Used by prompt-lookup speculative decoding (PLD): the verify
+    /// step runs a `(committed_token, draft_1, …, draft_K)` sequence and
+    /// needs per-position logits so each drafted token can be compared
+    /// against the model's argmax at the previous position.
+    pub fn forward_all_logits_from_embeds<C>(
+        &mut self,
+        embeds: &Array,
+        cache: &mut Vec<C>,
+        per_layer_inputs: Option<&Array>,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let hidden = self
+            .model
+            .forward_from_embeds(embeds, None, cache, per_layer_inputs)?;
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&hidden)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &hidden)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok(logits)
+    }
+
     pub fn embed_tokens_slice(&mut self, ids: &[i32]) -> Result<Array, Exception> {
         let input = Array::from_slice(ids, &[1, ids.len() as i32]);
         let embeds = self.model.embed_tokens.forward(&input)?;
@@ -2875,12 +2954,17 @@ impl Model {
         //     all P cached tokens + its causal-prefix verify positions.
         let t = hidden_states.shape()[1];
         let cache_offset: i32 = cache.first().map(|c| c.offset()).unwrap_or(0);
-        let mask_arr = if t > 1 {
-            Some(create_causal_mask(t, Some(cache_offset), None, None)?)
-        } else {
-            None
-        };
-        let mask_ref = mask_arr.as_ref();
+        // gemma4 interleaves sliding-window and full attention, so the mask must
+        // be built PER LAYER TYPE (offset-aware): window-limited for sliding
+        // layers, full-causal for full-attention layers. The previous code
+        // applied a single full-causal mask to every layer, letting sliding
+        // layers attend beyond their window — so the captured hidden states (and
+        // thus the DFlash draft) diverged from the training reference, depressing
+        // acceptance (worse at long context). Cache masks by window (key -1 =
+        // full causal). Built only for multi-token forwards (t > 1); single-step
+        // decode passes None and each layer self-builds its mask.
+        let mut mask_by_window: std::collections::HashMap<i32, Array> =
+            std::collections::HashMap::new();
 
         // Per-layer eval was originally needed during long-prompt prefill on
         // MoE to bound peak Metal memory. For short multi-token forwards
@@ -2901,9 +2985,22 @@ impl Model {
 
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let cache_slot = self.model.kv_cache_map[i];
+            // Per-layer offset-aware mask: window-limited for sliding layers,
+            // full-causal for full-attention layers (key -1).
+            let mask_opt: Option<&Array> = if t > 1 {
+                let window = layer.self_attn.sliding_window;
+                let key = window.unwrap_or(-1);
+                if !mask_by_window.contains_key(&key) {
+                    let m = create_causal_mask(t, Some(cache_offset), window, None)?;
+                    mask_by_window.insert(key, m);
+                }
+                mask_by_window.get(&key)
+            } else {
+                None
+            };
             hidden_states = layer.forward(DecoderLayerInput {
                 hidden_states: &hidden_states,
-                mask: mask_ref,
+                mask: mask_opt,
                 cache: &mut cache[cache_slot],
                 shared_kv: None,
                 per_layer_input: None,
@@ -2999,10 +3096,28 @@ pub fn get_model_args(model_dir: impl AsRef<Path>) -> Result<Gemma4Config, Error
 
 fn keep_language_weight(key: &str) -> bool {
     key.starts_with("model.language_model.")
+        || key.starts_with("language_model.model.")
         || matches!(
             key,
-            "lm_head.weight" | "model.lm_head.weight" | "model.language_model.lm_head.weight"
+            "lm_head.weight"
+                | "model.lm_head.weight"
+                | "model.language_model.lm_head.weight"
+                | "language_model.lm_head.weight"
         )
+}
+
+/// Rewrite multimodal-wrapper naming (`language_model.model.X`,
+/// `language_model.lm_head.X`) to the canonical nested form
+/// (`model.language_model.X`, `lm_head.X`) the loader looks up by.
+/// Other keys pass through unchanged.
+fn normalize_weight_key(key: &str) -> String {
+    if let Some(rest) = key.strip_prefix("language_model.model.") {
+        format!("model.language_model.{rest}")
+    } else if let Some(rest) = key.strip_prefix("language_model.lm_head.") {
+        format!("lm_head.{rest}")
+    } else {
+        key.to_string()
+    }
 }
 
 fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
@@ -3035,7 +3150,7 @@ fn load_all_weights(model_dir: &Path) -> Result<HashMap<String, Array>, Error> {
         let loaded = Array::load_safetensors(&weights_filename)?;
         for (key, value) in loaded {
             if keep_language_weight(&key) {
-                all_weights.insert(key, value);
+                all_weights.insert(normalize_weight_key(&key), value);
             }
         }
     }
@@ -3958,6 +4073,15 @@ impl Gemma4VlModel {
         init_cache::<KVCache>(num_slots)
     }
 
+    /// Paged variant of `new_cache`, parallel to the `MixedKvCache` path used
+    /// by non-VL Gemma4 under `OMINIX_PAGED_ATTENTION=1`. Full-attention layers
+    /// allocate against the shared paged pool; sliding-window layers stay
+    /// contiguous (the "mixed" of `MixedKvCache`).
+    pub fn new_cache_paged(&self) -> Vec<crate::mixed_cache::MixedKvCache> {
+        let num_slots = *self.text.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
+        init_cache::<crate::mixed_cache::MixedKvCache>(num_slots)
+    }
+
     pub fn encode_image_bytes(&mut self, bytes: &[u8]) -> Result<Array, Error> {
         let (pixel_values, patch_positions, padding_mask) = preprocess_image_gemma4(bytes)?;
         let num_positions = padding_mask.len() as i32;
@@ -3973,12 +4097,42 @@ impl Gemma4VlModel {
         embeds.reshape(&[s1, s2]).map_err(Into::into)
     }
 
-    pub fn prefill_multimodal(
+    /// Lazy-graph variant: drives the refactored `VisionModel::forward_lazy`
+    /// path which has no internal `eval()`/`try_as_slice` calls. The
+    /// returned `Array` is unevaluated — the entire vision + embed_vision
+    /// graph stays deferred until the caller evaluates it (e.g. during
+    /// `prefill_multimodal_async`'s first prefill-chunk eval), letting
+    /// MLX's scheduler overlap vision kernels with downstream prefill
+    /// kernels.
+    pub fn encode_image_bytes_async(&mut self, bytes: &[u8]) -> Result<Array, Error> {
+        let (pixel_values, patch_positions, padding_mask, num_real, n_valid) =
+            crate::vision::preprocess_image_gemma4_with_counts(bytes)?;
+        let num_positions = padding_mask.len() as i32;
+        let patch_positions = Array::from_slice(&patch_positions, &[1, num_positions, 2]);
+        let padding_bool: Vec<bool> = padding_mask.iter().map(|&v| v != 0).collect();
+        let padding_positions = Array::from_slice(&padding_bool, &[1, num_positions]);
+        let hidden = self.vision.forward_lazy(
+            &pixel_values,
+            &patch_positions,
+            &padding_positions,
+            num_real,
+            n_valid,
+        )?;
+        let embeds = self.embed_vision.forward(&hidden)?;
+        let s1 = embeds.shape()[1];
+        let s2 = embeds.shape()[2];
+        embeds.reshape(&[s1, s2]).map_err(Into::into)
+    }
+
+    pub fn prefill_multimodal<C>(
         &mut self,
         input_ids: &[i32],
         visual_features: &Array,
-        cache: &mut Vec<KVCache>,
-    ) -> Result<Array, Error> {
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
         let image_positions: Vec<usize> = input_ids
             .iter()
             .enumerate()
@@ -4074,11 +4228,138 @@ impl Gemma4VlModel {
         Err(Error::Model("prefill_multimodal: unexpected empty sequence".into()))
     }
 
-    pub fn prefill_text(
+    /// Async-overlap variant of `prefill_multimodal`.
+    ///
+    /// Eliminates the three CPU-sync points (`eval text_embeds`,
+    /// `eval visual_features`, CPU scatter via `try_as_slice` + memcpy)
+    /// that force the vision graph to drain before prefill can start.
+    /// Instead, splices visual features into the embed stream using a
+    /// lazy MLX `concatenate_axis` on a [pre_text, vision, post_text]
+    /// triple, keeping the full pipeline as one graph so MLX's
+    /// scheduler can overlap vision-tower kernels with text-embedding,
+    /// PLE, and the first prefill chunk.
+    ///
+    /// Assumes the image tokens form a single contiguous block in
+    /// `input_ids` (this is the standard Gemma4-VL prompt shape from
+    /// `build_gemma4_vl_chat_tokens`). Returns an error otherwise.
+    pub fn prefill_multimodal_async<C>(
         &mut self,
         input_ids: &[i32],
-        cache: &mut Vec<KVCache>,
-    ) -> Result<Array, Error> {
+        visual_features: &Array,
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
+        let image_positions: Vec<usize> = input_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &id)| (id as u32 == self.image_token_id).then_some(idx))
+            .collect();
+        if image_positions.is_empty() {
+            return self.prefill_text(input_ids, cache);
+        }
+        let img_start = *image_positions.first().unwrap();
+        let img_end_excl = image_positions.last().unwrap() + 1;
+        let is_contiguous =
+            image_positions.windows(2).all(|w| w[1] == w[0] + 1);
+        if !is_contiguous {
+            return Err(Error::Model(
+                "prefill_multimodal_async requires a contiguous image-token block; \
+                 use prefill_multimodal for interleaved layouts."
+                    .into(),
+            ));
+        }
+        let n_image_slots = image_positions.len();
+        let vis_len = visual_features.shape()[0] as usize;
+        if vis_len == 0 {
+            return Err(Error::Model(
+                "encode_image_bytes returned zero visual tokens".into(),
+            ));
+        }
+        if vis_len != n_image_slots {
+            return Err(Error::Model(format!(
+                "prefill_multimodal_async: vis_len ({vis_len}) != image-token count ({n_image_slots})"
+            )));
+        }
+
+        // Pre-text and post-text embedding lookups — lazy.
+        let scale_f32 = (self.text.args.hidden_size as f32).sqrt();
+        let pre_ids = &input_ids[..img_start];
+        let post_ids = &input_ids[img_end_excl..];
+        let pre_embeds = self.text.embed_tokens_slice(pre_ids)?;
+        let post_embeds = self.text.embed_tokens_slice(post_ids)?;
+        let scale = Array::from(scale_f32)
+            .as_dtype(Dtype::Bfloat16)?
+            .as_dtype(pre_embeds.dtype())?;
+        let pre_scaled = pre_embeds.multiply(&scale)?;
+        let post_scaled = post_embeds.multiply(&scale)?;
+
+        // Match dtype of text embeds for the concat. visual_features
+        // comes through `embed_vision.forward` which yields the LLM
+        // hidden_size in bf16; the cast is a no-op in the common case.
+        let vis_aligned = if visual_features.dtype() != pre_scaled.dtype() {
+            visual_features.as_dtype(pre_scaled.dtype())?
+        } else {
+            visual_features.clone()
+        };
+
+        // [pre_L, H], [vis_L, H], [post_L, H] -> [seq_len, H]
+        let combined_2d = ops::concatenate_axis(
+            &[&pre_scaled, &vis_aligned, &post_scaled],
+            0,
+        )?;
+        let seq_len = input_ids.len() as i32;
+        let combined = combined_2d
+            .reshape(&[1, seq_len, self.text.args.hidden_size])?;
+
+        // PLE: same fallback as prefill_multimodal — auxiliary signal,
+        // OK to feed image_token_id through the lookup at image slots.
+        let input_ids_arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+        let per_layer_inputs_full = self
+            .text
+            .model
+            .compute_per_layer_inputs(&input_ids_arr, &combined)
+            .map_err(|e| Error::Model(format!("compute_per_layer_inputs: {e}")))?;
+
+        // Chunked prefill — same as prefill_multimodal.
+        const PREFILL_CHUNK: i32 = 32;
+        let total = seq_len;
+        let mut pos: i32 = 0;
+        while pos < total {
+            let end = (pos + PREFILL_CHUNK).min(total);
+            let chunk = combined.index((.., pos..end, ..));
+            let ple_chunk = per_layer_inputs_full
+                .as_ref()
+                .map(|p| p.index((.., pos..end, .., ..)));
+            if end < total {
+                let hidden = self
+                    .text
+                    .model
+                    .forward_from_embeds(&chunk, None, cache, ple_chunk.as_ref())?;
+                eval([&hidden])
+                    .map_err(|e| Error::Model(format!("prefill_async chunk {pos}: {e}")))?;
+            } else {
+                return self
+                    .text
+                    .forward_from_embeds(&chunk, cache, ple_chunk.as_ref())
+                    .map_err(Into::into);
+            }
+            pos = end;
+        }
+        Err(Error::Model(
+            "prefill_multimodal_async: unexpected empty sequence".into(),
+        ))
+    }
+
+    pub fn prefill_text<C>(
+        &mut self,
+        input_ids: &[i32],
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
         let input = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
         self.text
             .forward_last_logits(ModelInput {
@@ -4089,11 +4370,14 @@ impl Gemma4VlModel {
             .map_err(Into::into)
     }
 
-    pub fn decode_token(
+    pub fn decode_token<C>(
         &mut self,
         token_id: u32,
-        cache: &mut Vec<KVCache>,
-    ) -> Result<Array, Error> {
+        cache: &mut Vec<C>,
+    ) -> Result<Array, Error>
+    where
+        C: KeyValueCache + Default,
+    {
         let input = Array::from_slice(&[token_id as i32], &[1, 1]);
         self.text
             .forward_last_logits(ModelInput {

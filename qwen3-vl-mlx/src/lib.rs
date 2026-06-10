@@ -863,14 +863,7 @@ pub fn preprocess_image(
 // Sampling
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> std::result::Result<Array, mlx_rs::error::Exception> {
-    if temp == 0.0 {
-        mlx_rs::argmax_axis!(logits, -1)
-    } else {
-        let scaled = logits.multiply(array!(1.0 / temp))?;
-        mlx_rs::categorical!(scaled)
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 // ============================================================================
 // Model loading

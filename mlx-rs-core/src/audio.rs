@@ -359,17 +359,17 @@ fn hann_window(size: usize) -> Vec<f32> {
 }
 
 /// Convert frequency to mel scale
-fn hz_to_mel(hz: f32) -> f32 {
+pub fn hz_to_mel(hz: f32) -> f32 {
     2595.0 * (1.0 + hz / 700.0).log10()
 }
 
 /// Convert mel scale to frequency
-fn mel_to_hz(mel: f32) -> f32 {
+pub fn mel_to_hz(mel: f32) -> f32 {
     700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
 }
 
-/// Create mel filterbank matrix
-fn mel_filterbank(n_fft: i32, n_mels: i32, sample_rate: i32, fmin: f32, fmax: f32) -> Vec<f32> {
+/// Create a triangular mel filterbank, returned row-major as `[n_mels, n_fft/2 + 1]`.
+pub fn mel_filterbank(n_fft: i32, n_mels: i32, sample_rate: i32, fmin: f32, fmax: f32) -> Vec<f32> {
     let n_freqs = (n_fft / 2 + 1) as usize;
 
     // Mel points

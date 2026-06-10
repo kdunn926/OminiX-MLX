@@ -6,7 +6,7 @@
 use std::{collections::{HashMap, HashSet}, path::Path};
 
 use mlx_rs::{
-    argmax_axis, array, categorical,
+    array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
@@ -632,12 +632,7 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
 // Generation
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> std::result::Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => categorical!(logits.multiply(array!(1.0 / temp))?).map_err(Into::into),
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,

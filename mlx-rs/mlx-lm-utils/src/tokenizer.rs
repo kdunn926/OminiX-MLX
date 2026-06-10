@@ -231,7 +231,11 @@ where
 {
     // pub conversations: &'a [Conversation<R, T>],
     pub conversations: I,
-    // pub tools: Option<Box<dyn FnOnce()>>, // TODO
+    /// Tool JSON schemas exposed to the template as the `tools` variable.
+    /// A tools-aware chat template (e.g. Hermes-style Qwen) renders these into
+    /// the system prompt under `{% if tools %}`. `None` leaves `tools`
+    /// undefined, matching a no-tools render.
+    pub tools: Option<&'a serde_json::Value>,
     pub documents: Option<&'a [Document]>,
     pub model_id: &'a str,
     pub chat_template_id: Option<&'a str>,
@@ -439,7 +443,7 @@ where
 {
     let ApplyChatTemplateArgs {
         conversations,
-        // tools,
+        tools,
         documents,
         model_id,
         chat_template_id,
@@ -462,13 +466,12 @@ where
         },
     };
 
-    // TODO: handle tool
-
     // TODO: allow return_generation_indices
 
     render_jinja_tempalte(
         template,
         conversations,
+        tools,
         documents,
         Some(add_generation_prompt),
         Some(continue_final_message),
@@ -479,6 +482,7 @@ where
 fn render_jinja_tempalte<'a, R, T>(
     template: Template,
     conversations: impl IntoIterator<Item = Chat<'a, R, T>>,
+    tools: Option<&'a serde_json::Value>,
     documents: Option<&'a [Document]>,
     add_generation_prompt: Option<bool>,
     continue_final_message: Option<bool>,
@@ -495,6 +499,7 @@ where
     for chat in conversations {
         let mut rendered_chat = template.render(context! {
             messages => chat,
+            tools => tools,
             documents => documents,
             add_generation_prompt => add_generation_prompt,
         })?;
@@ -568,6 +573,7 @@ mod tests {
         }];
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
+            tools: None,
             documents: None,
             model_id: &model_id,
             chat_template_id: None,
@@ -580,6 +586,41 @@ mod tests {
 
         let rendered_chat = apply_chat_template(&mut env, model_chat_template, args).unwrap();
         println!("{:?}", rendered_chat);
+    }
+
+    // F16: tool schemas passed via `tools` must reach the template's `tools`
+    // variable (previously the param was a stubbed TODO and silently dropped).
+    #[test]
+    fn test_apply_chat_template_passes_tools() {
+        // Inline tools-aware template — no model fixture needed.
+        let template = "{% if tools %}{% for t in tools %}TOOL:{{ t.function.name }}\n\
+            {% endfor %}{% endif %}{% for m in messages %}{{ m.role }}:{{ m.content }}{% endfor %}"
+            .to_string();
+        let model_id = "test/inline".to_string();
+        let conversations = vec![Conversation {
+            role: Role::User,
+            content: "hi",
+        }];
+        let tools = serde_json::json!([
+            { "type": "function", "function": { "name": "get_weather", "parameters": {} } }
+        ]);
+        let args = ApplyChatTemplateArgs {
+            conversations: [conversations.into()],
+            tools: Some(&tools),
+            documents: None,
+            model_id: &model_id,
+            chat_template_id: None,
+            add_generation_prompt: None,
+            continue_final_message: None,
+        };
+        let mut env = Environment::new();
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        let out = apply_chat_template(&mut env, template, args).unwrap();
+        assert!(
+            out[0].contains("TOOL:get_weather"),
+            "tools must be injected into the template, got: {:?}",
+            out[0]
+        );
     }
 
     #[test]
@@ -604,6 +645,7 @@ mod tests {
 
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
+            tools: None,
             documents: None,
             model_id: &model_id,
             chat_template_id: None,
@@ -638,6 +680,7 @@ mod tests {
 
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
+            tools: None,
             documents: None,
             model_id: &model_id,
             chat_template_id: None,

@@ -10,9 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use mlx_rs::{
-    array, argmax_axis,
     builder::Builder,
-    categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters as ModuleParametersTrait, Param},
@@ -547,15 +545,7 @@ pub fn init_cache<C: KeyValueCache + Default>(num_layers: usize) -> Vec<C> {
     (0..num_layers).map(|_| C::default()).collect()
 }
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
-        }
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 /// Pipelined token generator
 pub struct Generate<'a, C> {

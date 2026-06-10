@@ -9,9 +9,7 @@ use std::{
 };
 
 use mlx_rs::{
-    argmax_axis, array,
     builder::Builder,
-    categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt, Param},
@@ -212,6 +210,28 @@ where
                 .offset(cache.offset())
                 .build()?;
             keys = self.rope.forward(k_input)?;
+
+            // Decode fast path: a paged cache fuses append + attention in one
+            // kernel (no gather). `KVCache` returns `None`, so this is a no-op
+            // for the default backend.
+            if L == 1 {
+                let kv_repeat = (self.n_heads / self.n_kv_heads) as i32;
+                let fused_mask = match mask {
+                    Some(AttentionMask::Array(m)) => Some(m),
+                    _ => None,
+                };
+                if let Some(attn) = cache.try_fused_attention(
+                    &queries,
+                    keys.clone(),
+                    values.clone(),
+                    self.scale,
+                    fused_mask,
+                    kv_repeat,
+                )? {
+                    let output = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[B, L, -1])?;
+                    return self.o_proj.forward(&output);
+                }
+            }
 
             (keys, values) = cache.update_and_fetch(keys, values)?;
         } else {
@@ -1013,15 +1033,7 @@ fn load_qwen3_moe_model_quantized(model_dir: &Path, args: &ModelArgs) -> Result<
 
 // =================== Generation ===================
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
-        }
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,

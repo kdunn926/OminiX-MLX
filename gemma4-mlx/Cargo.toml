@@ -1,6 +1,6 @@
 [package]
 name = "gemma4-mlx"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Gemma 4 text-only inference on Apple Silicon with MLX"
 license = "MIT OR Apache-2.0"
@@ -13,10 +13,27 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenizers = "0.21"
 image = "0.25"
+# Jinja chat-template rendering. We prefer running the model's bundled
+# `chat_template.jinja` directly (it is what the model was trained on) over
+# the hand-rolled Rust renderer, which has drifted from upstream templates
+# in subtle ways (role name, e4b empty-channel pre-fill, tool-call syntax).
+# `loader` is unused but pulled in to match the other minijinja consumer
+# in this workspace (`mlx-rs-lm`). `pycompat` provides `.get()` / `.split()`
+# bindings the Gemma4 templates rely on.
+minijinja = { version = "2", features = ["loader"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [[example]]
 name = "chat_gemma4"
 path = "examples/chat_gemma4.rs"
+
+[[example]]
+name = "chat_text"
+path = "examples/chat_text.rs"
+
+[[example]]
+name = "sliding_bench"
+path = "examples/sliding_bench.rs"
 
 [[example]]
 name = "chat_gemma4_ud"
@@ -54,6 +71,16 @@ path = "examples/mtplx_chat.rs"
 name = "draft_verify_spike"
 path = "examples/draft_verify_spike.rs"
 
+[[example]]
+name = "model_parity"
+path = "examples/model_parity.rs"
+
+[[example]]
+name = "decode_consistency"
+path = "examples/decode_consistency.rs"
+
 [dev-dependencies]
 anyhow = "1"
+coreml-bridge = { path = "../ane-vit/coreml-bridge" }
+npyz = "0.8"
 

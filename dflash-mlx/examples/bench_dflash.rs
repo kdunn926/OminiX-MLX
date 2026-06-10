@@ -45,6 +45,11 @@ struct Args {
     max_tokens: usize,
     temp: f32,
     cpu: bool,
+    /// RNG seed for reproducibility. Without seeding, temp>0 sampling
+    /// (`categorical!`) uses MLX's unseeded global key, so runs are
+    /// non-deterministic — which made the sweep flaky (a run could sample EOS
+    /// as the first token and report 0 tokens). Defaults to a fixed value.
+    seed: u64,
     ddtree: DDTreeArgs,
 }
 
@@ -57,6 +62,10 @@ struct RunStats {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
+    // Seed MLX's global RNG so temp>0 sampling is reproducible across runs.
+    // Without this the sweep is non-deterministic and can flakily sample EOS as
+    // the first token (reported as a 0-token run).
+    mlx_rs::random::seed(args.seed).map_err(|e| anyhow!("seed RNG: {e}"))?;
     if args.cpu {
         mlx_rs::Device::set_default(&mlx_rs::Device::cpu());
         eprintln!("Using CPU device");
@@ -783,6 +792,7 @@ fn parse_args() -> Result<Args> {
     let mut max_tokens = 200usize;
     let mut temp = 0.7f32;
     let mut cpu = false;
+    let mut seed = 0u64;
     let mut ddtree_enabled = false;
     let mut ddtree_budget = 16usize;
     let mut ddtree_topk = 4usize;
@@ -828,6 +838,13 @@ fn parse_args() -> Result<Args> {
                     .context("invalid --temp value")?
             }
             "--cpu" => cpu = true,
+            "--seed" => {
+                seed = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--seed requires a value"))?
+                    .parse()
+                    .context("invalid --seed value")?
+            }
             "--ddtree" => ddtree_enabled = true,
             "--tree-budget" => {
                 ddtree_budget = args
@@ -862,6 +879,7 @@ fn parse_args() -> Result<Args> {
         max_tokens,
         temp,
         cpu,
+        seed,
         ddtree: DDTreeArgs {
             enabled: ddtree_enabled,
             budget: ddtree_budget,

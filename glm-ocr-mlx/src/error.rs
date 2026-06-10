@@ -16,6 +16,8 @@ pub enum Error {
     Image(String),
     #[error("mlx error: {0}")]
     Mlx(#[from] mlx_rs::error::Exception),
+    #[error("mlx core error: {0}")]
+    MlxCore(#[from] mlx_rs_core::error::Error),
     #[error("safetensors error: {0}")]
     Safetensors(String),
 }

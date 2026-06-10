@@ -28,7 +28,6 @@ pub use model::{load_model, load_vl_model, KVCacheMode, Model, VlModel};
 pub use vision::{preprocess_image, VisionTower};
 
 use mlx_rs::{
-    argmax_axis, array, categorical,
     error::Exception,
     ops::indexing::{IndexOp, NewAxis},
     Array,
@@ -104,15 +103,7 @@ pub fn build_chat_tokens_for_messages(
 // Sampling
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        t if t == 0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
-        }
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 // ============================================================================
 // Generation Iterator
@@ -161,6 +152,22 @@ impl<'a> Generate<'a> {
     /// online-softmax SDPA path via `KeyValueCache::try_fused_attention`.
     pub fn new_turboquant_kv(model: &'a mut Model, temp: f32, prompt: &'a Array) -> Self {
         let cache = model.new_cache(KVCacheMode::TurboQuant);
+        Self {
+            model,
+            cache,
+            temp,
+            state: GenerateState::Prefill { prompt },
+            prefetched: None,
+            token_count: 0,
+        }
+    }
+
+    /// Paged KV for full-attention layers: each layer draws blocks from its own
+    /// private `PagedKvPool` and decode runs through the fused paged-attention
+    /// kernel. Recurrent (GDN) layers are unaffected. Used to benchmark the
+    /// paged-attention path against the standard contiguous KV cache.
+    pub fn new_paged_kv(model: &'a mut Model, temp: f32, prompt: &'a Array) -> Self {
+        let cache = model.new_cache(KVCacheMode::Paged);
         Self {
             model,
             cache,

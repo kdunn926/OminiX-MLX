@@ -32,6 +32,9 @@ struct Args {
 fn main() -> Result<()> {
     let args = parse_args()?;
 
+    // Seed MLX's global RNG so speculative (temp>0) sampling is reproducible.
+    mlx_rs::random::seed(0).map_err(|e| anyhow!("seed RNG: {e}"))?;
+
     // Detect target family from config.json so we can route Gemma4 down
     // its AR path (no MTP head, paired-model speculation deferred) and
     // Qwen3.6 through the existing MtplxSession.

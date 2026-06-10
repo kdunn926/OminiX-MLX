@@ -82,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         // Apply chat template
         let args = ApplyChatTemplateArgs {
             conversations: vec![conversations.into()],
+            tools: None,
             documents: None,
             model_id: &model_id,
             chat_template_id: None,

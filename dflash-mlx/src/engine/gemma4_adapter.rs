@@ -13,13 +13,18 @@
 //!   `KVCache` has no public offset setter, and the DFlash lane is forbidden
 //!   from touching `mlx-rs-core`. Snapshot+replay is the same strategy
 //!   `Qwen36TargetAdapter` uses; see `gemma4_mlx::snapshot_cache` docs.
-//! - `Model::forward_with_hidden_capture` currently narrows to last-position
-//!   logits before the LM head (see `gemma4-mlx/src/model.rs:1281-1286`),
-//!   which differs from `Qwen36TargetAdapter`'s full-sequence logits. For
-//!   verify, spec_epoch indexes `verify_logits[.., t, ..]` across the block,
-//!   so this shape mismatch is a known TODO: acceptance-ratio parity against
-//!   the Python `target_gemma4.py` is the 3-6 week deferred investigation
-//!   called out in the task scope. Compilation and routing are unaffected.
+//! - `verify` uses `Model::forward_with_hidden_capture` (last_only=false), so
+//!   it DOES return full per-position logits `[B, T, V]` — spec_epoch's
+//!   `verify_logits[.., t, ..]` indexing across the block is correct. (An
+//!   earlier revision narrowed to last-position logits; that is fixed.)
+//!   What remains open is acceptance-ratio PARITY with the Python
+//!   `target_gemma4.py`: gemma4-specific numerics (final_logit_softcapping,
+//!   the sqrt(hidden) embed scale, sliding-window masks, norm eps) make the
+//!   Rust target's hidden states / logits diverge subtly from what the DFlash
+//!   draft was trained against, which depresses acceptance (observed ~0.11 vs
+//!   ~0.32 on Qwen3.6). That is the 3-6 week deferred parity investigation —
+//!   a numerical gap, NOT a wiring/shape bug (target_layer_ids align with the
+//!   30-layer target and the draft loads as a real DFlashDraftModel).
 
 use mlx_rs::{error::Exception, ops::concatenate_axis, Array};
 

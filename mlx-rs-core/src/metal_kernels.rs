@@ -945,14 +945,18 @@ const TQ_SDPA_4BIT_ONLINE_KERNEL: &str = r#"
     }
 "#;
 
-// V matmul using simdgroup_matrix<float, 8, 8> tile intrinsics. 256
-// threads (8 simdgroups of 32 lanes); each simdgroup owns one d-group
-// of 8 outputs. Same online-softmax + V-tile cache shape as the v2
-// kernel, only the FMA loop swaps scalar reads for matrix-tile ops on
-// the Apple matrix functional pipe. Opt-in via TURBOQUANT_SIMD_MATMUL=1
-// — empirical impact depends on whether V matmul is on the workload's
-// critical path; on Gemma4 5K decode the kernel itself is <5% of decode
-// time and gains may be marginal.
+// Wide (256-thread) online-softmax SDPA kernel for the 4-bit TurboQuant
+// path. Originally an attempt to drive the V matmul through
+// simdgroup_matrix<float, 8, 8> tile intrinsics, but for q_len=1 decode the
+// attention output is a matrix-VECTOR product (1xKV scores · KVxD V): an 8x8
+// systolic tile leaves 7 of 8 rows empty, wasting 7/8 of the MACs, and the
+// sparse-A path produced wrong results (sign flips / inf). simdgroup_matrix is
+// the right tool for DENSE matmuls (MoE MLP, batched/q_len>1 prefill), not a
+// row-vector reduction. This kernel therefore uses a cooperative scalar
+// reduction (64 threads, one output dim each) — the same math as
+// tq_sdpa_4bit_online but spreading V-dequant across 256 threads (4 per KV
+// row). Selected via TURBOQUANT_SIMD_MATMUL; gains over the v2 kernel are
+// marginal since the V matmul is <5% of Gemma4 5K decode time.
 const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
     uint tid = thread_position_in_threadgroup.x;
     uint group_x = threadgroup_position_in_grid.x;
@@ -963,10 +967,6 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
     uint h_kv = h_q / uint(kv_repeat);
     uint d_start = d_chunk_id * 64u;
     if (d_start >= uint(D)) return;
-
-    uint sg_id   = tid >> 5;       // 0..7
-    uint sg_lane = tid & 31u;
-    uint d_group_start = sg_id * 8u;  // each simdgroup outputs d_start + 8*sg_id .. +8
 
     threadgroup float s_q[512];
     threadgroup float s_centroids[16];
@@ -979,10 +979,8 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
     threadgroup float s_running_m;
     threadgroup float s_running_l;
     threadgroup float s_v_tile[64 * 64];
-    // 8x8 A tile (only row 0 used). Shared across simdgroups.
-    threadgroup float s_a_tile[64];
-    // Per-simdgroup 8x8 C tile dump (only row 0 of each is used).
-    threadgroup float s_c_dump[8 * 64];
+    // Running (rescaled) output numerator for the 64 d-cols of this chunk.
+    threadgroup float s_out[64];
 
     if (tid < 16u) s_centroids[tid] = centroids[tid];
 
@@ -1049,11 +1047,8 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
     uint v_base  = b * v_stride_b + h_kv * v_stride_h;
     uint vs_base = b * vs_b + h_kv * vs_h;
 
-    // Per-simdgroup accumulator: only row 0 is the real output. Stored
-    // across the 32 lanes of the simdgroup as a tile.
-    simdgroup_matrix<float, 8, 8> sg_c = simdgroup_matrix<float, 8, 8>(0.0f);
-
     if (tid == 0u) { s_running_m = -1.0e30f; s_running_l = 0.0f; }
+    if (tid < 64u) s_out[tid] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint t = 0u; t < uint(KV); t += 64u) {
@@ -1174,82 +1169,28 @@ const TQ_SDPA_4BIT_ONLINE_SIMD_KERNEL: &str = r#"
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // (e) V matmul via simdgroup_matrix.
-        // Online-softmax rescale: sg_c *= alpha BEFORE accumulating this
-        // tile's contribution. Metal's simdgroup_matrix has no native
-        // scalar multiply, so we round-trip through threadgroup memory:
-        //   store → scalar multiply per lane → load.
-        // The store/load is 64 floats per simdgroup, dominated by the
-        // accumulate path's GMEM traffic in practice.
-        simdgroup_store(sg_c, &s_c_dump[sg_id * 64u], 8);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
-            uint base = sg_id * 64u;
-            for (uint k = sg_lane; k < 64u; k += 32u) {
-                s_c_dump[base + k] *= alpha;
+        // (e) Cooperative V matmul: 64 threads, each accumulates one output
+        // dim d-local = tid over all KV positions in the tile, then folds into
+        // the running numerator with the online-softmax rescale. Scores for
+        // kk >= tile_len are zeroed in step (c), so the full 64-wide loop is
+        // safe even for a short final tile.
+        if (tid < 64u) {
+            float acc = 0.0f;
+            for (uint kk = 0u; kk < 64u; ++kk) {
+                acc += s_tile_scores[kk] * s_v_tile[kk * 64u + tid];
             }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_load(sg_c, &s_c_dump[sg_id * 64u], 8);
-
-        // Each tile contributes 8 8x8 matmuls per simdgroup (kv split
-        // into 8 chunks of 8 positions).
-        for (uint kk_chunk = 0u; kk_chunk < 8u; ++kk_chunk) {
-            uint kk_start = kk_chunk * 8u;
-            // Build A tile: row 0 = scores[kk_start..kk_start+8], rows 1..7 = 0.
-            // 64 cells; first 8 threads populate row 0, rest write 0.
-            if (tid < 8u) {
-                s_a_tile[tid] = s_tile_scores[kk_start + tid];
-            } else if (tid < 64u) {
-                s_a_tile[tid] = 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            simdgroup_matrix<float, 8, 8> sg_a, sg_b;
-            simdgroup_load(sg_a, s_a_tile, 8);
-            simdgroup_load(
-                sg_b,
-                &s_v_tile[kk_start * 64u + d_start + d_group_start],
-                64
-            );
-            simdgroup_multiply_accumulate(sg_c, sg_a, sg_b, sg_c);
+            s_out[tid] = s_out[tid] * alpha + acc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // (f) Extract row 0 of each simdgroup's sg_c, normalise by l, write 8 d values.
-    simdgroup_store(sg_c, &s_c_dump[sg_id * 64u], 8);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    // (f) Normalise by the running softmax denominator and write D_CHUNK outputs.
     if (tid < 64u) {
-        uint sg_part = tid >> 3;
-        uint col = tid & 7u;
-        // row 0, col `col` of simdgroup `sg_part`'s 8x8 tile.
-        // NOTE: this kernel's correctness test (`online_softmax_simd_matches_reference`)
-        // fails with ~13% rel error and sign flips at ~half the output positions.
-        // Root cause (diagnosed 2026-05-18 against tinygrad's working metal_matmul
-        // reference at github.com/tinygrad/tinygrad/blob/3f2d4014/extra/gemm/metal_matmul.py):
-        // simdgroup_matrix expects DENSE 8x8 tiles. Our A-tile is a row-vector
-        // (1x8 real data + 7x8 zero padding), and Apple's per-thread lane→element
-        // mapping inside simdgroup_multiply_accumulate is implementation-defined,
-        // so the zero-padded rows land in lanes that scramble the result.
-        // Two viable fixes:
-        //   (a) Batch 8 query rows at once so A is dense — requires rewriting
-        //       the online-softmax loop to process 8 queries together. Not worth
-        //       it for our decode path where q_len=1.
-        //   (b) Use raw simdgroup ops (simd_shuffle dot products) instead of
-        //       simdgroup_matrix — that's what tq_sdpa_4bit_online (the working
-        //       kernel) already does.
-        // Conclusion: simdgroup_matrix is the wrong tool for row-vector workloads.
-        // Kernel kept gated off (TURBOQUANT_SIMD_MATMUL=1) as a record. Use
-        // tq_sdpa_4bit_online for production. simdgroup_matrix IS the right tool
-        // for dense matmul workloads (MoE expert MLP, large-batch prefill).
-        float v = s_c_dump[sg_part * 64u + col];
         float inv_l = 1.0f / s_running_l;
-        uint d_global = d_start + sg_part * 8u + col;
+        uint d_global = d_start + tid;  // tid is the d-local index (0..63)
         if (d_global < uint(D)) {
             uint out_offset = (b * uint(Hq) + h_q) * uint(D) + d_global;
-            out[out_offset] = T(v * inv_l);
+            out[out_offset] = T(s_out[tid] * inv_l);
         }
     }
 "#;
@@ -2409,6 +2350,547 @@ pub fn kv_compact(
             mlx_sys::mlx_vector_array_free(outputs);
             mlx_sys::mlx_stream_free(stream);
             return Err(Exception::custom("kv_compact kernel execution failed"));
+        }
+
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok(Array::from_ptr(result))
+    }
+}
+
+// =============================================================================
+// Paged KV gather kernel (Phase 2/3 of paged attention — see `paged.rs`)
+// =============================================================================
+//
+// Gathers a sequence's logical KV out of a paged block arena into one
+// contiguous `[B, H, N, D]` tensor in a single Metal dispatch — the kernel
+// replacement for the concat-based `paged::gather_blocks` placeholder.
+//
+// Storage model it expects:
+//   pool_buf:     contiguous arena `[num_blocks, B, H, BLOCK, D]` of dtype T
+//   block_table:  int32 `[ceil(N / BLOCK)]`, logical block i → physical block id
+// For logical token t: physical block = block_table[t / BLOCK],
+//                      in-block offset = t % BLOCK.
+//
+// NOTE (draft): `PagedKvPool` currently stores each block as a separate
+// `Array` (`Vec<Option<Array>>`), so it must first be given a single-arena
+// storage mode before this kernel can be wired into `PagedKvCache`. Until
+// then `PagedKvCache` keeps using the concat fallback. The kernel below is
+// validated in isolation by `gather_blocks` tests.
+const GATHER_BLOCKS_KERNEL_SOURCE: &str = r#"
+    // Grid layout: (D * N, H, B) — one thread per output element.
+    uint d = thread_position_in_grid.x % uint(D);
+    uint t = thread_position_in_grid.x / uint(D);
+    uint h = thread_position_in_grid.y;
+    uint b = thread_position_in_grid.z;
+    if (t >= uint(N)) return;
+
+    // Resolve the physical token for logical position t: block_table maps the
+    // logical block, blocks are contiguous BLOCK-token ranges in the arena.
+    int logical_block = int(t) / BLOCK;
+    int in_off        = int(t) % BLOCK;
+    int pb            = block_table[logical_block];
+    uint phys_t       = uint(pb) * uint(BLOCK) + uint(in_off);
+
+    // Strides into the [B, H, SEQ, D] contiguous arena.
+    uint stride_t = uint(D);
+    uint stride_h = uint(SEQ) * stride_t;
+    uint stride_b = uint(H) * stride_h;
+    uint src = b * stride_b + h * stride_h + phys_t * stride_t + d;
+
+    // Strides into the [B, H, N, D] contiguous output.
+    uint out_stride_t = uint(D);
+    uint out_stride_h = uint(N) * out_stride_t;
+    uint out_stride_b = uint(H) * out_stride_h;
+    uint dst = b * out_stride_b + h * out_stride_h + t * out_stride_t + d;
+
+    out[dst] = pool_buf[src];
+"#;
+
+static GATHER_BLOCKS_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_gather_blocks_kernel() -> MetalKernel {
+    unsafe {
+        let pool_name = CString::new("pool_buf").unwrap();
+        let table_name = CString::new("block_table").unwrap();
+        let out_name = CString::new("out").unwrap();
+        let inputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(inputs, pool_name.as_ptr());
+        mlx_sys::mlx_vector_string_append_value(inputs, table_name.as_ptr());
+        let outputs = mlx_sys::mlx_vector_string_new();
+        mlx_sys::mlx_vector_string_append_value(outputs, out_name.as_ptr());
+        let source = CString::new(GATHER_BLOCKS_KERNEL_SOURCE).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new("paged_gather_blocks").unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Gather a paged sequence's KV into one contiguous `[B, H, n_tokens, D]`
+/// tensor in a single Metal dispatch (the non-contiguous-blocks fallback;
+/// contiguous sequences are a free slice in `PagedKvCache::gather`).
+///
+/// - `pool_buf`: contiguous arena `[B, H, seq, D]`, dtype `T` (blocks are
+///   `block_size`-token ranges along the seq axis).
+/// - `block_table`: int32 `[ceil(n_tokens / block_size)]`, logical→physical
+///   block id. Coerced to int32 if needed.
+/// - `seq`: the arena's physical token capacity (`pool_buf.shape()[2]`).
+#[allow(clippy::too_many_arguments)]
+pub fn gather_blocks(
+    pool_buf: &Array,
+    block_table: &Array,
+    n_tokens: i32,
+    block_size: i32,
+    seq: i32,
+    b: i32,
+    h: i32,
+    d: i32,
+) -> Result<Array, Exception> {
+    if n_tokens <= 0 {
+        return Err(Exception::custom("gather_blocks: n_tokens must be > 0"));
+    }
+    let shape = pool_buf.shape();
+    if shape.len() != 4 {
+        return Err(Exception::custom(format!(
+            "gather_blocks expects pool_buf [B,H,SEQ,D], got {:?}",
+            shape
+        )));
+    }
+    let dtype: u32 = pool_buf.dtype().into();
+    let block_table = if block_table.dtype() != Dtype::Int32 {
+        block_table.as_dtype(Dtype::Int32)?
+    } else {
+        block_table.clone()
+    };
+
+    let kernel = GATHER_BLOCKS_KERNEL.get_or_init(create_gather_blocks_kernel);
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype,
+        );
+        for (name, value) in [("D", d), ("H", h), ("B", b), ("BLOCK", block_size), ("N", n_tokens), ("SEQ", seq)] {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(
+            config,
+            (d * n_tokens).max(1),
+            h.max(1),
+            b.max(1),
+        );
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1);
+
+        let out_shape: [i32; 4] = [b, h, n_tokens, d];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            dtype,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        mlx_sys::mlx_vector_array_append_value(inputs, pool_buf.as_ptr());
+        mlx_sys::mlx_vector_array_append_value(inputs, block_table.as_ptr());
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("gather_blocks kernel execution failed"));
+        }
+
+        let mut result = mlx_sys::mlx_array_new();
+        mlx_sys::mlx_vector_array_get(&mut result, outputs, 0);
+
+        mlx_sys::mlx_fast_metal_kernel_config_free(config);
+        mlx_sys::mlx_vector_array_free(inputs);
+        mlx_sys::mlx_vector_array_free(outputs);
+        mlx_sys::mlx_stream_free(stream);
+
+        Ok(Array::from_ptr(result))
+    }
+}
+
+// =============================================================================
+// Paged attention — decode (single-query) kernel
+// =============================================================================
+//
+// Computes attention output for a one-token query directly against a paged KV
+// arena, WITHOUT first gathering the cache into a contiguous tensor. One
+// thread per (query head, batch); each does a flash-style online-softmax pass
+// over all cached positions, resolving each position's physical block through
+// the block table. This removes the per-decode-step gather copy.
+//
+//   q:           [B, HQ, 1, D]                (the just-projected query)
+//   k_arena:     [num_blocks, B, HKV, BLOCK, D]
+//   v_arena:     [num_blocks, B, HKV, BLOCK, D]
+//   block_table: int32 [ceil(N / BLOCK)]      logical→physical block id
+//   scale_arr:   f32 [1]                       softmax scale (1/sqrt(D))
+//   out:         [B, HQ, 1, D]
+//
+// GQA: HQ query heads map to HKV kv heads via kv_repeat = HQ / HKV.
+// Decode attends to all N cached positions (the query is the latest token),
+// so no causal masking is needed here.
+// 2-pass split-D flash decode. One THREADGROUP per (query head hq, batch b),
+// `TG` threads cooperating. The previous design kept a per-thread `acc[D]`
+// register array — for D=256 that spills (256 registers/thread), which crippled
+// occupancy and made the kernel slower than contiguous SDPA at long context.
+//
+// This version is register-light:
+//   Pass 1: the TG threads cooperatively compute all N scores into the `s_p`
+//           threadgroup buffer, reducing to the global softmax max and sum.
+//           Each thread holds only scalars (no acc array).
+//   Pass 2: the D output dims are SPLIT across threads — each thread owns the
+//           dims `d = tid, tid+TG, …`, looping over all N positions and reading
+//           `s_p[t]` (the softmax weight) × V[t][d]. Each thread accumulates a
+//           single scalar per dim, so there is no per-thread D-sized array.
+//
+// `s_p` caps the cached length at `N_MAX`; the caller falls back to gather+SDPA
+// for sequences longer than that. Pass-2 reads across the TG threads at a fixed
+// position are contiguous in D, so they coalesce.
+/// Max cached length the fused paged decode kernel handles (sized by its `s_p`
+/// threadgroup buffer). Callers fall back to gather + SDPA beyond this.
+pub const PAGED_DECODE_MAX_KV: i32 = 4096;
+
+// Single-pass variant (small N). Each of TG threads runs the full online
+// softmax over a strided slice of N, holding a per-thread `acc[D]`. The acc[D]
+// register array spills for large D, which is why this loses to the 2-pass
+// kernel at long context — but at SHORT context its lower fixed overhead (no
+// score buffer, fewer barriers) makes it the faster choice. The dispatch picks
+// this below PAGED_DECODE_TWO_PASS_MIN cached tokens.
+const PAGED_ATTENTION_DECODE_V1_SOURCE: &str = r#"
+    threadgroup float tg_m[TG];
+    threadgroup float tg_l[TG];
+    threadgroup float tg_acc[TG * D];
+    threadgroup float g_m;
+    threadgroup float g_l;
+
+    uint hq  = threadgroup_position_in_grid.x;
+    uint b   = threadgroup_position_in_grid.y;
+    uint tid = thread_position_in_threadgroup.x;
+
+    uint hkv = hq / uint(KV_REPEAT);
+    float scale = float(scale_arr[0]);
+    uint q_base = b * uint(HQ) * uint(D) + hq * uint(D);
+
+    uint ar_t = uint(D);
+    uint ar_h = uint(SEQ) * ar_t;
+    uint ar_b = uint(HKV) * ar_h;
+
+    float m = -INFINITY;
+    float l = 0.0;
+    float acc[D];
+    for (int d = 0; d < D; ++d) { acc[d] = 0.0; }
+
+    for (int t = int(tid); t < N; t += TG) {
+        int pb  = block_table[t / BLOCK];
+        int off = t % BLOCK;
+        uint phys_t  = uint(pb) * uint(BLOCK) + uint(off);
+        uint kv_base = b * ar_b + hkv * ar_h + phys_t * ar_t;
+
+        float score = 0.0;
+        for (int d = 0; d < D; ++d) {
+            score += float(q[q_base + d]) * float(k_arena[kv_base + d]);
+        }
+        score *= scale;
+
+        float m_new = max(m, score);
+        float corr  = exp(m - m_new);
+        float p     = exp(score - m_new);
+        l = l * corr + p;
+        for (int d = 0; d < D; ++d) {
+            acc[d] = acc[d] * corr + p * float(v_arena[kv_base + d]);
+        }
+        m = m_new;
+    }
+
+    tg_m[tid] = m;
+    tg_l[tid] = l;
+    for (int d = 0; d < D; ++d) { tg_acc[tid * D + d] = acc[d]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float gm = -INFINITY;
+        for (int i = 0; i < TG; ++i) { gm = max(gm, tg_m[i]); }
+        float gl = 0.0;
+        for (int i = 0; i < TG; ++i) { gl += tg_l[i] * exp(tg_m[i] - gm); }
+        g_m = gm;
+        g_l = gl;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float gm = g_m;
+    float inv_l = (g_l > 0.0) ? (1.0 / g_l) : 0.0;
+    uint o_base = b * uint(HQ) * uint(D) + hq * uint(D);
+    for (uint d = tid; d < uint(D); d += TG) {
+        float a = 0.0;
+        for (int i = 0; i < TG; ++i) {
+            a += tg_acc[uint(i) * uint(D) + d] * exp(tg_m[i] - gm);
+        }
+        out[o_base + d] = T(a * inv_l);
+    }
+"#;
+
+static PAGED_ATTENTION_DECODE_V1_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_paged_attention_decode_v1_kernel() -> MetalKernel {
+    create_paged_kernel("paged_attention_decode_v1", PAGED_ATTENTION_DECODE_V1_SOURCE)
+}
+
+/// Cached length at/above which the dispatch uses the register-light 2-pass
+/// kernel (below it, the lower-overhead single-pass V1 is faster). Crossover
+/// measured on gemma-4-26B (D=256): single-pass wins at ~270 tokens, 2-pass
+/// wins at ~2300.
+pub const PAGED_DECODE_TWO_PASS_MIN: i32 = 1024;
+
+const PAGED_ATTENTION_DECODE_KERNEL_SOURCE: &str = r#"
+    threadgroup float s_p[N_MAX];   // scores (pass 1) then exp-weights (pass 2)
+    threadgroup float s_red[TG];    // reduction scratch
+    threadgroup float g_m;
+    threadgroup float g_l;
+
+    uint hq  = threadgroup_position_in_grid.x;
+    uint b   = threadgroup_position_in_grid.y;
+    uint tid = thread_position_in_threadgroup.x;
+
+    uint hkv = hq / uint(KV_REPEAT);
+    float scale = float(scale_arr[0]);
+    uint q_base = b * uint(HQ) * uint(D) + hq * uint(D);
+
+    // arena: [B, HKV, SEQ, D] — block pb owns tokens [pb*BLOCK, (pb+1)*BLOCK).
+    uint ar_t = uint(D);
+    uint ar_h = uint(SEQ) * ar_t;
+    uint ar_b = uint(HKV) * ar_h;
+
+    // --- Pass 1a: scores into s_p, per-thread max over a strided slice of N ---
+    float local_m = -INFINITY;
+    for (uint t = tid; t < uint(N); t += uint(TG)) {
+        int pb = block_table[t / uint(BLOCK)];
+        uint phys_t = uint(pb) * uint(BLOCK) + (t % uint(BLOCK));
+        uint kv_base = b * ar_b + hkv * ar_h + phys_t * ar_t;
+        float score = 0.0;
+        for (uint d = 0; d < uint(D); ++d) {
+            score += float(q[q_base + d]) * float(k_arena[kv_base + d]);
+        }
+        score *= scale;
+        s_p[t] = score;
+        local_m = max(local_m, score);
+    }
+    s_red[tid] = local_m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = uint(TG) >> 1; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] = max(s_red[tid], s_red[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) g_m = s_red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = g_m;
+
+    // --- Pass 1b: exp(score - m) into s_p, per-thread sum ---
+    float local_l = 0.0;
+    for (uint t = tid; t < uint(N); t += uint(TG)) {
+        float e = exp(s_p[t] - m);
+        s_p[t] = e;
+        local_l += e;
+    }
+    s_red[tid] = local_l;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = uint(TG) >> 1; s > 0u; s >>= 1u) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) g_l = s_red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_l = (g_l > 0.0) ? (1.0 / g_l) : 0.0;
+
+    // --- Pass 2: out[d] = inv_l · Σ_t s_p[t]·V[t][d], D split across threads ---
+    uint o_base = b * uint(HQ) * uint(D) + hq * uint(D);
+    for (uint d = tid; d < uint(D); d += uint(TG)) {
+        float a = 0.0;
+        for (uint t = 0; t < uint(N); ++t) {
+            int pb = block_table[t / uint(BLOCK)];
+            uint phys_t = uint(pb) * uint(BLOCK) + (t % uint(BLOCK));
+            uint kv_base = b * ar_b + hkv * ar_h + phys_t * ar_t;
+            a += s_p[t] * float(v_arena[kv_base + d]);
+        }
+        out[o_base + d] = T(a * inv_l);
+    }
+"#;
+
+static PAGED_ATTENTION_DECODE_KERNEL: OnceLock<MetalKernel> = OnceLock::new();
+
+fn create_paged_attention_decode_kernel() -> MetalKernel {
+    create_paged_kernel("paged_attention_decode", PAGED_ATTENTION_DECODE_KERNEL_SOURCE)
+}
+
+/// Shared builder for the paged-attention decode kernels (V1 single-pass and
+/// V2 2-pass) — same inputs/outputs, different source.
+fn create_paged_kernel(name: &str, src: &str) -> MetalKernel {
+    unsafe {
+        let inputs = mlx_sys::mlx_vector_string_new();
+        for n in ["q", "k_arena", "v_arena", "block_table", "scale_arr"] {
+            let c = CString::new(n).unwrap();
+            mlx_sys::mlx_vector_string_append_value(inputs, c.as_ptr());
+        }
+        let outputs = mlx_sys::mlx_vector_string_new();
+        let out_name = CString::new("out").unwrap();
+        mlx_sys::mlx_vector_string_append_value(outputs, out_name.as_ptr());
+        let source = CString::new(src).unwrap();
+        let header = CString::new("").unwrap();
+        let name = CString::new(name).unwrap();
+        let kernel = mlx_sys::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inputs,
+            outputs,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        );
+        MetalKernel { kernel, input_names: inputs, output_names: outputs }
+    }
+}
+
+/// Single-query paged attention: `[B, HQ, 1, D]` output computed against a
+/// paged KV arena in one Metal dispatch, no gather. See the kernel source.
+///
+/// - `q`: `[B, HQ, 1, D]`, dtype `T`.
+/// - `k_arena`/`v_arena`: contiguous `[B, HKV, seq, D]`, dtype `T` (blocks are
+///   `block_size`-token ranges along the seq axis).
+/// - `block_table`: int32 `[ceil(n_tokens / block_size)]` (coerced if needed).
+/// - `seq`: the arena's physical token capacity (`k_arena.shape()[2]`).
+/// - `scale`: softmax scale (typically `1/sqrt(D)`).
+#[allow(clippy::too_many_arguments)]
+pub fn paged_attention_decode(
+    q: &Array,
+    k_arena: &Array,
+    v_arena: &Array,
+    block_table: &Array,
+    scale: f32,
+    n_tokens: i32,
+    block_size: i32,
+    seq: i32,
+    b: i32,
+    hq: i32,
+    hkv: i32,
+    d: i32,
+) -> Result<Array, Exception> {
+    if n_tokens <= 0 {
+        return Err(Exception::custom("paged_attention_decode: n_tokens must be > 0"));
+    }
+    if hkv <= 0 || hq % hkv != 0 {
+        return Err(Exception::custom("paged_attention_decode: HQ must be a multiple of HKV"));
+    }
+    if q.shape() != [b, hq, 1, d] {
+        return Err(Exception::custom(format!(
+            "paged_attention_decode expects q [B,HQ,1,D]={:?}, got {:?}",
+            [b, hq, 1, d],
+            q.shape()
+        )));
+    }
+    let kv_repeat = hq / hkv;
+    let dtype: u32 = q.dtype().into();
+    let block_table = if block_table.dtype() != Dtype::Int32 {
+        block_table.as_dtype(Dtype::Int32)?
+    } else {
+        block_table.clone()
+    };
+    let scale_arr = Array::from_slice(&[scale], &[1]);
+
+    // Pick the kernel by cached length: the register-light 2-pass kernel wins at
+    // long context, the lower-overhead single-pass V1 wins at short context.
+    let two_pass = n_tokens >= PAGED_DECODE_TWO_PASS_MIN;
+    let kernel = if two_pass {
+        PAGED_ATTENTION_DECODE_KERNEL.get_or_init(create_paged_attention_decode_kernel)
+    } else {
+        PAGED_ATTENTION_DECODE_V1_KERNEL.get_or_init(create_paged_attention_decode_v1_kernel)
+    };
+    unsafe {
+        let stream = mlx_sys::mlx_default_gpu_stream_new();
+        let config = mlx_sys::mlx_fast_metal_kernel_config_new();
+
+        let type_name = CString::new("T").unwrap();
+        mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config, type_name.as_ptr(), dtype,
+        );
+        // V2 (2-pass): TG=256 (decoupled from D, no acc[D] array). V1
+        // (single-pass): TG capped so tg_acc[TG*D] stays ≤16KB threadgroup mem.
+        let tg: i32 = if two_pass { 256 } else { (4096 / d.max(1)).clamp(1, 32) };
+        let mut targs: Vec<(&str, i32)> = vec![
+            ("D", d),
+            ("HQ", hq),
+            ("HKV", hkv),
+            ("B", b),
+            ("SEQ", seq),
+            ("BLOCK", block_size),
+            ("N", n_tokens),
+            ("KV_REPEAT", kv_repeat),
+            ("TG", tg),
+        ];
+        // N_MAX sizes V2's s_p score buffer; V1 doesn't use it.
+        if two_pass {
+            targs.push(("N_MAX", PAGED_DECODE_MAX_KV));
+        }
+        for (name, value) in targs {
+            let cname = CString::new(name).unwrap();
+            mlx_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+                config, cname.as_ptr(), value,
+            );
+        }
+        // One threadgroup per (hq, b): grid.x = HQ·TG threads (HQ groups of TG),
+        // grid.y = B groups of 1. `threadgroup_position_in_grid` → (hq, b).
+        mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, hq.max(1) * tg, b.max(1), 1);
+        mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1);
+
+        let out_shape: [i32; 4] = [b, hq, 1, d];
+        mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            out_shape.as_ptr(),
+            out_shape.len(),
+            dtype,
+        );
+
+        let inputs = mlx_sys::mlx_vector_array_new();
+        for arr in [q, k_arena, v_arena, &block_table, &scale_arr] {
+            mlx_sys::mlx_vector_array_append_value(inputs, arr.as_ptr());
+        }
+
+        let mut outputs = mlx_sys::mlx_vector_array_new();
+        let ret = mlx_sys::mlx_fast_metal_kernel_apply(
+            &mut outputs, kernel.kernel, inputs, config, stream,
+        );
+        if ret != 0 {
+            mlx_sys::mlx_fast_metal_kernel_config_free(config);
+            mlx_sys::mlx_vector_array_free(inputs);
+            mlx_sys::mlx_vector_array_free(outputs);
+            mlx_sys::mlx_stream_free(stream);
+            return Err(Exception::custom("paged_attention_decode kernel execution failed"));
         }
 
         let mut result = mlx_sys::mlx_array_new();
