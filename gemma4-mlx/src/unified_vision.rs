@@ -401,6 +401,44 @@ impl Gemma4UnifiedVlModel {
         self.text.forward_last_logits(input).map_err(Error::from)
     }
 
+    /// Run a verify forward for prompt-lookup speculative decoding (PLD).
+    ///
+    /// Given the trailing committed token `committed` and a `draft` of K
+    /// guessed token IDs, runs a sequence forward of length `K + 1` through
+    /// `self.text` and returns the lm-head logits at each position
+    /// (`shape = [K + 1, vocab]`). The caller compares
+    /// `argmax(logits[i])` to `draft[i]` to accept the leading prefix of
+    /// the draft, then [`KeyValueCache::trim_kv`]s the cache by
+    /// `K - accepted` to discard the rejected tail.
+    ///
+    /// Returns the per-position logits (shape `(K + 1, vocab)`).
+    pub fn verify_draft<C>(
+        &mut self,
+        committed: i32,
+        draft: &[i32],
+        cache: &mut Vec<C>,
+    ) -> Result<Array>
+    where
+        C: mlx_rs_core::cache::KeyValueCache + Default,
+    {
+        let mut seq = Vec::with_capacity(1 + draft.len());
+        seq.push(committed);
+        seq.extend_from_slice(draft);
+        // Compute embeddings first so the second borrow of `self.text` is
+        // strictly sequential with the first (Rust's borrow checker rejects
+        // back-to-back `&mut` reborrows across argument positions).
+        let embeds = self.text.embed_tokens(&seq)?;
+        let logits = self
+            .text
+            .forward_all_logits_from_embeds(&embeds, cache, None)
+            .map_err(Error::from)?;
+        // Drop the batch dim → (K+1, vocab).
+        logits
+            .index((0, .., ..))
+            .reshape(&[seq.len() as i32, -1])
+            .map_err(Error::from)
+    }
+
     /// Build a fresh contiguous KV cache sized for `self.text`.
     pub fn new_cache(&self) -> Vec<crate::KVCache> {
         let num_slots = *self.text.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;

@@ -2679,6 +2679,35 @@ impl Model {
         Ok(logits)
     }
 
+    /// Like [`Self::forward_from_embeds`] but returns the lm-head logits at
+    /// **every** input position (shape `[B, T, vocab]`) instead of only the
+    /// last. Used by prompt-lookup speculative decoding (PLD): the verify
+    /// step runs a `(committed_token, draft_1, …, draft_K)` sequence and
+    /// needs per-position logits so each drafted token can be compared
+    /// against the model's argmax at the previous position.
+    pub fn forward_all_logits_from_embeds<C>(
+        &mut self,
+        embeds: &Array,
+        cache: &mut Vec<C>,
+        per_layer_inputs: Option<&Array>,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let hidden = self
+            .model
+            .forward_from_embeds(embeds, None, cache, per_layer_inputs)?;
+        let mut logits = match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&hidden)?,
+            None => mq_embedding_as_linear(&mut self.model.embed_tokens, &hidden)?,
+        };
+        if let Some(softcap) = self.args.final_logit_softcapping {
+            let cap = array!(softcap);
+            logits = ops::tanh(&logits.divide(&cap)?)?.multiply(&cap)?;
+        }
+        Ok(logits)
+    }
+
     pub fn embed_tokens_slice(&mut self, ids: &[i32]) -> Result<Array, Exception> {
         let input = Array::from_slice(ids, &[1, ids.len() as i32]);
         let embeds = self.model.embed_tokens.forward(&input)?;
