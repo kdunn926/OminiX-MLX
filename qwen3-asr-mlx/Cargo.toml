@@ -31,6 +31,14 @@ rustfft = "6.2"
 # Path utilities
 dirs = "5"
 
+# ANE / Core ML bridge (used by asr_ane_bench example)
+coreml-bridge = { path = "../ane-vit/coreml-bridge" }
+anyhow = "1"
+
 [[example]]
 name = "transcribe"
 path = "examples/transcribe.rs"
+
+[[example]]
+name = "asr_ane_bench"
+path = "examples/asr_ane_bench.rs"
