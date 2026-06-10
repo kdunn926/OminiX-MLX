@@ -1,7 +1,10 @@
-//! Full Precision Qwen-Image Transformer
+//! Full Precision Qwen-Image Transformer.
 //!
-//! Matches the architecture of Qwen/Qwen-Image (HuggingFace diffusers format)
-//! Uses joint attention with separate image/text pathways.
+//! Matches the architecture of Qwen/Qwen-Image (HuggingFace diffusers format);
+//! joint attention with separate image/text pathways.
+//!
+//! NOTE: not exercised by any example — `qwen_quantized` is the production
+//! path; treat this implementation as unvalidated.
 
 use std::collections::HashMap;
 
@@ -382,8 +385,8 @@ impl QwenFullBlock {
             self.txt_mod.forward(temb)?;
 
         // Pre-attention modulation (no separate norm - modulation includes implicit norm)
-        let img_modulated = modulate(&img, &img_shift_attn, &img_scale_attn)?;
-        let txt_modulated = modulate(&txt, &txt_shift_attn, &txt_scale_attn)?;
+        let img_modulated = modulate(img, &img_shift_attn, &img_scale_attn)?;
+        let txt_modulated = modulate(txt, &txt_shift_attn, &txt_scale_attn)?;
 
         // Joint attention
         let (img_attn, txt_attn) = self.attn.forward(&img_modulated, &txt_modulated, img_rope, txt_rope)?;
@@ -425,10 +428,10 @@ fn modulate_manual(x: &Array, shift: &Array, scale: &Array) -> Result<Array, Exc
     let mean = ops::mean_axis(x, -1, true)?;
     let x_centered = ops::subtract(x, &mean)?;
     let var = ops::mean_axis(&ops::multiply(&x_centered, &x_centered)?, -1, true)?;
-    let normalized = ops::divide(&x_centered, &ops::sqrt(&ops::add(&var, &Array::from_f32(1e-6))?)?)?;
+    let normalized = ops::divide(&x_centered, &ops::sqrt(&ops::add(&var, Array::from_f32(1e-6))?)?)?;
 
     // Apply modulation: (1 + scale) * normalized + shift
-    let scaled = ops::multiply(&normalized, &ops::add(scale, &Array::from_f32(1.0))?)?;
+    let scaled = ops::multiply(&normalized, &ops::add(scale, Array::from_f32(1.0))?)?;
     ops::add(&scaled, shift)
 }
 
@@ -467,7 +470,7 @@ impl TimestepEmbedder {
     pub fn forward(&mut self, t: &Array) -> Result<Array, Exception> {
         // Use cached frequencies instead of recomputing
         // t is in [0, 1], scale to [0, 1000] for embedding
-        let t_scaled = ops::multiply(t, &Array::from_f32(1000.0))?;
+        let t_scaled = ops::multiply(t, Array::from_f32(1000.0))?;
         let t_expanded = t_scaled.reshape(&[-1, 1])?;
         let args = ops::multiply(&t_expanded, &self.cached_freqs)?;
 

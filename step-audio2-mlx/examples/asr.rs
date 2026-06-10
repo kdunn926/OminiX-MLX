@@ -19,13 +19,13 @@ fn main() -> Result<()> {
 
     if args.len() < 3 {
         eprintln!("Step-Audio 2 ASR Example");
-        eprintln!("");
+        eprintln!();
         eprintln!("Usage: {} <model_path> <audio_file>", args[0]);
-        eprintln!("");
+        eprintln!();
         eprintln!("Arguments:");
         eprintln!("  model_path  Path to Step-Audio-2-mini model directory");
         eprintln!("  audio_file  Path to audio file (WAV format, 16kHz recommended)");
-        eprintln!("");
+        eprintln!();
         eprintln!("Example:");
         eprintln!("  {} ./Step-Audio-2-mini ./speech.wav", args[0]);
         return Err(Error::Config("Invalid arguments".into()));
@@ -50,30 +50,30 @@ fn main() -> Result<()> {
 
     println!("Step-Audio 2 ASR");
     println!("================");
-    println!("");
+    println!();
     println!("Model: {}", model_path.display());
     println!("Audio: {}", audio_path.display());
-    println!("");
+    println!();
 
     // Load model
     println!("Loading model...");
     let start = Instant::now();
     let mut model = StepAudio2::load(&model_path)?;
     println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
-    println!("");
+    println!();
 
     // Transcribe audio
     println!("Transcribing...");
     let start = Instant::now();
     let text = model.transcribe_long(&audio_path)?;
     let duration = start.elapsed();
-    println!("");
+    println!();
 
     // Output results
     println!("Transcription:");
     println!("--------------");
     println!("{}", text);
-    println!("");
+    println!();
     println!("Time: {:.2}s", duration.as_secs_f64());
 
     Ok(())

@@ -474,11 +474,24 @@ impl S3TokenizerMLX {
         Ok(codes)
     }
 
-    /// Quantize 8-dim latent to discrete codes
+    /// Quantize 8-dim latent to discrete codes.
     ///
-    /// Uses 81-level quantization: round(x * 40) / 40, clamped to [-1, 1]
-    /// Then converts to indices: (quantized + 1) * 40 = [0, 80]
+    /// Uses 81-level quantization: round(x * 40) / 40, clamped to [-1, 1].
+    /// Then converts to indices: (quantized + 1) * 40 = [0, 80].
+    ///
+    /// **KNOWN-APPROXIMATE**: the final code combines only the FIRST TWO of
+    /// the eight latent dimensions (`d0 * 81 + d1`), while the 6561-entry
+    /// codebook implies a full 8-dim FSQ combination — codes produced here
+    /// are structurally wrong for the flow decoder's codebook. A faithful
+    /// FSQ port is still TODO; a one-time warning is emitted at runtime.
     fn quantize(&self, latent: &Array) -> Result<Array> {
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            eprintln!(
+                "[step-audio2] WARNING: s3tokenizer quantize() is a known-approximate \
+                 2-of-8-dim FSQ; audio token codes will not match the reference tokenizer"
+            );
+        });
         // latent: [B, T, 8]
         let shape = latent.shape();
         let _batch = shape[0];

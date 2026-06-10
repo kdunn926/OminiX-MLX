@@ -406,9 +406,11 @@ fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array> {
     let rows = rows.index((.., NewAxis));
     let cols = cols.index(NewAxis);
 
-    // Causal + sliding window: attend if row >= col AND row - col <= window_size
+    // Causal + sliding window: attend iff row >= col AND row - col < window
+    // (HF convention: `window_size` attendable positions including self;
+    // `<=` allowed one extra — compare speech_encoder.rs's `>=` form).
     let causal = rows.ge(&cols)?;
-    let window = rows.subtract(&cols)?.le(&array!(window_size))?;
+    let window = rows.subtract(&cols)?.lt(&array!(window_size))?;
     let bool_mask = causal.logical_and(&window)?;
 
     // Convert to float additive mask: 0.0 where attend, -inf where masked

@@ -20,7 +20,6 @@ pub use mlx_rs_core::{error::Error, load_tokenizer};
 use mlx_rs_core::memory::MemoryGuard;
 
 use mlx_rs::{
-    argmax_axis, array, categorical,
     error::Exception,
     ops::indexing::{IndexOp, NewAxis},
     Array,
@@ -30,15 +29,7 @@ use mlx_rs::{
 // Sampling
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        t if t == 0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
-        }
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 // ============================================================================
 // Generation Iterator

@@ -1,0 +1,13 @@
+{
+  "model": "/Users/kyle/repos/OminiX-MLX/models/gemma-4-E4B-it",
+  "image_size": 384,
+  "patch_size": 16,
+  "pooling_kernel_size": 3,
+  "num_patches": 576,
+  "soft_tokens": 64,
+  "hidden_size": 768,
+  "output_elements": 49152,
+  "compute_units": "all",
+  "recommended_units": "cpuAndGpu",
+  "precision": "float16"
+}

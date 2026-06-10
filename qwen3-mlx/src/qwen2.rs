@@ -11,9 +11,7 @@ use std::{
 };
 
 use mlx_rs::{
-    argmax_axis, array,
     builder::Builder,
-    categorical,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
     module::{Module, ModuleParameters as ModuleParametersTrait, ModuleParametersExt, Param},
@@ -30,6 +28,7 @@ use mlx_rs_core::{
     KeyValueCache,
     Error,
     create_attention_mask,
+    fused_swiglu,
     initialize_rope,
     memory::MemoryGuard,
     FloatOrString,
@@ -153,7 +152,7 @@ impl Attention {
 
 pub struct AttentionInput<'a, C> {
     pub x: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: Option<&'a mut C>,
 }
 
@@ -197,6 +196,28 @@ where
                 .build()?;
             keys = self.rope.forward(k_input)?;
 
+            // Decode fast path: a paged cache fuses append + attention in one
+            // kernel (no gather). `KVCache` returns `None`, so this is a no-op
+            // for the default backend.
+            if L == 1 {
+                let kv_repeat = (self.n_heads / self.n_kv_heads) as i32;
+                let fused_mask = match mask {
+                    Some(AttentionMask::Array(m)) => Some(m),
+                    _ => None,
+                };
+                if let Some(attn) = cache.try_fused_attention(
+                    &queries,
+                    keys.clone(),
+                    values.clone(),
+                    self.scale,
+                    fused_mask,
+                    kv_repeat,
+                )? {
+                    let output = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[B, L, -1])?;
+                    return self.o_proj.forward(&output);
+                }
+            }
+
             (keys, values) = cache.update_and_fetch(keys, values)?;
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
@@ -205,7 +226,8 @@ where
 
         // Determine mask mode: use Causal for prefill (L > 1), None for decode (L == 1)
         let sdpa_mask = match mask {
-            Some(m) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Array(m)) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Causal) => Some(SdpaMask::Causal),
             None if L > 1 => Some(SdpaMask::Causal),
             None => None,
         };
@@ -268,7 +290,7 @@ impl Module<&Array> for Mlp {
     fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let activated = nn::silu(&gate)?.multiply(&up)?;
+        let activated = fused_swiglu(&up, &gate)?;
         self.down_proj.forward(&activated)
     }
 
@@ -387,7 +409,7 @@ impl Qwen2Model {
 
 pub struct ModelInput<'a, C> {
     pub inputs: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: &'a mut Vec<Option<C>>,
 }
 
@@ -403,16 +425,12 @@ where
 
         let mut h = self.embed_tokens.forward(inputs)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only `Array` mask is supported"))
-                }
-                None => None,
-            },
+        let computed_mask = if mask.is_none() {
+            create_attention_mask(&h, cache, Some(false))?
+        } else {
+            None
         };
+        let layer_mask = mask.or(computed_mask.as_ref());
 
         if cache.is_empty() {
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
@@ -421,7 +439,7 @@ where
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
             let layer_input = AttentionInput {
                 x: &h,
-                mask: mask.as_ref(),
+                mask: layer_mask,
                 cache: c.as_mut(),
             };
             h = layer.forward(layer_input)?;
@@ -504,6 +522,27 @@ where
     }
 }
 
+impl Model {
+    /// Project only the last sequence position through the LM head.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed_tokens) => embed_tokens.as_linear(&last),
+                MaybeQuantized::Quantized(q_embed_tokens) => q_embed_tokens.as_linear(&last),
+            },
+        }
+    }
+}
+
 // =================== Loading ===================
 
 pub fn load_qwen2_tokenizer(model_dir: impl AsRef<Path>) -> Result<Tokenizer, Error> {
@@ -545,6 +584,9 @@ pub fn load_qwen2_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
         let weights_filename = model_dir.join(weight_file);
         model.load_safetensors(&weights_filename)?;
     }
+
+    // Materialize parameters so the first request doesn't pay lazy-load cost.
+    model.eval()?;
 
     Ok(model)
 }
@@ -742,15 +784,7 @@ fn load_qwen2_model_quantized(model_dir: &Path, args: &ModelArgs) -> Result<Mode
 
 // =================== Generation ===================
 
-pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
-        }
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,
@@ -791,7 +825,7 @@ where
             cache: self.cache,
         };
         let logits = self.model.forward(input)?;
-        sample(&logits, self.temp)
+        sample(&logits.index((.., -1, ..)), self.temp)
     }
 }
 
@@ -827,8 +861,8 @@ where
                     mask: None,
                     cache: self.cache,
                 };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let logits = tri!(self.model.forward_last_logits(input));
+                let y = tri!(sample(&logits, self.temp));
 
                 let _ = async_eval([&y]);
                 let next_y = tri!(self.compute_next(&y));

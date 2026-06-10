@@ -28,13 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load audio to get duration
     println!("\nLoading audio: {}", audio_path);
-    let (samples, sample_rate) = audio::load_wav(audio_path)?;
+    let (samples, sample_rate) = audio::load_wav(&audio_path)?;
     let duration_secs = samples.len() as f32 / sample_rate as f32;
     println!("Audio: {:.2}s at {}Hz", duration_secs, sample_rate);
 
     // Warmup
     println!("\nWarmup run...");
-    let result = model.transcribe(audio_path)?;
+    let result = model.transcribe(&audio_path)?;
     let preview_len = result.chars().take(100).map(|c| c.len_utf8()).sum::<usize>();
     println!("Result: {}...", &result[..preview_len.min(result.len())]);
 
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for i in 0..iterations {
         let start = Instant::now();
-        let _result = model.transcribe(audio_path)?;
+        let _result = model.transcribe(&audio_path)?;
         let elapsed = start.elapsed().as_millis() as f64;
         times.push(elapsed);
 

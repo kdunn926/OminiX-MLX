@@ -54,23 +54,11 @@ impl TransformerWeightMapper {
         let mut name = hf_name.to_string();
 
         // Common mappings
-        name = name.replace("transformer_blocks.", "transformer_blocks.");
         name = name.replace(".attn1.", ".attn.");
         name = name.replace(".attn2.", ".attn.");
-        name = name.replace("to_q.weight", "to_q.weight");
-        name = name.replace("to_k.weight", "to_k.weight");
-        name = name.replace("to_v.weight", "to_v.weight");
         name = name.replace("to_out.0.", "attn_to_out.");
-        name = name.replace("add_q_proj.", "add_q_proj.");
-        name = name.replace("add_k_proj.", "add_k_proj.");
-        name = name.replace("add_v_proj.", "add_v_proj.");
-        name = name.replace("to_add_out.", "to_add_out.");
 
         // Norm mappings
-        name = name.replace("norm_q.", "norm_q.");
-        name = name.replace("norm_k.", "norm_k.");
-        name = name.replace("norm_added_q.", "norm_added_q.");
-        name = name.replace("norm_added_k.", "norm_added_k.");
 
         // FFN mappings
         name = name.replace("ff.net.0.proj.", "mlp_in.");
@@ -79,13 +67,9 @@ impl TransformerWeightMapper {
         name = name.replace("ff_context.net.2.", "ff_context.mlp_out.");
 
         // Embedding mappings
-        name = name.replace("time_text_embed.timestep_embedder.", "time_text_embed.timestep_embedder.");
-        name = name.replace("context_embedder.", "context_embedder.");
         name = name.replace("x_embedder.", "patch_embed.");
 
         // Output mappings
-        name = name.replace("norm_out.", "norm_out.");
-        name = name.replace("proj_out.", "proj_out.");
 
         name
     }
@@ -110,31 +94,13 @@ impl VAEWeightMapper {
         let mut name = hf_name.to_string();
 
         // Encoder mappings
-        name = name.replace("encoder.down_blocks.", "encoder.down_blocks.");
-        name = name.replace("encoder.mid_block.", "encoder.mid_block.");
-        name = name.replace("encoder.conv_in.", "encoder.conv_in.");
-        name = name.replace("encoder.conv_out.", "encoder.conv_out.");
 
         // Decoder mappings
-        name = name.replace("decoder.up_blocks.", "decoder.up_blocks.");
-        name = name.replace("decoder.mid_block.", "decoder.mid_block.");
-        name = name.replace("decoder.conv_in.", "decoder.conv_in.");
-        name = name.replace("decoder.conv_out.", "decoder.conv_out.");
 
         // ResBlock mappings
-        name = name.replace(".resnets.", ".resnets.");
-        name = name.replace(".norm1.", ".norm1.");
-        name = name.replace(".norm2.", ".norm2.");
-        name = name.replace(".conv1.", ".conv1.");
-        name = name.replace(".conv2.", ".conv2.");
-        name = name.replace(".conv_shortcut.", ".conv_shortcut.");
 
         // Attention mappings
-        name = name.replace(".attentions.", ".attentions.");
         name = name.replace(".group_norm.", ".norm.");
-        name = name.replace(".to_q.", ".to_q.");
-        name = name.replace(".to_k.", ".to_k.");
-        name = name.replace(".to_v.", ".to_v.");
         name = name.replace(".to_out.0.", ".to_out.");
 
         name

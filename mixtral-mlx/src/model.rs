@@ -6,7 +6,7 @@
 use std::{collections::{HashMap, HashSet}, path::Path};
 
 use mlx_rs::{
-    argmax_axis, array, categorical,
+    array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
@@ -116,7 +116,7 @@ pub struct Attention {
 
 pub struct AttentionInput<'a, C> {
     pub x: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: Option<&'a mut C>,
 }
 
@@ -151,7 +151,8 @@ impl<C: KeyValueCache> Module<AttentionInput<'_, C>> for Attention {
         }
 
         let sdpa_mask = match mask {
-            Some(m) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Array(m)) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Causal) => Some(SdpaMask::Causal),
             None if L > 1 => Some(SdpaMask::Causal),
             None => None,
         };
@@ -372,7 +373,7 @@ pub struct MixtralModel {
 
 pub struct ModelInput<'a, C> {
     pub inputs: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: &'a mut Vec<Option<C>>,
 }
 
@@ -384,21 +385,19 @@ impl<C: KeyValueCache + Default> Module<ModelInput<'_, C>> for MixtralModel {
         let ModelInput { inputs, mask, cache } = input;
         let mut h = self.embed_tokens.forward(inputs)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => return Err(Exception::custom("Only `Array` mask is supported")),
-                None => None,
-            },
+        let computed_mask = if mask.is_none() {
+            create_attention_mask(&h, cache, Some(false))?
+        } else {
+            None
         };
+        let layer_mask = mask.or(computed_mask.as_ref());
 
         if cache.is_empty() {
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
         }
 
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
-            h = layer.forward(AttentionInput { x: &h, mask: mask.as_ref(), cache: c.as_mut() })?;
+            h = layer.forward(AttentionInput { x: &h, mask: layer_mask, cache: c.as_mut() })?;
         }
 
         self.norm.forward(&h)
@@ -442,6 +441,21 @@ impl<C: KeyValueCache + Default> Module<ModelInput<'_, C>> for Model {
     fn training_mode(&mut self, mode: bool) {
         <MixtralModel as Module<ModelInput<'_, C>>>::training_mode(&mut self.model, mode);
         self.lm_head.training_mode(mode);
+    }
+}
+
+impl Model {
+    /// Project only the last sequence position through the LM head.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> std::result::Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        self.lm_head.forward(&last)
     }
 }
 
@@ -619,12 +633,7 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
 // Generation
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> std::result::Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => categorical!(logits.multiply(array!(1.0 / temp))?).map_err(Into::into),
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,
@@ -648,7 +657,7 @@ impl<'a, C: KeyValueCache + Default> Generate<'a, C> {
 
     fn compute_next(&mut self, y: &Array) -> std::result::Result<Array, Exception> {
         let input = ModelInput { inputs: &y.index((.., NewAxis)), mask: None, cache: self.cache };
-        sample(&self.model.forward(input)?, self.temp)
+        sample(&self.model.forward(input)?.index((.., -1, ..)), self.temp)
     }
 }
 
@@ -665,8 +674,8 @@ impl<'a, C: KeyValueCache + Default> Iterator for Generate<'a, C> {
         match &self.state {
             GenerateState::Prefill { prompt_token } => {
                 let input = ModelInput { inputs: prompt_token, mask: None, cache: self.cache };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let logits = tri!(self.model.forward_last_logits(input));
+                let y = tri!(sample(&logits, self.temp));
 
                 let _ = async_eval([&y]);
                 let next_y = tri!(self.compute_next(&y));

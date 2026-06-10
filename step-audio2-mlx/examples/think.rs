@@ -21,13 +21,13 @@ fn main() -> Result<()> {
 
     if args.len() < 3 {
         eprintln!("Step-Audio 2 Think Mode Example");
-        eprintln!("");
+        eprintln!();
         eprintln!("Usage: {} <model_path> <audio_file>", args[0]);
-        eprintln!("");
+        eprintln!();
         eprintln!("Arguments:");
         eprintln!("  model_path  Path to Step-Audio-2-mini-Think model directory");
         eprintln!("  audio_file  Path to audio file with question (WAV format)");
-        eprintln!("");
+        eprintln!();
         eprintln!("Example:");
         eprintln!("  {} ./Step-Audio-2-mini-Think ./question.wav", args[0]);
         return Err(Error::Config("Invalid arguments".into()));
@@ -52,44 +52,44 @@ fn main() -> Result<()> {
 
     println!("Step-Audio 2 Think Mode");
     println!("=======================");
-    println!("");
+    println!();
     println!("Model: {}", model_path.display());
     println!("Audio: {}", audio_path.display());
-    println!("");
+    println!();
 
     // Load model
     println!("Loading model...");
     let start = Instant::now();
     let mut model = StepAudio2::load(&model_path)?;
     println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
-    println!("");
+    println!();
 
     // Configure think mode
     let think_config = ThinkConfig::default();
     println!("Think mode enabled:");
     println!("  Max thinking tokens: {}", think_config.max_think_tokens);
     println!("  Max response tokens: {}", think_config.max_response_tokens);
-    println!("");
+    println!();
 
     // Process with think mode
     println!("Processing with think mode...");
     let start = Instant::now();
     let output = model.think_and_respond(&audio_path, think_config)?;
     let duration = start.elapsed();
-    println!("");
+    println!();
 
     // Output results
     if let Some(thinking) = &output.thinking {
         println!("Thinking:");
         println!("---------");
         println!("{}", thinking);
-        println!("");
+        println!();
     }
 
     println!("Response:");
     println!("---------");
     println!("{}", output.response_text);
-    println!("");
+    println!();
 
     println!("Statistics:");
     println!("-----------");

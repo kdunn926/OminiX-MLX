@@ -28,7 +28,7 @@ pub fn fft_device(
     let a = a.as_ref();
     let (n, axis) = resolve_size_and_axis_unchecked(a, n.into(), axis.into());
     Array::try_from_op(|res| unsafe {
-        mlx_sys::mlx_fft_fft(res, a.as_ptr(), n, axis, stream.as_ref().as_ptr())
+        mlx_sys::mlx_fft_fft(res, a.as_ptr(), n, axis, mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD, stream.as_ref().as_ptr())
     })
 }
 
@@ -66,6 +66,7 @@ pub fn fft2_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -105,6 +106,7 @@ pub fn fftn_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -130,7 +132,7 @@ pub fn ifft_device(
     let (n, axis) = resolve_size_and_axis_unchecked(a, n.into(), axis.into());
 
     Array::try_from_op(|res| unsafe {
-        mlx_sys::mlx_fft_ifft(res, a.as_ptr(), n, axis, stream.as_ref().as_ptr())
+        mlx_sys::mlx_fft_ifft(res, a.as_ptr(), n, axis, mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD, stream.as_ref().as_ptr())
     })
 }
 
@@ -168,6 +170,7 @@ pub fn ifft2_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -207,6 +210,7 @@ pub fn ifftn_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -231,13 +235,13 @@ mod tests {
         let fft = fft(&array, None, None).unwrap();
 
         assert_eq!(fft.dtype(), Dtype::Complex64);
-        assert_eq!(fft.as_slice::<complex64>(), FFT_EXPECTED);
+        assert_eq!(fft.contiguous().unwrap().as_slice::<complex64>(), FFT_EXPECTED);
 
         let ifft = ifft(&fft, None, None).unwrap();
 
         assert_eq!(ifft.dtype(), Dtype::Complex64);
         assert_eq!(
-            ifft.as_slice::<complex64>(),
+            ifft.contiguous().unwrap().as_slice::<complex64>(),
             FFT_DATA
                 .iter()
                 .map(|&x| complex64::new(x, 0.0))
@@ -264,13 +268,13 @@ mod tests {
         let fft2 = fft2(&array, None, None).unwrap();
 
         assert_eq!(fft2.dtype(), Dtype::Complex64);
-        assert_eq!(fft2.as_slice::<complex64>(), FFT2_EXPECTED);
+        assert_eq!(fft2.contiguous().unwrap().as_slice::<complex64>(), FFT2_EXPECTED);
 
         let ifft2 = ifft2(&fft2, None, None).unwrap();
 
         assert_eq!(ifft2.dtype(), Dtype::Complex64);
         assert_eq!(
-            ifft2.as_slice::<complex64>(),
+            ifft2.contiguous().unwrap().as_slice::<complex64>(),
             FFT2_DATA
                 .iter()
                 .map(|&x| complex64::new(x, 0.0))
@@ -301,13 +305,13 @@ mod tests {
         let fftn = fftn(&array, None, None).unwrap();
 
         assert_eq!(fftn.dtype(), Dtype::Complex64);
-        assert_eq!(fftn.as_slice::<complex64>(), FFTN_EXPECTED);
+        assert_eq!(fftn.contiguous().unwrap().as_slice::<complex64>(), FFTN_EXPECTED);
 
         let ifftn = ifftn(&fftn, FFTN_SHAPE, &[0, 1, 2]).unwrap();
 
         assert_eq!(ifftn.dtype(), Dtype::Complex64);
         assert_eq!(
-            ifftn.as_slice::<complex64>(),
+            ifftn.contiguous().unwrap().as_slice::<complex64>(),
             FFTN_DATA
                 .iter()
                 .map(|&x| complex64::new(x, 0.0))

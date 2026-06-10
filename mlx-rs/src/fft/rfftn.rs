@@ -30,7 +30,7 @@ pub fn rfft_device(
     let a = a.as_ref();
     let (n, axis) = resolve_size_and_axis_unchecked(a, n.into(), axis.into());
     Array::try_from_op(|res| unsafe {
-        mlx_sys::mlx_fft_rfft(res, a.as_ptr(), n, axis, stream.as_ref().as_ptr())
+        mlx_sys::mlx_fft_rfft(res, a.as_ptr(), n, axis, mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD, stream.as_ref().as_ptr())
     })
 }
 
@@ -72,6 +72,7 @@ pub fn rfft2_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -115,6 +116,7 @@ pub fn rfftn_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -148,7 +150,7 @@ pub fn irfft_device(
     }
 
     Array::try_from_op(|res| unsafe {
-        mlx_sys::mlx_fft_irfft(res, a.as_ptr(), n, axis, stream.as_ref().as_ptr())
+        mlx_sys::mlx_fft_irfft(res, a.as_ptr(), n, axis, mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD, stream.as_ref().as_ptr())
     })
 }
 
@@ -198,6 +200,7 @@ pub fn irfft2_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -250,6 +253,7 @@ pub fn irfftn_device<'a>(
             num_s,
             axes_ptr,
             num_axes,
+            mlx_sys::mlx_fft_norm__MLX_FFT_NORM_BACKWARD,
             stream.as_ref().as_ptr(),
         )
     })
@@ -274,11 +278,11 @@ mod tests {
         let a = Array::from_slice(RFFT_DATA, RFFT_SHAPE);
         let rfft = super::rfft(&a, RFFT_N, RFFT_AXIS).unwrap();
         assert_eq!(rfft.dtype(), Dtype::Complex64);
-        assert_eq!(rfft.as_slice::<complex64>(), RFFT_EXPECTED);
+        assert_eq!(rfft.contiguous().unwrap().as_slice::<complex64>(), RFFT_EXPECTED);
 
         let irfft = super::irfft(&rfft, RFFT_N, RFFT_AXIS).unwrap();
         assert_eq!(irfft.dtype(), Dtype::Float32);
-        assert_eq!(irfft.as_slice::<f32>(), RFFT_DATA);
+        assert_eq!(irfft.contiguous().unwrap().as_slice::<f32>(), RFFT_DATA);
     }
 
     #[test]
@@ -315,11 +319,11 @@ mod tests {
         let a = Array::from_slice(RFFT2_DATA, RFFT2_SHAPE);
         let rfft2 = super::rfft2(&a, None, None).unwrap();
         assert_eq!(rfft2.dtype(), Dtype::Complex64);
-        assert_eq!(rfft2.as_slice::<complex64>(), RFFT2_EXPECTED);
+        assert_eq!(rfft2.contiguous().unwrap().as_slice::<complex64>(), RFFT2_EXPECTED);
 
         let irfft2 = super::irfft2(&rfft2, None, None).unwrap();
         assert_eq!(irfft2.dtype(), Dtype::Float32);
-        assert_eq!(irfft2.as_slice::<f32>(), RFFT2_DATA);
+        assert_eq!(irfft2.contiguous().unwrap().as_slice::<f32>(), RFFT2_DATA);
     }
 
     #[test]
@@ -360,11 +364,11 @@ mod tests {
         let a = Array::from_slice(RFFTN_DATA, RFFTN_SHAPE);
         let rfftn = super::rfftn(&a, None, None).unwrap();
         assert_eq!(rfftn.dtype(), Dtype::Complex64);
-        assert_eq!(rfftn.as_slice::<complex64>(), RFFTN_EXPECTED);
+        assert_eq!(rfftn.contiguous().unwrap().as_slice::<complex64>(), RFFTN_EXPECTED);
 
         let irfftn = super::irfftn(&rfftn, None, None).unwrap();
         assert_eq!(irfftn.dtype(), Dtype::Float32);
-        assert_eq!(irfftn.as_slice::<f32>(), RFFTN_DATA);
+        assert_eq!(irfftn.contiguous().unwrap().as_slice::<f32>(), RFFTN_DATA);
     }
 
     #[test]

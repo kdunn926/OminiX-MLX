@@ -1,6 +1,10 @@
-//! Transformer components for Qwen-Image
+//! Transformer components for Qwen-Image (unquantized building blocks).
 //!
 //! Reference: diffusers/models/transformers/transformer_qwenimage.py
+//!
+//! NOTE: the `QwenImagePipeline` built on these is not exercised by any
+//! example — `qwen_quantized` is the production path; treat this
+//! implementation as unvalidated.
 
 mod norm;
 mod attention;

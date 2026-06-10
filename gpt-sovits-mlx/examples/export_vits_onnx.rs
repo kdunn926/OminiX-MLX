@@ -134,6 +134,7 @@ fn compute_weight_norm(weight_g: &[f32], weight_v: &[f32], shape: &[i64]) -> Vec
 
     let mut result = vec![0.0f32; weight_v.len()];
 
+    #[allow(clippy::needless_range_loop)]
     for out_ch in 0..out_channels {
         // Compute ||v|| for this output channel
         let start = out_ch * inner_size;
@@ -353,8 +354,8 @@ fn main() -> Result<()> {
     }
 
     // Group weight_g/weight_v pairs (for weights with weight normalization)
-    let mut weight_pairs: HashMap<String, (Option<Vec<f32>>, Option<Vec<f32>>, Vec<i64>)> =
-        HashMap::new();
+    type WeightPair = (Option<Vec<f32>>, Option<Vec<f32>>, Vec<i64>);
+    let mut weight_pairs: HashMap<String, WeightPair> = HashMap::new();
 
     for (name, tensor) in safetensors.tensors() {
         if name.ends_with(".weight_g") {
@@ -473,13 +474,11 @@ fn main() -> Result<()> {
                         println!("  PATCHED (named): {} -> {} {:?}", name, onnx_name, shape);
                     }
                     continue;
-                } else {
-                    if args.verbose {
-                        println!(
-                            "  SHAPE MISMATCH: {} ft={:?} vs onnx={:?}",
-                            name, shape, onnx_shape
-                        );
-                    }
+                } else if args.verbose {
+                    println!(
+                        "  SHAPE MISMATCH: {} ft={:?} vs onnx={:?}",
+                        name, shape, onnx_shape
+                    );
                 }
             }
         }

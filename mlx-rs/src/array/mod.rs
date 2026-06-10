@@ -91,8 +91,12 @@ impl Array {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the reference count of the array is properly incremented with
-    /// `mlx_sys::mlx_retain`.
+    /// The caller must transfer ownership of a valid `mlx_array` handle:
+    /// the returned [`Array`] frees it via `mlx_array_free` on drop, so the
+    /// handle must not be freed elsewhere or aliased by another owner. (In
+    /// current mlx-c, handles are independent copies created by the C API —
+    /// there is no `mlx_retain`; to share an array, create a new handle
+    /// with `mlx_array_set`, which is what [`Array::clone`] does.)
     pub unsafe fn from_ptr(c_array: mlx_array) -> Array {
         Self { c_array }
     }
@@ -305,6 +309,86 @@ impl Array {
         unsafe { mlx_sys::mlx_array_nbytes(self.as_ptr()) }
     }
 
+    /// Raw byte pointer + length of the array's underlying storage.
+    ///
+    /// On Apple Silicon (Metal backend), MLX allocates unified-memory
+    /// `MTLBuffer`s and exposes them as CPU-addressable pointers. The
+    /// pointer returned here is the start of that buffer, suitable for:
+    ///
+    /// * Constructing an `MLMultiArray` with a no-op deallocator on the
+    ///   Core ML side (zero-copy CPU read).
+    /// * Wrapping as a `CVPixelBuffer` via `CVPixelBufferCreateWithBytes`
+    ///   for video-pipeline interop.
+    /// * Forwarding to an `IOSurface` for true GPU→ANE handoff without a
+    ///   CPU roundtrip — but that path also requires the upstream
+    ///   `MTLBuffer` handle (not exposed by mlx-c today). See module
+    ///   docs in `ane-vit-spike/RESULTS.md` for the deferred IOSurface
+    ///   plan.
+    ///
+    /// # Safety
+    ///
+    /// * The returned pointer is valid only while the [`Array`] is alive
+    ///   and not yet re-evaluated (lazy graph re-eval may relocate the
+    ///   underlying buffer).
+    /// * The caller must not write through the pointer; treat as
+    ///   read-only.
+    /// * Returns `None` when the array is empty, evaluation fails, or the
+    ///   array is not contiguous in memory — for a strided view the
+    ///   `(ptr, nbytes)` pair would describe the wrong bytes.
+    ///
+    /// This evaluates the array first: reading the data pointer of an
+    /// unevaluated array dereferences a null `Data` shared_ptr inside mlx
+    /// core (a segfault that mlx-c's try/catch cannot convert into the
+    /// `NULL` return this function used to document).
+    pub fn raw_data_bytes(&self) -> Option<(*const u8, usize)> {
+        use std::os::raw::c_void;
+        let nbytes = self.nbytes();
+        if nbytes == 0 {
+            return None;
+        }
+        self.eval().ok()?;
+        if !self.is_contiguous() {
+            return None;
+        }
+        let ptr: *const c_void = unsafe {
+            match self.dtype() {
+                crate::Dtype::Bool => mlx_sys::mlx_array_data_bool(self.as_ptr()) as *const c_void,
+                crate::Dtype::Uint8 => mlx_sys::mlx_array_data_uint8(self.as_ptr()) as *const c_void,
+                crate::Dtype::Uint16 => mlx_sys::mlx_array_data_uint16(self.as_ptr()) as *const c_void,
+                crate::Dtype::Uint32 => mlx_sys::mlx_array_data_uint32(self.as_ptr()) as *const c_void,
+                crate::Dtype::Uint64 => mlx_sys::mlx_array_data_uint64(self.as_ptr()) as *const c_void,
+                crate::Dtype::Int8 => mlx_sys::mlx_array_data_int8(self.as_ptr()) as *const c_void,
+                crate::Dtype::Int16 => mlx_sys::mlx_array_data_int16(self.as_ptr()) as *const c_void,
+                crate::Dtype::Int32 => mlx_sys::mlx_array_data_int32(self.as_ptr()) as *const c_void,
+                crate::Dtype::Int64 => mlx_sys::mlx_array_data_int64(self.as_ptr()) as *const c_void,
+                crate::Dtype::Float16 => mlx_sys::mlx_array_data_float16(self.as_ptr()) as *const c_void,
+                crate::Dtype::Float32 => mlx_sys::mlx_array_data_float32(self.as_ptr()) as *const c_void,
+                crate::Dtype::Float64 => mlx_sys::mlx_array_data_float64(self.as_ptr()) as *const c_void,
+                crate::Dtype::Bfloat16 => mlx_sys::mlx_array_data_bfloat16(self.as_ptr()) as *const c_void,
+                _ => return None,
+            }
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        Some((ptr as *const u8, nbytes))
+    }
+
+    /// Convenience: like [`raw_data_bytes`] but typed as `*const u32`,
+    /// useful when forwarding the unified-memory buffer into a Core ML
+    /// MLMultiArray that expects a 32-bit element view (the caller
+    /// re-interprets per the array's actual `dtype()`).
+    ///
+    /// Note: despite the name this is the CPU-visible unified-memory
+    /// pointer, not an `MTLBuffer` handle. Returns `None` unless the
+    /// buffer's byte length is a multiple of 4 (a 32-bit view of e.g. an
+    /// odd-element f16 buffer would over-read its tail word).
+    pub fn metal_buffer_ptr(&self) -> Option<*const u32> {
+        self.raw_data_bytes()
+            .filter(|&(_, n)| n % 4 == 0)
+            .map(|(p, _)| p as *const u32)
+    }
+
     /// The array’s dimension.
     pub fn ndim(&self) -> usize {
         unsafe { mlx_sys::mlx_array_ndim(self.as_ptr()) }
@@ -474,8 +558,13 @@ impl Array {
 
         unsafe {
             let size = self.size();
+            if size == 0 {
+                // A legitimately empty array has no data pointer; an empty
+                // slice is the correct view of it (not an error).
+                return Ok(&[]);
+            }
             let data = T::array_data(self);
-            if data.is_null() || size == 0 {
+            if data.is_null() {
                 return Err(AsSliceError::Null);
             }
 
@@ -508,26 +597,49 @@ impl Array {
     /// Clone the array by copying the data.
     ///
     /// This is named `deep_clone` to avoid confusion with the `Clone` trait.
+    ///
+    /// # Panics
+    ///
+    /// Panics if evaluating the array (or materializing a contiguous copy
+    /// of a strided view) fails.
     pub fn deep_clone(&self) -> Self {
+        // Reading the raw data pointer of an unevaluated array dereferences
+        // a null `Data` shared_ptr inside mlx core (segfault, not catchable
+        // via mlx-c), and reading a strided view would copy bytes in the
+        // wrong element order. Materialize a contiguous buffer first.
+        self.eval().expect("deep_clone: eval failed");
+        let contiguous_copy;
+        let src: &Array = if self.is_contiguous() {
+            self
+        } else {
+            contiguous_copy = self
+                .contiguous()
+                .and_then(|c| {
+                    c.eval()?;
+                    Ok(c)
+                })
+                .expect("deep_clone: failed to materialize contiguous copy");
+            &contiguous_copy
+        };
         unsafe {
-            let dtype = self.dtype();
-            let shape = self.shape();
+            let dtype = src.dtype();
+            let shape = src.shape();
             let data = match dtype {
-                Dtype::Bool => mlx_sys::mlx_array_data_bool(self.as_ptr()) as *const c_void,
-                Dtype::Uint8 => mlx_sys::mlx_array_data_uint8(self.as_ptr()) as *const c_void,
-                Dtype::Uint16 => mlx_sys::mlx_array_data_uint16(self.as_ptr()) as *const c_void,
-                Dtype::Uint32 => mlx_sys::mlx_array_data_uint32(self.as_ptr()) as *const c_void,
-                Dtype::Uint64 => mlx_sys::mlx_array_data_uint64(self.as_ptr()) as *const c_void,
-                Dtype::Int8 => mlx_sys::mlx_array_data_int8(self.as_ptr()) as *const c_void,
-                Dtype::Int16 => mlx_sys::mlx_array_data_int16(self.as_ptr()) as *const c_void,
-                Dtype::Int32 => mlx_sys::mlx_array_data_int32(self.as_ptr()) as *const c_void,
-                Dtype::Int64 => mlx_sys::mlx_array_data_int64(self.as_ptr()) as *const c_void,
-                Dtype::Float16 => mlx_sys::mlx_array_data_float16(self.as_ptr()) as *const c_void,
-                Dtype::Float32 => mlx_sys::mlx_array_data_float32(self.as_ptr()) as *const c_void,
-                Dtype::Float64 => mlx_sys::mlx_array_data_float64(self.as_ptr()) as *const c_void,
-                Dtype::Bfloat16 => mlx_sys::mlx_array_data_bfloat16(self.as_ptr()) as *const c_void,
+                Dtype::Bool => mlx_sys::mlx_array_data_bool(src.as_ptr()) as *const c_void,
+                Dtype::Uint8 => mlx_sys::mlx_array_data_uint8(src.as_ptr()) as *const c_void,
+                Dtype::Uint16 => mlx_sys::mlx_array_data_uint16(src.as_ptr()) as *const c_void,
+                Dtype::Uint32 => mlx_sys::mlx_array_data_uint32(src.as_ptr()) as *const c_void,
+                Dtype::Uint64 => mlx_sys::mlx_array_data_uint64(src.as_ptr()) as *const c_void,
+                Dtype::Int8 => mlx_sys::mlx_array_data_int8(src.as_ptr()) as *const c_void,
+                Dtype::Int16 => mlx_sys::mlx_array_data_int16(src.as_ptr()) as *const c_void,
+                Dtype::Int32 => mlx_sys::mlx_array_data_int32(src.as_ptr()) as *const c_void,
+                Dtype::Int64 => mlx_sys::mlx_array_data_int64(src.as_ptr()) as *const c_void,
+                Dtype::Float16 => mlx_sys::mlx_array_data_float16(src.as_ptr()) as *const c_void,
+                Dtype::Float32 => mlx_sys::mlx_array_data_float32(src.as_ptr()) as *const c_void,
+                Dtype::Float64 => mlx_sys::mlx_array_data_float64(src.as_ptr()) as *const c_void,
+                Dtype::Bfloat16 => mlx_sys::mlx_array_data_bfloat16(src.as_ptr()) as *const c_void,
                 Dtype::Complex64 => {
-                    mlx_sys::mlx_array_data_complex64(self.as_ptr()) as *const c_void
+                    mlx_sys::mlx_array_data_complex64(src.as_ptr()) as *const c_void
                 }
             };
 

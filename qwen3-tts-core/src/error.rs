@@ -14,6 +14,9 @@ pub enum Error {
     #[error("model error: {0}")]
     Model(String),
 
+    #[error("generation error: {0}")]
+    Generation(String),
+
     #[error("config error: {0}")]
     Config(String),
 

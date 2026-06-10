@@ -3,8 +3,7 @@
 //! Run with: cargo run --release --example trace_t2s_rust
 
 use mlx_rs::{
-    array,
-    module::{Module, Param},
+    module::Module,
     ops::{concatenate_axis, indexing::IndexOp},
     transforms::eval,
     Array,

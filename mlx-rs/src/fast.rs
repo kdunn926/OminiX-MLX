@@ -86,23 +86,26 @@ impl<'a> IntoOption<ScaledDotProductAttentionMask<'a>> for &'a [Array] {
 }
 
 impl ScaledDotProductAttentionMask<'_> {
-    fn as_mode_and_mask_ptr(&self) -> (&'static CStr, mlx_sys::mlx_array) {
+    fn as_mode_and_mask_ptr(&self) -> Result<(&'static CStr, mlx_sys::mlx_array)> {
         match self {
-            ScaledDotProductAttentionMask::Array(mask) => (
-                DEFAULT_MASK_MODE,
-                mask.as_ptr(),
-            ),
-            ScaledDotProductAttentionMask::Arrays(masks) => {
-                // New API only supports a single mask array, use the first one
-                if masks.is_empty() {
-                    (DEFAULT_MASK_MODE, unsafe { mlx_sys::mlx_array_new() })
-                } else {
-                    (DEFAULT_MASK_MODE, masks[0].as_ptr())
-                }
+            ScaledDotProductAttentionMask::Array(mask) => {
+                Ok((DEFAULT_MASK_MODE, mask.as_ptr()))
+            }
+            ScaledDotProductAttentionMask::Arrays(masks) => match masks {
+                // The current mlx-c SDPA API takes a single mask array;
+                // silently using `masks[0]` would compute wrong attention
+                // for callers passing several.
+                [] => Ok((DEFAULT_MASK_MODE, unsafe { mlx_sys::mlx_array_new() })),
+                [mask] => Ok((DEFAULT_MASK_MODE, mask.as_ptr())),
+                _ => Err(crate::error::Exception::custom(format!(
+                    "scaled_dot_product_attention: {} mask arrays given, but the \
+                     mask-array form supports exactly one",
+                    masks.len()
+                ))),
             },
-            ScaledDotProductAttentionMask::Causal => (CAUSAL_MASK_MODE, unsafe {
+            ScaledDotProductAttentionMask::Causal => Ok((CAUSAL_MASK_MODE, unsafe {
                 mlx_sys::mlx_array_new()
-            }),
+            })),
         }
     }
 }
@@ -128,12 +131,12 @@ pub fn scaled_dot_product_attention_device<'a>(
 ) -> Result<Array> {
     let (mask_mode, mask_arr) = mask.into_option().map_or_else(
         || {
-            (DEFAULT_MASK_MODE, unsafe {
+            Ok((DEFAULT_MASK_MODE, unsafe {
                 mlx_sys::mlx_array_new()
-            })
+            }))
         },
         |m| m.as_mode_and_mask_ptr(),
-    );
+    )?;
 
     <Array as Guarded>::try_from_op(|res| unsafe {
         mlx_sys::mlx_fast_scaled_dot_product_attention(
@@ -301,8 +304,9 @@ mod tests {
     #[test]
     #[allow(non_snake_case)]
     fn test_fast_sdpa() {
-        // This test just makes sure that `scaled_dot_product_attention` is callable
-        // in the various cases, based on the Python test `test_fast_sdpa`.
+        // Checks `scaled_dot_product_attention` against the unfused op
+        // chain softmax(Q·Kᵀ·scale)·V across shapes/dtypes, based on the
+        // Python test `test_fast_sdpa`.
 
         let Dk = 64;
         let scale = 1.0 / (Dk as f32).sqrt();
@@ -323,9 +327,43 @@ mod tests {
                     .as_dtype(dtype)
                     .unwrap();
 
-                let result = scaled_dot_product_attention(q, k, v, scale, None).unwrap();
+                let result =
+                    scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
                 assert_eq!(result.shape(), [B, H, seq_len, Dk]);
                 assert_eq!(result.dtype(), dtype);
+
+                // Unfused fp32 reference (softmax in fp32 matches the
+                // kernel's documented accumulation precision).
+                let q_f = q.as_dtype(crate::Dtype::Float32).unwrap();
+                let k_f = k.as_dtype(crate::Dtype::Float32).unwrap();
+                let v_f = v.as_dtype(crate::Dtype::Float32).unwrap();
+                let scores = q_f
+                    .matmul(&k_f.transpose_axes(&[0, 1, 3, 2]).unwrap())
+                    .unwrap()
+                    .multiply(crate::array!(scale))
+                    .unwrap();
+                let probs = crate::ops::softmax_axis(&scores, -1, None).unwrap();
+                let reference = probs.matmul(&v_f).unwrap();
+
+                let diff = result
+                    .as_dtype(crate::Dtype::Float32)
+                    .unwrap()
+                    .subtract(&reference)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .max(None)
+                    .unwrap()
+                    .item::<f32>();
+                let tol = if dtype == crate::Dtype::Float32 {
+                    1e-4
+                } else {
+                    2e-2
+                };
+                assert!(
+                    diff < tol,
+                    "sdpa vs reference: max_abs {diff} >= {tol} (seq_len {seq_len}, {dtype:?})"
+                );
             }
         }
     }

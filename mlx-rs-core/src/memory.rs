@@ -1,127 +1,203 @@
-//! GPU memory monitoring and OOM-resilient evaluation.
+//! Memory management utilities for MLX on Apple Silicon.
 //!
-//! Provides safe wrappers around MLX memory APIs and an adaptive retry
-//! mechanism for GPU operations that may fail under memory pressure.
-//!
-//! Inspired by Makepad's progressive buffer reservation strategy
-//! (libs/llama/src/session.rs) which retries with incremental buffer
-//! growth on Metal allocation failures.
+//! Provides safe wrappers around `mlx_sys` memory introspection and limit-setting
+//! functions. On Apple Silicon, unified memory means GPU memory IS system memory;
+//! `DeviceInfo::memory_size` is the total physical RAM.
 
-/// GPU memory snapshot (all values in bytes).
-#[derive(Debug, Clone, Copy)]
-pub struct MemorySnapshot {
-    /// Memory currently allocated and in use by MLX arrays.
-    pub active: usize,
-    /// Memory held in MLX's cache (freed arrays, available for reuse).
-    pub cache: usize,
-    /// Peak memory usage since process start or last reset.
-    pub peak: usize,
+/// Snapshot of current MLX memory state.
+#[derive(Debug, Clone)]
+pub struct MemoryStats {
+    /// Bytes currently held by live MLX arrays (cannot be reclaimed without freeing the array).
+    pub active_bytes: usize,
+    /// Bytes in MLX's reclaimable cache (can be freed by `clear_cache()`).
+    pub cache_bytes: usize,
+    /// Peak bytes since the last `reset_peak()` call.
+    pub peak_bytes: usize,
+    /// Current MLX allocator soft limit (0 = unlimited).
+    pub memory_limit_bytes: usize,
 }
 
-impl MemorySnapshot {
-    /// Total GPU memory currently held (active + cached).
-    pub fn total(&self) -> usize {
-        self.active + self.cache
+impl MemoryStats {
+    /// Resident bytes = active + cache (total currently allocated from Metal).
+    pub fn resident_bytes(&self) -> usize {
+        self.active_bytes + self.cache_bytes
+    }
+
+    /// Fraction of memory_limit currently resident (0.0 if limit is 0).
+    pub fn resident_fraction(&self) -> f64 {
+        if self.memory_limit_bytes == 0 {
+            0.0
+        } else {
+            self.resident_bytes() as f64 / self.memory_limit_bytes as f64
+        }
     }
 }
 
-impl std::fmt::Display for MemorySnapshot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "active={:.1}MB cache={:.1}MB peak={:.1}MB",
-            self.active as f64 / 1e6,
-            self.cache as f64 / 1e6,
-            self.peak as f64 / 1e6,
-        )
-    }
+/// Key Metal/MLX device limits for Apple Silicon.
+#[derive(Debug, Clone)]
+#[derive(Default)]
+pub struct DeviceInfo {
+    /// Total physical RAM (= unified GPU memory on Apple Silicon).
+    pub memory_size: usize,
+    /// Metal's recommended maximum wired working-set size.
+    pub max_recommended_working_set_size: usize,
+    /// Largest single contiguous buffer Metal will allow.
+    pub max_buffer_length: usize,
 }
 
-/// Take a snapshot of current GPU memory usage.
-pub fn memory_snapshot() -> MemorySnapshot {
+/// Read current MLX memory statistics.
+///
+/// Returns `None` if any MLX call fails (should be extremely rare).
+pub fn get_memory_stats() -> Option<MemoryStats> {
     unsafe {
         let mut active: usize = 0;
         let mut cache: usize = 0;
         let mut peak: usize = 0;
-        mlx_sys::mlx_get_active_memory(&mut active);
-        mlx_sys::mlx_get_cache_memory(&mut cache);
-        mlx_sys::mlx_get_peak_memory(&mut peak);
-        MemorySnapshot { active, cache, peak }
+        let mut limit: usize = 0;
+        if mlx_sys::mlx_get_active_memory(&mut active) != 0 {
+            return None;
+        }
+        if mlx_sys::mlx_get_cache_memory(&mut cache) != 0 {
+            return None;
+        }
+        if mlx_sys::mlx_get_peak_memory(&mut peak) != 0 {
+            return None;
+        }
+        // mlx_get_memory_limit returns the current soft cap (0 = unlimited)
+        let _ = mlx_sys::mlx_get_memory_limit(&mut limit);
+        Some(MemoryStats {
+            active_bytes: active,
+            cache_bytes: cache,
+            peak_bytes: peak,
+            memory_limit_bytes: limit,
+        })
     }
 }
 
-/// Clear MLX's GPU memory cache (frees unused cached allocations).
+/// Return Metal device information (memory sizes, buffer limits).
 ///
-/// Safe to call at any point — only releases memory from completed
-/// computation graphs, not in-flight operations.
-pub fn clear_cache() {
+/// mlx-c 0.6 replaced the typed `mlx_metal_device_info` struct with a generic
+/// key-value lookup on a `mlx_device_info` object. Missing keys return 0 — on
+/// Apple Silicon all three are populated by the Metal backend.
+pub fn get_device_info() -> DeviceInfo {
     unsafe {
-        mlx_sys::mlx_clear_cache();
-    }
-}
-
-/// Set the MLX memory limit (maximum bytes MLX will allocate).
-/// Returns the previous limit.
-pub fn set_memory_limit(limit: usize) -> usize {
-    unsafe {
-        let mut prev: usize = 0;
-        mlx_sys::mlx_set_memory_limit(&mut prev, limit);
-        prev
-    }
-}
-
-/// Set the MLX cache limit (maximum bytes MLX will hold in cache).
-/// Returns the previous limit.
-pub fn set_cache_limit(limit: usize) -> usize {
-    unsafe {
-        let mut prev: usize = 0;
-        mlx_sys::mlx_set_cache_limit(&mut prev, limit);
-        prev
-    }
-}
-
-/// Evaluate an MLX array with OOM retry.
-///
-/// On failure, clears the GPU cache and retries up to `max_retries` times.
-/// This handles transient memory pressure from accumulated cache entries
-/// without requiring the caller to manage memory manually.
-///
-/// Returns `Ok(())` on success, or the last error if all retries fail.
-pub fn eval_with_retry(
-    arrays: &[&mlx_rs::Array],
-    max_retries: usize,
-) -> Result<(), mlx_rs::error::Exception> {
-    let mut last_err = None;
-
-    for attempt in 0..=max_retries {
-        match mlx_rs::transforms::eval(arrays.iter().copied()) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let msg = format!("{e}");
-                let is_oom = msg.contains("out of memory")
-                    || msg.contains("allocation failed")
-                    || msg.contains("too small");
-
-                if !is_oom || attempt == max_retries {
-                    return Err(e);
-                }
-
-                // Log the retry attempt
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    attempt = attempt + 1,
-                    max_retries,
-                    memory = %memory_snapshot(),
-                    "OOM during eval, clearing cache and retrying"
-                );
-
-                clear_cache();
-                last_err = Some(e);
-            }
+        let mut dev = mlx_sys::mlx_device_new();
+        if mlx_sys::mlx_get_default_device(&mut dev) != 0 {
+            mlx_sys::mlx_device_free(dev);
+            return DeviceInfo::default();
+        }
+        let info = mlx_sys::mlx_device_info_new();
+        let mut info_local = info;
+        if mlx_sys::mlx_device_info_get(&mut info_local, dev) != 0 {
+            mlx_sys::mlx_device_info_free(info);
+            mlx_sys::mlx_device_free(dev);
+            return DeviceInfo::default();
+        }
+        let memory_size = read_size_key(info_local, c"memory_size");
+        let max_recommended_working_set_size =
+            read_size_key(info_local, c"max_recommended_working_set_size");
+        let max_buffer_length = read_size_key(info_local, c"max_buffer_length");
+        mlx_sys::mlx_device_info_free(info_local);
+        mlx_sys::mlx_device_free(dev);
+        DeviceInfo {
+            memory_size,
+            max_recommended_working_set_size,
+            max_buffer_length,
         }
     }
+}
 
-    Err(last_err.unwrap())
+unsafe fn read_size_key(info: mlx_sys::mlx_device_info, key: &core::ffi::CStr) -> usize {
+    let mut value: usize = 0;
+    if mlx_sys::mlx_device_info_get_size(&mut value, info, key.as_ptr()) != 0 {
+        return 0;
+    }
+    value
+}
+
+/// Free MLX's reclaimable tensor cache.
+///
+/// Does not touch live arrays. Returns `Ok(())` on success.
+pub fn clear_cache() -> Result<(), String> {
+    let rc = unsafe { mlx_sys::mlx_clear_cache() };
+    if rc != 0 {
+        Err("mlx_clear_cache failed".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Set the MLX allocator soft limit (bytes).
+///
+/// When the allocator would exceed this limit, MLX flushes its cache and, if still over,
+/// returns an allocation error instead of committing more Metal memory. This makes OOM
+/// recoverable rather than fatal.
+///
+/// Returns the *previous* limit on success.
+pub fn set_memory_limit(limit: usize) -> Result<usize, String> {
+    let mut prev: usize = 0;
+    let rc = unsafe { mlx_sys::mlx_set_memory_limit(&mut prev, limit) };
+    if rc != 0 {
+        Err(format!("mlx_set_memory_limit({limit}) failed"))
+    } else {
+        Ok(prev)
+    }
+}
+
+/// Set the MLX reclaimable cache size limit (bytes).
+///
+/// MLX will flush its cache rather than grow it past this limit.
+///
+/// Returns the *previous* limit on success.
+pub fn set_cache_limit(limit: usize) -> Result<usize, String> {
+    let mut prev: usize = 0;
+    let rc = unsafe { mlx_sys::mlx_set_cache_limit(&mut prev, limit) };
+    if rc != 0 {
+        Err(format!("mlx_set_cache_limit({limit}) failed"))
+    } else {
+        Ok(prev)
+    }
+}
+
+/// Set the Metal wired memory limit (bytes).
+///
+/// Controls how much memory Metal may keep wired (non-pageable). Should be set to
+/// `DeviceInfo::max_recommended_working_set_size` for best balance of performance
+/// and system stability.
+///
+/// Returns the *previous* limit on success.
+pub fn set_wired_limit(limit: usize) -> Result<usize, String> {
+    let mut prev: usize = 0;
+    let rc = unsafe { mlx_sys::mlx_set_wired_limit(&mut prev, limit) };
+    if rc != 0 {
+        Err(format!("mlx_set_wired_limit({limit}) failed"))
+    } else {
+        Ok(prev)
+    }
+}
+
+/// Reset the peak memory counter to zero.
+pub fn reset_peak_memory() -> Result<(), String> {
+    let rc = unsafe { mlx_sys::mlx_reset_peak_memory() };
+    if rc != 0 {
+        Err("mlx_reset_peak_memory failed".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Flush the MLX cache only when `active + cache > limit * threshold`.
+///
+/// Returns `true` if a flush was performed.
+pub fn flush_cache_if_needed(limit: usize, threshold: f64) -> bool {
+    let Some(stats) = get_memory_stats() else {
+        return false;
+    };
+    if stats.resident_bytes() as f64 > limit as f64 * threshold {
+        let _ = clear_cache();
+        return true;
+    }
+    false
 }
 
 /// Guard that periodically clears GPU cache during long generation loops.
@@ -137,8 +213,6 @@ pub struct MemoryGuard {
     pressure_threshold: f64,
     /// Current step counter.
     step: usize,
-    /// Snapshot at last clear.
-    last_clear: MemorySnapshot,
 }
 
 impl MemoryGuard {
@@ -151,7 +225,6 @@ impl MemoryGuard {
             step_interval,
             pressure_threshold,
             step: 0,
-            last_clear: memory_snapshot(),
         }
     }
 
@@ -167,19 +240,18 @@ impl MemoryGuard {
 
         // Always clear at step interval
         if self.step % self.step_interval == 0 {
-            clear_cache();
-            self.last_clear = memory_snapshot();
+            let _ = clear_cache();
             return true;
         }
 
         // Check memory pressure
-        let snap = memory_snapshot();
-        if snap.peak > 0 {
-            let pressure = snap.active as f64 / snap.peak as f64;
-            if pressure > self.pressure_threshold {
-                clear_cache();
-                self.last_clear = memory_snapshot();
-                return true;
+        if let Some(stats) = get_memory_stats() {
+            if stats.peak_bytes > 0 {
+                let pressure = stats.active_bytes as f64 / stats.peak_bytes as f64;
+                if pressure > self.pressure_threshold {
+                    let _ = clear_cache();
+                    return true;
+                }
             }
         }
 
@@ -189,51 +261,5 @@ impl MemoryGuard {
     /// Current step count.
     pub fn current_step(&self) -> usize {
         self.step
-    }
-
-    /// Memory snapshot from last cache clear.
-    pub fn last_snapshot(&self) -> MemorySnapshot {
-        self.last_clear
-    }
-
-    /// Take a fresh memory snapshot.
-    pub fn snapshot(&self) -> MemorySnapshot {
-        memory_snapshot()
-    }
-}
-
-/// Pre-flight memory check before starting inference.
-///
-/// Estimates whether there's enough GPU memory for the requested operation.
-/// Returns `Ok(snapshot)` if there's likely enough memory, or
-/// `Err(message)` with a description of the shortage.
-///
-/// This is advisory — actual memory needs depend on MLX's graph optimization.
-/// But it catches obvious cases (e.g., loading a 13GB model on a 16GB device
-/// with only 2GB free).
-pub fn preflight_check(estimated_bytes: usize) -> Result<MemorySnapshot, String> {
-    let snap = memory_snapshot();
-    let available = if snap.cache > 0 {
-        // Cache memory can be reclaimed
-        snap.cache
-    } else {
-        0
-    };
-
-    // Conservative: if active + estimated > peak * 1.1, warn
-    // (peak is our best proxy for "how much Metal let us allocate before")
-    if snap.peak > 0 && snap.active + estimated_bytes > (snap.peak as f64 * 1.1) as usize + available {
-        Err(format!(
-            "Estimated {:.1}MB needed, but only ~{:.1}MB available \
-             (active={:.1}MB, cache={:.1}MB, peak={:.1}MB). \
-             Consider clearing cache or using a smaller model/batch.",
-            estimated_bytes as f64 / 1e6,
-            available as f64 / 1e6,
-            snap.active as f64 / 1e6,
-            snap.cache as f64 / 1e6,
-            snap.peak as f64 / 1e6,
-        ))
-    } else {
-        Ok(snap)
     }
 }

@@ -39,7 +39,7 @@ impl QwenImageCausalConv3D {
         let scale = (2.0 / (in_channels * kt * kh * kw) as f32).sqrt();
         let weight_shape = &[out_channels, in_channels, kt, kh, kw];
         let random_weight = mlx_rs::random::normal::<f32>(weight_shape, None, None, None)?;
-        let weight = ops::multiply(&random_weight, &Array::from_f32(scale))?;
+        let weight = ops::multiply(&random_weight, Array::from_f32(scale))?;
 
         let bias = if use_bias {
             Some(Array::zeros::<f32>(&[out_channels])?)

@@ -174,22 +174,6 @@ impl RepetitionPenaltyMask {
     }
 }
 
-/// Sample a token from logits with temperature, top-k, top-p, repetition penalty,
-/// and control token suppression.
-/// If `rng_key` is Some, uses seeded sampling; otherwise uses global RNG.
-pub fn sample_logits(
-    logits: &Array,
-    temperature: f32,
-    top_k: i32,
-    top_p: f32,
-    repetition_penalty: f32,
-    generated_tokens: &[u32],
-    rng_key: Option<&mut SamplingKey>,
-) -> Result<u32, Exception> {
-    sample_logits_with_mask(logits, temperature, top_k, top_p, repetition_penalty, generated_tokens, rng_key, None, None)
-}
-
-/// Full-featured sampling with pre-built suppression mask and GPU penalty mask.
 pub fn sample_logits_with_mask(
     logits: &Array,
     temperature: f32,

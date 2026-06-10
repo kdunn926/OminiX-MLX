@@ -1,0 +1,9 @@
+timestamp,sweep,model,mode,prompt_len,gen_tokens,tok_per_s,peak_mb,delta_mb
+2026-06-10T18:25:18Z,quick,gemma-4-e4b-it-4bit,baseline,1024,64,55.59,5317.1,1272.5
+2026-06-10T18:25:18Z,quick,gemma-4-e4b-it-4bit,layered,1024,64,55.52,5188.2,1143.6
+2026-06-10T18:25:18Z,quick,gemma-4-e4b-it-4bit,baseline,4096,64,48.55,9049.1,5004.5
+2026-06-10T18:25:18Z,quick,gemma-4-e4b-it-4bit,layered,4096,64,49.22,8580.6,4536.0
+2026-06-10T18:26:11Z,quick,gemma-4-12B-it-4bit,baseline,1024,64,19.54,12960.0,2519.0
+2026-06-10T18:26:11Z,quick,gemma-4-12B-it-4bit,layered,1024,64,18.72,12171.2,1730.3
+2026-06-10T18:26:11Z,quick,gemma-4-12B-it-4bit,baseline,4096,64,16.75,20016.0,9575.0
+2026-06-10T18:26:11Z,quick,gemma-4-12B-it-4bit,layered,4096,64,18.24,17193.0,6752.0

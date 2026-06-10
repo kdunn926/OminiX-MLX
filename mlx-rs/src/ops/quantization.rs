@@ -51,6 +51,12 @@ pub fn quantize_device(
     let mode_cstr = std::ffi::CString::new(mode_str).unwrap();
 
     unsafe {
+        // Make sure the error handler is installed so a failure stores its
+        // message in LAST_MLX_ERROR (instead of leaking a strdup'd string
+        // through an unread thread-local).
+        crate::error::INIT_ERR_HANDLER
+            .with(|init| init.call_once(crate::error::setup_mlx_error_handler));
+
         let mut res = mlx_sys::mlx_vector_array_new();
         let status = mlx_sys::mlx_quantize(
             &mut res,
@@ -58,20 +64,40 @@ pub fn quantize_device(
             optional_int(group_size),
             optional_int(bits),
             mode_cstr.as_ptr(),
+            mlx_sys::mlx_array_ { ctx: std::ptr::null_mut() },
             stream.as_ref().as_ptr(),
         );
         if status != 0 {
             mlx_sys::mlx_vector_array_free(res);
-            return Err(crate::error::Exception::custom("mlx_quantize failed").into());
+            // Surface the real MLX error text, not a generic placeholder.
+            let what = crate::error::get_and_clear_last_mlx_error()
+                .map(|e| e.what)
+                .unwrap_or_else(|| "mlx_quantize failed (no error message set)".to_string());
+            return Err(crate::error::Exception::custom(what));
         }
 
+        let n = mlx_sys::mlx_vector_array_size(res);
+        if n != 3 {
+            mlx_sys::mlx_vector_array_free(res);
+            return Err(crate::error::Exception::custom(format!(
+                "mlx_quantize returned {n} arrays, expected 3 (weights, scales, biases)"
+            )));
+        }
         let mut arr0 = mlx_sys::mlx_array_new();
         let mut arr1 = mlx_sys::mlx_array_new();
         let mut arr2 = mlx_sys::mlx_array_new();
-        mlx_sys::mlx_vector_array_get(&mut arr0, res, 0);
-        mlx_sys::mlx_vector_array_get(&mut arr1, res, 1);
-        mlx_sys::mlx_vector_array_get(&mut arr2, res, 2);
+        let s0 = mlx_sys::mlx_vector_array_get(&mut arr0, res, 0);
+        let s1 = mlx_sys::mlx_vector_array_get(&mut arr1, res, 1);
+        let s2 = mlx_sys::mlx_vector_array_get(&mut arr2, res, 2);
         mlx_sys::mlx_vector_array_free(res);
+        if s0 != 0 || s1 != 0 || s2 != 0 {
+            mlx_sys::mlx_array_free(arr0);
+            mlx_sys::mlx_array_free(arr1);
+            mlx_sys::mlx_array_free(arr2);
+            return Err(crate::error::Exception::custom(
+                "mlx_quantize: failed to extract result arrays",
+            ));
+        }
 
         Ok((Array::from_ptr(arr0), Array::from_ptr(arr1), Array::from_ptr(arr2)))
     }
@@ -146,6 +172,7 @@ pub fn dequantize_device(
             optional_int(group_size),
             optional_int(bits),
             mode_cstr.as_ptr(),
+            mlx_sys::mlx_array_ { ctx: std::ptr::null_mut() },
             optional_dtype_none(),
             stream.as_ref().as_ptr(),
         )
@@ -243,12 +270,12 @@ mod tests {
 
         for i in [2, 4, 8].iter() {
             let el_per_int = 32 / i;
-            let (x_q, scales, biases) = quantize(&x, 128, *i).unwrap();
+            let (x_q, scales, biases) = quantize(&x, 128, *i, None).unwrap();
             assert_eq!(x_q.shape(), [128, 512 / el_per_int]);
             assert_eq!(scales.shape(), [128, 4]);
             assert_eq!(biases.shape(), [128, 4]);
 
-            let x_hat = dequantize(&x_q, &scales, &biases, 128, *i).unwrap();
+            let x_hat = dequantize(&x_q, &scales, &biases, 128, *i, None).unwrap();
             let max_diff = ((&x - &x_hat).abs().unwrap().max(None).unwrap()).item::<f32>();
             assert!(max_diff <= 127.0 / (1 << i) as f32);
         }

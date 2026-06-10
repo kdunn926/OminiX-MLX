@@ -10,6 +10,9 @@ use rand::rngs::StdRng;
 
 use crate::error::Error;
 
+/// Raw sample tuple: (phoneme_ids, bert_features, bert_shape, semantic_ids)
+type RawSample = (Vec<i32>, Vec<f32>, Vec<usize>, Vec<i32>);
+
 /// Metadata for a single training sample
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SampleMetadata {
@@ -132,7 +135,9 @@ impl TrainingDataset {
     }
 
     /// Load a single sample by index
-    fn load_sample(&self, idx: usize) -> Result<(Vec<i32>, Vec<f32>, Vec<usize>, Vec<i32>), Error> {
+    ///
+    /// Returns (phoneme_ids, bert_features, bert_shape, semantic_ids)
+    fn load_sample(&self, idx: usize) -> Result<RawSample, Error> {
         let sample = &self.metadata.samples[idx];
 
         // Load phoneme IDs

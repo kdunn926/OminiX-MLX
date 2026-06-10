@@ -38,7 +38,7 @@ use mlx_rs::{
 /// Returns tensor [batch, channels, new_size]
 fn interpolate_linear(x: &Array, new_size: i32) -> Result<Array, Exception> {
     let shape = x.shape();
-    let src_len = shape[2] as i32;
+    let src_len = shape[2];
 
     if new_size == src_len {
         return Ok(x.clone());
@@ -190,8 +190,8 @@ pub fn rand_slice_segments(
 ) -> Result<(Array, Array), Exception> {
     use mlx_rs::transforms::eval;
 
-    let batch = x.dim(0) as i32;
-    let time = x.dim(2) as i32;
+    let batch = x.dim(0);
+    let time = x.dim(2);
 
     // Get max valid start index per batch item
     let ids_str_max = if let Some(lengths) = x_lengths {
@@ -199,7 +199,7 @@ pub fn rand_slice_segments(
         let seg_arr = Array::from_int(segment_size - 1);
         let max_idx = lengths.subtract(&seg_arr)?;
         // Clamp to at least 1 to avoid negative indices
-        maximum(&max_idx, &Array::from_int(1))?
+        maximum(&max_idx, Array::from_int(1))?
     } else {
         // Use full time length: create array filled with (time - segment_size + 1)
         let max_val = time - segment_size + 1;
@@ -276,7 +276,7 @@ impl RVQCodebook {
 
         // Reshape: if input was [1, 1, seq], output should be [1, dim, seq]
         if shape.len() == 3 {
-            let seq_len = shape[2] as i32;
+            let seq_len = shape[2];
             // quantized is [seq, dim] - we need [1, dim, seq]
             // First add batch dim: [1, seq, dim]
             let batched = quantized.reshape(&[1, seq_len, self.codebook_dim])?;
@@ -299,9 +299,9 @@ impl RVQCodebook {
         use mlx_rs::ops::{sum_axis, maximum, indexing::argmax_axis_device};
 
         let shape = features.shape();
-        let batch = shape[0] as i32;
-        let dim = shape[1] as i32;
-        let seq = shape[2] as i32;
+        let batch = shape[0];
+        let dim = shape[1];
+        let seq = shape[2];
 
         // Transpose features: [batch, dim, seq] -> [batch, seq, dim]
         let features_t = features.transpose_axes(&[0, 2, 1])?;
@@ -354,9 +354,9 @@ impl RVQCodebook {
         use mlx_rs::stop_gradient;
 
         let shape = features.shape();
-        let batch = shape[0] as i32;
-        let dim = shape[1] as i32;
-        let seq = shape[2] as i32;
+        let batch = shape[0];
+        let dim = shape[1];
+        let seq = shape[2];
 
         // Step 1: Find nearest codebook entries (same as encode)
         let features_t = features.transpose_axes(&[0, 2, 1])?;
@@ -500,9 +500,9 @@ impl RelativeAttention {
     #[allow(dead_code)]
     fn relative_position_to_absolute_position(&self, x: &Array) -> Result<Array, Exception> {
         let shape = x.shape();
-        let batch = shape[0] as i32;
-        let heads = shape[1] as i32;
-        let length = shape[2] as i32;
+        let batch = shape[0];
+        let heads = shape[1];
+        let length = shape[2];
 
         // Pad along last dim: [b, h, l, 2*l-1] -> [b, h, l, 2*l]
         let widths: &[(i32, i32)] = &[(0, 0), (0, 0), (0, 0), (0, 1)];
@@ -527,9 +527,9 @@ impl RelativeAttention {
     #[allow(dead_code)]
     fn absolute_position_to_relative_position(&self, x: &Array) -> Result<Array, Exception> {
         let shape = x.shape();
-        let batch = shape[0] as i32;
-        let heads = shape[1] as i32;
-        let length = shape[2] as i32;
+        let batch = shape[0];
+        let heads = shape[1];
+        let length = shape[2];
 
         // Pad along last dim: [b, h, l, l] -> [b, h, l, 2*l-1]
         let widths: &[(i32, i32)] = &[(0, 0), (0, 0), (0, 0), (0, length - 1)];
@@ -553,9 +553,9 @@ impl RelativeAttention {
     /// Forward pass (expects NCL input, returns NCL output)
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
         let shape = x.shape();
-        let batch = shape[0] as i32;
-        let channels = shape[1] as i32;
-        let seq_len = shape[2] as i32;
+        let batch = shape[0];
+        let channels = shape[1];
+        let seq_len = shape[2];
 
         // Convert NCL to NLC for Conv1d (mlx-rs expects NLC)
         let x_nlc = swap_axes(x, 1, 2)?;
@@ -634,10 +634,10 @@ impl RelativeAttention {
     pub fn cross_forward(&mut self, x: &Array, c: &Array, attn_mask: Option<&Array>) -> Result<Array, Exception> {
         let x_shape = x.shape();
         let c_shape = c.shape();
-        let batch = x_shape[0] as i32;
-        let channels = x_shape[1] as i32;
-        let q_len = x_shape[2] as i32;  // SSL sequence length
-        let kv_len = c_shape[2] as i32;  // Text sequence length
+        let batch = x_shape[0];
+        let channels = x_shape[1];
+        let q_len = x_shape[2];  // SSL sequence length
+        let kv_len = c_shape[2];  // Text sequence length
 
         // Convert NCL to NLC for Conv1d
         let x_nlc = swap_axes(x, 1, 2)?;
@@ -1065,6 +1065,7 @@ impl TextEncoder {
     /// - quantized: [batch, ssl_dim, seq] from RVQ decode (NCL format)
     /// - text: [batch, text_seq] phoneme indices
     /// - style: [batch, gin_channels, 1] style embedding
+    ///
     /// Returns: (encoded, mean, log_var, mask) all in NCL format
     pub fn forward(
         &mut self,
@@ -1072,8 +1073,8 @@ impl TextEncoder {
         text: &Array,
         style: Option<&Array>,
     ) -> Result<(Array, Array, Array, Array), Exception> {
-        let batch = quantized.shape()[0] as i32;
-        let seq_len = quantized.shape()[2] as i32;
+        let batch = quantized.shape()[0];
+        let seq_len = quantized.shape()[2];
 
         // Create masks
         // NCL format mask for convolutions and encoder
@@ -1095,7 +1096,7 @@ impl TextEncoder {
 
         // Step 3: text embedding and encoder_text with mask before
         // Python: text = self.encoder_text(text * text_mask, text_mask)
-        let text_seq_len = text.shape()[1] as i32;
+        let text_seq_len = text.shape()[1];
         let text_mask = Array::ones::<f32>(&[batch, 1, text_seq_len])?;
         let text_embed = self.text_embedding.forward(text)?;
         // [batch, seq, channels] -> [batch, channels, seq]
@@ -1135,8 +1136,8 @@ impl TextEncoder {
     ) -> Result<Vec<(String, Array)>, Exception> {
         let mut outputs = Vec::new();
 
-        let batch = quantized.shape()[0] as i32;
-        let seq_len = quantized.shape()[2] as i32;
+        let batch = quantized.shape()[0];
+        let seq_len = quantized.shape()[2];
 
         // Create masks
         let mask_nlc = Array::ones::<f32>(&[batch, seq_len, 1])?;
@@ -1160,7 +1161,7 @@ impl TextEncoder {
         outputs.push(("step2_encoder_ssl_output".to_string(), ssl_ncl.clone()));
 
         // Step 3: text_embedding and encoder_text
-        let text_seq_len = text.shape()[1] as i32;
+        let text_seq_len = text.shape()[1];
         let text_mask = Array::ones::<f32>(&[batch, 1, text_seq_len])?;
         outputs.push(("step3_text_mask".to_string(), text_mask.clone()));
 
@@ -1463,7 +1464,7 @@ impl ResidualCouplingBlock {
 
         // Helper to flip channels (reverse along dim 1)
         fn flip_channels(x: &Array) -> Result<Array, Exception> {
-            let n_channels = x.shape()[1] as i32;
+            let n_channels = x.shape()[1];
             // Create reversed indices: [n-1, n-2, ..., 1, 0]
             let indices = Array::from_iter((0..n_channels).rev(), &[n_channels]);
             x.take_axis(&indices, 1)
@@ -1576,11 +1577,11 @@ impl HiFiGANGenerator {
         // Upsample layers with weight normalization
         let mut ups = Vec::new();
         let mut ch = config.upsample_initial_channel;
-        for (_i, (&u, &k)) in config
+        for (&u, &k) in config
             .upsample_rates
             .iter()
             .zip(config.upsample_kernel_sizes.iter())
-            .enumerate()
+            
         {
             let out_ch = ch / 2;
             ups.push(WeightNormConvTranspose1d::new(
@@ -1598,12 +1599,12 @@ impl HiFiGANGenerator {
         let mut resblocks = Vec::new();
         ch = config.upsample_initial_channel;
         for _i in 0..config.upsample_rates.len() {
-            ch = ch / 2;
-            for (_j, (k, d)) in config
+            ch /= 2;
+            for (k, d) in config
                 .resblock_kernel_sizes
                 .iter()
                 .zip(config.resblock_dilation_sizes.iter())
-                .enumerate()
+                
             {
                 resblocks.push(HiFiGANResBlock::new(ch, *k, d)?);
             }
@@ -2049,13 +2050,32 @@ impl SynthesizerTrn {
         speed: f32,
     ) -> Result<Array, Exception> {
         // Get style embedding from reference
-        // For v2, slice to first 704 channels: refer[:, :704, :]
-        let ge = if let Some(r) = refer {
-            let r_sliced = r.index((.., ..704, ..));
-            Some(self.ref_enc.forward(&r_sliced)?)
-        } else {
-            None
-        };
+        let ge = refer.map(|r| self.ref_embedding(r)).transpose()?;
+        self.decode_with_ge(codes, text, ge.as_ref(), noise_scale, speed)
+    }
+
+    /// Compute the style embedding `ge` from a reference mel spectrogram.
+    ///
+    /// For v2, slices to the first 704 channels: refer[:, :704, :].
+    /// The result only depends on the reference audio, so callers that decode
+    /// repeatedly with the same reference should compute it once and use
+    /// [`Self::decode_with_ge`].
+    pub fn ref_embedding(&mut self, refer: &Array) -> Result<Array, Exception> {
+        let r_sliced = refer.index((.., ..704, ..));
+        self.ref_enc.forward(&r_sliced)
+    }
+
+    /// Decode semantic codes to audio using a precomputed style embedding
+    /// (see [`Self::ref_embedding`]).
+    pub fn decode_with_ge(
+        &mut self,
+        codes: &Array,
+        text: &Array,
+        ge: Option<&Array>,
+        noise_scale: f32,
+        speed: f32,
+    ) -> Result<Array, Exception> {
+        let ge = ge.cloned();
 
         // Decode quantized features from codes
         let quantized = self.quantizer.decode(codes)?;
@@ -2063,7 +2083,7 @@ impl SynthesizerTrn {
         // Interpolate if needed (25hz -> 50hz for semantic_frame_rate="25hz")
         // Input: [1, dim, seq] -> Output: [1, dim, seq*2]
         // Each position is repeated: [a0, a1, a2] -> [a0, a0, a1, a1, a2, a2]
-        let seq_len = quantized.shape()[2] as i32;
+        let seq_len = quantized.shape()[2];
         let target_len = seq_len * 2;
         // Add axis at end: [1, dim, seq] -> [1, dim, seq, 1]
         let q_expanded = quantized.index((.., .., .., mlx_rs::ops::indexing::NewAxis));
@@ -2076,7 +2096,7 @@ impl SynthesizerTrn {
         // speed > 1.0 = faster (shorter sequence), speed < 1.0 = slower (longer sequence)
         // Python: y = F.interpolate(y, size=int(y.shape[-1] / speed)+1, mode="linear")
         let quantized = if (speed - 1.0).abs() > 1e-6 {
-            let current_len = quantized.shape()[2] as i32;
+            let current_len = quantized.shape()[2];
             let new_len = (current_len as f32 / speed) as i32 + 1;
             interpolate_linear(&quantized, new_len)?
         } else {
@@ -2318,14 +2338,14 @@ pub fn load_vits_weights(
     let load_weight_norm_conv = |prefix: &str| -> Option<Result<Array, Exception>> {
         let g = weights.get(&format!("{}.weight_g", prefix))?;
         let v = weights.get(&format!("{}.weight_v", prefix))?;
-        Some(weight_norm_conv(g, v).and_then(|w| transpose_conv(w)))
+        Some(weight_norm_conv(g, v).and_then(&transpose_conv))
     };
 
     // Helper to load weight-normalized ConvTranspose1d
-    let load_weight_norm_convt = |prefix: &str| -> Option<Result<Array, Exception>> {
+    let _load_weight_norm_convt = |prefix: &str| -> Option<Result<Array, Exception>> {
         let g = weights.get(&format!("{}.weight_g", prefix))?;
         let v = weights.get(&format!("{}.weight_v", prefix))?;
-        Some(weight_norm_convt(g, v).and_then(|w| transpose_convt(w)))
+        Some(weight_norm_convt(g, v).and_then(&transpose_convt))
     };
 
     // Quantizer codebook

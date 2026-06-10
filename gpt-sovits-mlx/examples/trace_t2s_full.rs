@@ -88,8 +88,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut caches: Vec<Option<ConcatKeyValueCache>> = (0..num_layers).map(|_| None).collect();
 
     // Generation parameters
-    let temperature = 1.0f32;
-    let top_k = 20;
+    let _temperature = 1.0f32;
+    let _top_k = 20;
     let max_tokens = 50;
     let eos_token = config.eos_token;
 
@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Logits shape after prefill: {:?}", logits.shape());
 
     let seq_len = logits.shape()[1] as i32;
-    let vocab_size = logits.shape()[2] as i32;
+    let _vocab_size = logits.shape()[2] as i32;
     // Get last position logits: [batch, vocab_size]
     let last_logits = logits.index((.., seq_len - 1, ..));
     eval([&last_logits])?;

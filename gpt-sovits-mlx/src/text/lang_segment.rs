@@ -26,6 +26,7 @@ impl Lang {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // infallible parse; FromStr would force a Result
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "zh" | "chinese" | "all_zh" => Lang::Chinese,

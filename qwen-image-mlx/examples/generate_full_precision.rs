@@ -159,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch = 1;
     let latent_h = 32i32;
     let latent_w = 32i32;
-    let img_seq = (latent_h * latent_w) as i32;  // 1024 patches
+    let img_seq = (latent_h * latent_w);  // 1024 patches
     let txt_seq = 77;
 
     // Generate random inputs (small values to avoid numerical issues)

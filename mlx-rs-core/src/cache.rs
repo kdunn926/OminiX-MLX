@@ -2,11 +2,25 @@
 
 use mlx_rs::{error::Exception, ops::concatenate_axis, ops::zeros_dtype, Array};
 use mlx_rs::ops::indexing::{IndexMutOp, IndexOp, Ellipsis};
+use mlx_rs::ops::{dequantize, quantize};
 
 /// Trait for key-value caches used in attention
 pub trait KeyValueCache {
     /// Returns the current offset (number of tokens in cache)
     fn offset(&self) -> i32;
+
+    /// Returns the *physical* length of the cache buffer (how many KV slots
+    /// `update_and_fetch` would emit on its next return). For standard caches
+    /// this equals [`Self::offset`]; sliding-window caches that physically
+    /// cap the buffer at `window` entries return `min(offset, window)` here
+    /// so callers can size their attention mask to the physical key length
+    /// instead of the (potentially much larger) logical token count.
+    ///
+    /// Default impl: same as `offset()`. Override only in caches that
+    /// decouple logical position from physical buffer length.
+    fn physical_offset(&self) -> i32 {
+        self.offset()
+    }
 
     /// Returns the maximum cache size (for sliding window), if any
     fn max_size(&self) -> Option<i32>;
@@ -17,6 +31,81 @@ pub trait KeyValueCache {
     /// Reset the cache offset to 0 without deallocating buffers.
     /// Default implementation does nothing (for caches that don't support reset).
     fn reset(&mut self) {}
+
+    /// Optional fused-attention fast path. When a cache holds keys in a
+    /// non-trivial compressed form (e.g. TurboQuant), it can fold the
+    /// new-block append + Q @ K^T score + scale + mask + softmax + attn
+    /// @ V steps into one operation that never materialises a full
+    /// dequantized K tensor.
+    ///
+    /// Returns `Ok(Some(attn_out))` when handled; `Ok(None)` to fall
+    /// back to the caller's standard `update_and_fetch` + SDPA path.
+    ///
+    /// `q` is `[B, Hq, q_len, D]`, `k_new`/`v_new` are
+    /// `[B, Hkv, q_len_or_more, D]` (the just-projected new K/V block to
+    /// append). `kv_repeat = Hq / Hkv` for GQA. `mask` is the same
+    /// per-query mask the caller would have passed to SDPA (additive
+    /// log-prob style, shape broadcastable to `[..., q_len, kv_len]`).
+    ///
+    /// Default impl: not fused.
+    fn try_fused_attention(
+        &mut self,
+        _q: &Array,
+        _k_new: Array,
+        _v_new: Array,
+        _scale: f32,
+        _mask: Option<&Array>,
+        _kv_repeat: i32,
+    ) -> Result<Option<Array>, Exception> {
+        Ok(None)
+    }
+
+    /// Returns sliced key/value tensors up to the current offset, if available.
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        None
+    }
+
+    /// Materialize lazy computation graphs for cached arrays.
+    fn eval(&self) -> Result<(), Exception> {
+        Ok(())
+    }
+
+    /// Drop the last `n_drop` tokens from the cache. Used by speculative
+    /// decoding rollback when the target rejects some drafted positions.
+    /// Default impl returns an error; caches with O(1) trim support
+    /// (`KVCache`, `TurboQuantKVCache`) override this.
+    fn trim_kv(&mut self, _n_drop: i32) -> Result<(), Exception> {
+        Err(Exception::custom(
+            "KeyValueCache::trim_kv: this cache impl does not support trim",
+        ))
+    }
+
+    /// Compact the cache to keep only the last `n` entries (dropping the
+    /// oldest prefix). Used by sliding-window caches to bound the
+    /// physical buffer between attention forwards — call AFTER SDPA so
+    /// the current step still sees the full buffer.
+    ///
+    /// Default impl is a no-op so unbounded caches (`KVCache`,
+    /// `PagedKvCache`, …) can be called uniformly without effect. Only
+    /// `SlidingKVCache` (or a future `RotatingKVCache`) needs to
+    /// override.
+    fn compact_to_last_n(&mut self, _n: i32) -> Result<(), Exception> {
+        Ok(())
+    }
+
+    /// Compact the cache to keep only positions in `keep_indices` from
+    /// the latest `past_length` window. Used by tree-shaped speculative
+    /// decoding (DDTree) to drop rejected branches. Default impl errors;
+    /// only `KVCache` supports this today.
+    fn compact_kv(
+        &mut self,
+        _past_length: i32,
+        _keep_indices: &Array,
+    ) -> Result<(), Exception> {
+        Err(Exception::custom(
+            "KeyValueCache::compact_kv: this cache impl does not support compact",
+        ))
+    }
 }
 
 impl<T> KeyValueCache for &'_ mut T
@@ -25,6 +114,10 @@ where
 {
     fn offset(&self) -> i32 {
         T::offset(self)
+    }
+
+    fn physical_offset(&self) -> i32 {
+        T::physical_offset(self)
     }
 
     fn max_size(&self) -> Option<i32> {
@@ -37,6 +130,38 @@ where
 
     fn reset(&mut self) {
         T::reset(self)
+    }
+
+    fn try_fused_attention(
+        &mut self,
+        q: &Array,
+        k_new: Array,
+        v_new: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        kv_repeat: i32,
+    ) -> Result<Option<Array>, Exception> {
+        T::try_fused_attention(self, q, k_new, v_new, scale, mask, kv_repeat)
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        T::current_kv(self)
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        T::eval(self)
+    }
+
+    fn trim_kv(&mut self, n_drop: i32) -> Result<(), Exception> {
+        T::trim_kv(self, n_drop)
+    }
+
+    fn compact_to_last_n(&mut self, n: i32) -> Result<(), Exception> {
+        T::compact_to_last_n(self, n)
+    }
+
+    fn compact_kv(&mut self, past_length: i32, keep_indices: &Array) -> Result<(), Exception> {
+        T::compact_kv(self, past_length, keep_indices)
     }
 }
 
@@ -94,6 +219,10 @@ pub struct KVCache {
     values: Option<Array>,
     offset: i32,
     step: i32,
+    /// Soft reservation hint used by the first `update_and_fetch`: when set,
+    /// the initial allocation rounds up to at least this many tokens so the
+    /// cache doesn't need to regrow mid-decode for short generations.
+    reserved: i32,
 }
 
 impl Default for KVCache {
@@ -113,9 +242,276 @@ impl KVCache {
             values: None,
             offset: 0,
             step,
+            reserved: 0,
         }
     }
 
+    /// Hint that the cache should pre-allocate room for at least `capacity`
+    /// tokens on its first `update_and_fetch`. No-op once the buffers exist;
+    /// safe to call before prefill with `prompt_len + max_new_tokens`.
+    pub fn reserve(&mut self, capacity: i32) {
+        if capacity > self.reserved {
+            self.reserved = capacity;
+        }
+    }
+
+    /// Current preallocated buffer capacity in tokens, if any.
+    pub fn capacity(&self) -> Option<i32> {
+        self.keys.as_ref().map(|k| k.shape()[2])
+    }
+
+    /// Returns sliced key/value tensors up to the current offset, if any.
+    pub fn current_kv(&self) -> Option<(Array, Array)> {
+        match (&self.keys, &self.values) {
+            (Some(k), Some(v)) if self.offset > 0 => {
+                Some((
+                    k.index((Ellipsis, ..self.offset, ..)),
+                    v.index((Ellipsis, ..self.offset, ..)),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Borrow the underlying keys/values buffers (full preallocated length,
+    /// not sliced to offset). Returns `None` until the first `update_and_fetch`.
+    /// Useful for cache adapters that need to share storage.
+    pub fn keys_buffer(&self) -> Option<&Array> {
+        self.keys.as_ref()
+    }
+
+    pub fn values_buffer(&self) -> Option<&Array> {
+        self.values.as_ref()
+    }
+
+    /// Compact the "appended window" `[past_length .. offset)` by keeping
+    /// only the slots in `keep_indices` (interpreted as offsets within the
+    /// window: `0` ⇒ position `past_length`, `1` ⇒ `past_length + 1`, …).
+    /// Kept slots are written contiguously starting at `past_length` and
+    /// `offset` becomes `past_length + keep_indices.len()`.
+    ///
+    /// Used by tree-based speculative decoding (e.g. DDTree) to drop
+    /// rejected branches from the middle of a verify forward in-place,
+    /// avoiding the cost of rolling back and re-feeding the accepted
+    /// prefix. `keep_indices` must be a 1-D int32 tensor; its values must
+    /// be in `[0, offset - past_length)`. Out-of-bounds indices are
+    /// silently treated as if they were the last position (mlx semantics).
+    pub fn compact(&mut self, past_length: i32, keep_indices: &Array) -> Result<(), Exception> {
+        let past_length = past_length.max(0);
+        if past_length >= self.offset {
+            return Ok(());
+        }
+        let keep_count = keep_indices.shape()[0];
+        if keep_count == 0 {
+            self.offset = past_length;
+            return Ok(());
+        }
+        let current_length = self.offset - past_length;
+        if keep_count == current_length {
+            // Fast path: a full-length `keep_indices` is assumed to be the
+            // identity permutation 0,1,...,n-1 (DDTree's accepted path is
+            // generally a proper subset, so this case means "keep all").
+            // PRECONDITION: a full-length *non-identity* permutation would
+            // be silently ignored here; debug builds verify it.
+            #[cfg(debug_assertions)]
+            {
+                if let Ok(idx) = keep_indices.try_as_slice::<i32>() {
+                    debug_assert!(
+                        idx.iter().enumerate().all(|(i, &v)| v == i as i32),
+                        "KVCache::compact: full-length keep_indices must be the identity permutation"
+                    );
+                }
+            }
+            return Ok(());
+        }
+        if let (Some(keys), Some(values)) = (self.keys.as_mut(), self.values.as_mut()) {
+            // Single fused Metal dispatch per K/V: prefix [0..past_length)
+            // copies straight through, suffix [past_length..past_length+keep_count)
+            // gathers from input[past_length + keep_indices[i]]. Replaces the
+            // prior two-dispatch take_axis + index_mut pattern.
+            let new_keys = crate::metal_kernels::kv_compact(keys, past_length, keep_indices)?;
+            let new_values = crate::metal_kernels::kv_compact(values, past_length, keep_indices)?;
+            // The fused kernel produces a buffer of length past_length +
+            // keep_count, which is smaller than the original preallocated
+            // capacity; the next `update_and_fetch` will grow it as needed.
+            *keys = new_keys;
+            *values = new_values;
+        }
+        self.offset = past_length + keep_count;
+        Ok(())
+    }
+
+    /// Drop the last `n_drop` cached positions by rewinding `offset`. The
+    /// underlying preallocated buffer is unchanged; the next
+    /// `update_and_fetch` will overwrite the rolled-back slots in place.
+    ///
+    /// Used by DFlash-style speculative-decoding rollback: after the target
+    /// verifies a draft block, if N positions are accepted we trim the
+    /// remaining `verify_len - N` positions in O(1) instead of cloning the
+    /// pre-verify cache and re-running a forward pass.
+    pub fn trim(&mut self, n_drop: i32) {
+        if n_drop <= 0 {
+            return;
+        }
+        let dropped = n_drop.min(self.offset);
+        self.offset -= dropped;
+    }
+
+    /// Save the cache's K/V state (sliced to `offset`) to a safetensors
+    /// file. Used by the prompt-cache prefix feature so a pre-filled KV
+    /// state for a long system prompt can be reused across requests.
+    ///
+    /// Metadata: `offset` is encoded so the loader knows the cached
+    /// length without inspecting tensor shapes.
+    pub fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> Result<(), Exception> {
+        use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
+        let (k, v) = match (self.keys.as_ref(), self.values.as_ref()) {
+            (Some(k), Some(v)) => (k, v),
+            _ => return Err(Exception::custom("KVCache::save_to_path: cache is empty")),
+        };
+        let k_sliced = k.index((Ellipsis, ..self.offset, ..));
+        let v_sliced = v.index((Ellipsis, ..self.offset, ..));
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("offset".to_string(), self.offset.to_string());
+        meta.insert("step".to_string(), self.step.to_string());
+        mlx_rs::Array::save_safetensors(
+            [("k", &k_sliced), ("v", &v_sliced)],
+            Some(&meta),
+            path.as_ref(),
+        )
+        .map_err(|e| Exception::custom(format!("save_safetensors: {e}")))?;
+        Ok(())
+    }
+
+    /// Save a Vec<KVCache> (one per layer slot) + the corresponding
+    /// prompt-token sequence to a directory. Used by the prompt-cache
+    /// prefix feature to persist a pre-filled KV state for a long
+    /// system prompt so it can be reused across requests.
+    pub fn save_kv_caches(
+        caches: &[KVCache],
+        tokens: &[i32],
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<(), Exception> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Exception::custom(format!("create_dir_all {}: {e}", dir.display())))?;
+        for (i, c) in caches.iter().enumerate() {
+            if c.offset == 0 {
+                // Cache was never written (e.g. a layer that isn't a
+                // KV-storing slot). Skip — the loader treats absent
+                // files as empty.
+                continue;
+            }
+            c.save_to_path(dir.join(format!("cache_{i}.safetensors")))?;
+        }
+        let manifest = serde_json::json!({
+            "tokens": tokens,
+            "n_caches": caches.len(),
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest)
+                .map_err(|e| Exception::custom(format!("manifest serialize: {e}")))?,
+        )
+        .map_err(|e| Exception::custom(format!("write manifest: {e}")))?;
+        Ok(())
+    }
+
+    /// Try to load a prompt-prefix KV cache for `prompt_tokens`. Returns
+    /// `Some((caches, n_cached_tokens))` when the cached prefix matches.
+    /// The caller should then prefill only `prompt_tokens[n_cached..]`.
+    pub fn try_load_kv_caches(
+        prompt_tokens: &[i32],
+        dir: impl AsRef<std::path::Path>,
+    ) -> Result<Option<(Vec<KVCache>, usize)>, Exception> {
+        let dir = dir.as_ref();
+        let manifest_path = dir.join("manifest.json");
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&manifest_path)
+            .map_err(|e| Exception::custom(format!("read manifest: {e}")))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| Exception::custom(format!("manifest parse: {e}")))?;
+        let cached_tokens: Vec<i32> = manifest
+            .get("tokens")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_i64().map(|n| n as i32)).collect())
+            .unwrap_or_default();
+        let n = cached_tokens.len();
+        if n == 0 || prompt_tokens.len() < n {
+            return Ok(None);
+        }
+        if prompt_tokens[..n] != cached_tokens[..] {
+            return Ok(None);
+        }
+        // Leave at least 1 token in the suffix so the caller still has
+        // something to prefill + sample from. Degenerate-case guard for
+        // the bench scenario where the prompt is identical run-to-run.
+        let n = n.min(prompt_tokens.len() - 1);
+        if n == 0 {
+            return Ok(None);
+        }
+        let n_caches = manifest
+            .get("n_caches")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let mut caches = Vec::with_capacity(n_caches);
+        for i in 0..n_caches {
+            let path = dir.join(format!("cache_{i}.safetensors"));
+            let mut cache = if path.exists() {
+                KVCache::load_from_path(&path)?
+            } else {
+                // Absent slot: empty cache (skipped during save).
+                KVCache::new()
+            };
+            // Trim to the (possibly degenerate-case-capped) prefix length.
+            let cache_offset = cache.offset();
+            if cache_offset > n as i32 {
+                cache.trim(cache_offset - n as i32);
+            }
+            caches.push(cache);
+        }
+        Ok(Some((caches, n)))
+    }
+
+    /// Restore a KVCache from a file produced by `save_to_path`.
+    pub fn load_from_path(path: impl AsRef<std::path::Path>) -> Result<Self, Exception> {
+        let map = mlx_rs::Array::load_safetensors(path.as_ref())
+            .map_err(|e| Exception::custom(format!("load_safetensors: {e}")))?;
+        let keys = map
+            .get("k")
+            .cloned()
+            .ok_or_else(|| Exception::custom("KVCache::load_from_path: missing 'k'"))?;
+        let values = map
+            .get("v")
+            .cloned()
+            .ok_or_else(|| Exception::custom("KVCache::load_from_path: missing 'v'"))?;
+        let kshape = keys.shape();
+        let offset = kshape[kshape.len() - 2];
+        Ok(Self {
+            keys: Some(keys),
+            values: Some(values),
+            offset,
+            step: 256,
+            reserved: 0,
+        })
+    }
+
+    /// Materialize lazy computation graphs for cached arrays.
+    pub fn eval(&self) -> Result<(), Exception> {
+        let mut arrays: Vec<&Array> = Vec::new();
+        if let Some(k) = &self.keys {
+            arrays.push(k);
+        }
+        if let Some(v) = &self.values {
+            arrays.push(v);
+        }
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
+        Ok(())
+    }
 }
 
 impl KeyValueCache for KVCache {
@@ -149,8 +545,15 @@ impl KeyValueCache for KVCache {
             let k_head_dim = keys_shape[3];
             let v_head_dim = values_shape[3];
 
-            let n_steps = (self.step + num_new - 1) / self.step;
-            let new_size = n_steps * self.step;
+            let needed = prev + num_new;
+            // Round needed up to the next step boundary, then honor any
+            // reservation hint set before the first update_and_fetch.
+            let n_steps = (needed + self.step - 1) / self.step;
+            let mut new_size = n_steps * self.step;
+            if self.keys.is_none() && self.reserved > new_size {
+                let reserved_steps = (self.reserved + self.step - 1) / self.step;
+                new_size = reserved_steps * self.step;
+            }
 
             let k_shape = &[b, n_kv_heads, new_size, k_head_dim];
             let v_shape = &[b, n_kv_heads, new_size, v_head_dim];
@@ -191,5 +594,1502 @@ impl KeyValueCache for KVCache {
             k.index((Ellipsis, ..self.offset, ..)),
             v.index((Ellipsis, ..self.offset, ..)),
         ))
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        KVCache::current_kv(self)
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        KVCache::eval(self)
+    }
+
+    fn trim_kv(&mut self, n_drop: i32) -> Result<(), Exception> {
+        self.trim(n_drop);
+        Ok(())
+    }
+
+    fn compact_kv(
+        &mut self,
+        past_length: i32,
+        keep_indices: &Array,
+    ) -> Result<(), Exception> {
+        self.compact(past_length, keep_indices)
+    }
+}
+
+// ============================================================================
+// TurboQuantKVCache — 4-bit Lloyd-Max on Hadamard-rotated keys (spike)
+// ============================================================================
+
+/// KV cache where keys are stored in TurboQuant 4-bit form (Hadamard-
+/// rotated + per-vector sigma + Lloyd-Max N(0,1) codebook) and values
+/// are stored in 8-bit per-group form (stock `mlx_rs::ops::quantize`
+/// symmetric absmax, group_size=64). Sink tokens (configurable, default
+/// 4) stay at the native dtype on both K and V — per the upstream
+/// `tq-kv` 3-Fix ablation, these first few tokens carry the
+/// disproportionate attention weight at decode time and quantizing them
+/// is the largest single source of quality loss.
+///
+/// Memory (Gemma4-26B-A4B sliding head, head_dim=256, group_size=64):
+///   - K: 512 bytes BF16  → 128 (packed) + 4 (sigma) + 4 (mean) = 136 B  ≈ 3.8×
+///   - V: 512 bytes BF16  → 256 (u32 packed) + 16 (4 scales) + 16 (4 biases) ≈ 1.7×
+///   - Combined KV: ≈ 2.6× compression including the sink-token overhead.
+///   - Long contexts amortise the sink-token cost: 4 BF16-sink tokens on
+///     a 4096-token cache add ~0.1% overhead vs the compressed bulk.
+///
+/// Spike caveats (matches `turboquant.rs`):
+///   - No pre-RoPE quantization, no QJL, no calibrated codebooks.
+///   - V uses mlx stock symmetric quantize; the upstream paper's
+///     4-bit V path (+1.3% PPL) would need a Lloyd-Max V codebook.
+///   - Cached signs reuse the same seed across all cycles; for safety
+///     across a long process lifetime, use a unique seed per cache.
+#[derive(Debug, Clone)]
+pub struct TurboQuantKVCache {
+    /// Packed 4-bit key indices, shape `[B, H, n_tokens, D/8]` u32.
+    /// Holds only positions [sink_tokens..offset). Positions [0..sink)
+    /// live in `sink_keys` at native dtype.
+    packed_keys: Option<Array>,
+    /// Per-vector sigma for compressed K, shape `[B, H, n_compressed]` f32.
+    key_sigma: Option<Array>,
+    /// Per-vector mean for compressed K, shape `[B, H, n_compressed]` f32.
+    key_mean: Option<Array>,
+    /// Sink tokens for K: first `sink_tokens` positions kept at native
+    /// dtype, shape `[B, H, n_sink, D]`. None until the first update.
+    sink_keys: Option<Array>,
+    /// Compressed values: quantized `[B, H, n_compressed, packed_cols]`,
+    /// scales/biases broadcast over groups.
+    quant_v: Option<Array>,
+    v_scales: Option<Array>,
+    v_biases: Option<Array>,
+    /// Sink tokens for V: first `sink_tokens` positions at native dtype.
+    sink_values: Option<Array>,
+    /// Number of sink tokens (capped at `offset` until the cache grows).
+    sink_tokens: i32,
+    /// Group size for V's per-group quantizer (must divide head_dim).
+    v_group_size: i32,
+    /// Bits for V (default 8; supported: 4 or 8).
+    v_bits: i32,
+    offset: i32,
+    /// Sign tensor seed (deterministic across the lifetime of this cache).
+    seed: u64,
+    /// Model dtype captured at the first append, so `current_kv` can rebuild
+    /// K/V at the correct precision instead of guessing (the u32-packed bulk
+    /// doesn't carry the original dtype).
+    model_dtype: Option<mlx_rs::Dtype>,
+    /// Device-resident `[D]` sign tensor for this cache's seed, built lazily
+    /// on first use. Avoids cloning the host `Vec` out of the global signs
+    /// mutex and re-uploading it on every decode step.
+    signs_device: Option<Array>,
+    /// `TURBOQUANT_FUSED_KV_MIN` — read once at construction; env lookups
+    /// in the per-token fused-attention path are measurable overhead.
+    fused_kv_min: i32,
+    /// `TURBOQUANT_ONLINE` (default on) — read once at construction.
+    online_enabled: bool,
+    /// `TURBOQUANT_SIMD_MATMUL` (default off) — read once at construction.
+    simd_matmul: bool,
+}
+
+impl TurboQuantKVCache {
+    pub fn new() -> Self {
+        // Default sink size from env (TURBOQUANT_SINK_TOKENS, defaults to 4).
+        // Set to 0 to exclusively use the fully-fused SDPA path on the
+        // entire compressed bulk.
+        let sink_tokens: i32 = std::env::var("TURBOQUANT_SINK_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        Self {
+            packed_keys: None,
+            key_sigma: None,
+            key_mean: None,
+            sink_keys: None,
+            quant_v: None,
+            v_scales: None,
+            v_biases: None,
+            sink_values: None,
+            sink_tokens,
+            v_group_size: 64,
+            v_bits: 8,
+            offset: 0,
+            seed: 0x5EED_5EED,
+            model_dtype: None,
+            signs_device: None,
+            fused_kv_min: std::env::var("TURBOQUANT_FUSED_KV_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8192),
+            online_enabled: std::env::var("TURBOQUANT_ONLINE")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            simd_matmul: std::env::var("TURBOQUANT_SIMD_MATMUL")
+                .map(|v| v != "0")
+                .unwrap_or(false),
+        }
+    }
+
+    /// Device-resident `[D]` sign tensor for this cache's seed, cached after
+    /// the first call.
+    fn signs(&mut self, d: i32) -> Array {
+        if self
+            .signs_device
+            .as_ref()
+            .is_none_or(|s| s.shape()[0] != d)
+        {
+            let signs_vec = crate::turboquant::cached_signs(d, self.seed);
+            self.signs_device = Some(Array::from_slice(&signs_vec, &[d]));
+        }
+        self.signs_device.as_ref().unwrap().clone()
+    }
+
+    /// Compress and append a new K/V block without reconstructing the full
+    /// cache. `update_and_fetch` layers reconstruction on top of this;
+    /// `try_fused_attention` calls it directly so the per-token decode path
+    /// never builds (and discards) the full-history reconstruct graph.
+    ///
+    /// Returns `(head_dim, dtype)` of the appended block for callers that
+    /// do want to reconstruct afterwards.
+    fn append_block(
+        &mut self,
+        keys: Array,
+        values: Array,
+    ) -> Result<(i32, mlx_rs::Dtype), Exception> {
+        use crate::turboquant::BOUNDARIES_4BIT;
+        let k_shape = keys.shape();
+        let b = k_shape[0];
+        let h = k_shape[1];
+        let t_new = k_shape[2];
+        let d = k_shape[3];
+        let dtype = keys.dtype();
+        // Remember the model dtype so current_kv can rebuild at the right
+        // precision (the compressed bulk is u32-packed and loses it).
+        if self.model_dtype.is_none() {
+            self.model_dtype = Some(dtype);
+        }
+
+        // Determine how many of the new tokens go into the sink (kept at
+        // native dtype) vs the compressed bulk. Sink positions are the
+        // first `sink_tokens` positions of the whole cache; once the
+        // sink is full all subsequent tokens go to the bulk.
+        let already_sinked = self
+            .sink_keys
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let sink_room = (self.sink_tokens - already_sinked).max(0);
+        let n_to_sink = sink_room.min(t_new);
+        let n_to_compress = t_new - n_to_sink;
+
+        if n_to_sink > 0 {
+            let k_sink = keys.index((Ellipsis, ..n_to_sink, ..));
+            let v_sink = values.index((Ellipsis, ..n_to_sink, ..));
+            self.sink_keys = Some(match self.sink_keys.take() {
+                Some(prev) => concatenate_axis(&[prev, k_sink], 2)?,
+                None => k_sink,
+            });
+            self.sink_values = Some(match self.sink_values.take() {
+                Some(prev) => concatenate_axis(&[prev, v_sink], 2)?,
+                None => v_sink,
+            });
+        }
+
+        if n_to_compress > 0 {
+            let k_bulk = keys.index((Ellipsis, n_to_sink.., ..));
+            let v_bulk = values.index((Ellipsis, n_to_sink.., ..));
+
+            // Compress K via TurboQuant Metal kernel.
+            let signs = self.signs(d);
+            let boundaries = Array::from_slice(&BOUNDARIES_4BIT, &[15]);
+            let (packed_new, sigma_new, mean_new) =
+                crate::metal_kernels::tq_compress_4bit(&k_bulk, &signs, &boundaries)?;
+            let packed_new = packed_new.reshape(&[b, h, n_to_compress, d / 8])?;
+            let sigma_new = sigma_new.reshape(&[b, h, n_to_compress])?;
+            let mean_new = mean_new.reshape(&[b, h, n_to_compress])?;
+
+            // Compress V via stock symmetric per-group quantize. Reshape
+            // [B, H, T, D] → [B*H*T, D] so quantize sees a 2D input and
+            // produces grouped scales along the last axis.
+            let v_flat = v_bulk.reshape(&[b * h * n_to_compress, d])?;
+            let (vq, vs, vbi) = mlx_rs::ops::quantize(
+                &v_flat,
+                self.v_group_size,
+                self.v_bits,
+                None::<&str>,
+            )?;
+            let n_groups = d / self.v_group_size;
+            let packed_v_cols = vq.shape()[1];
+            let vq = vq.reshape(&[b, h, n_to_compress, packed_v_cols])?;
+            let vs = vs.reshape(&[b, h, n_to_compress, n_groups])?;
+            let vbi = vbi.reshape(&[b, h, n_to_compress, n_groups])?;
+
+            self.packed_keys = Some(match self.packed_keys.take() {
+                Some(prev) => concatenate_axis(&[prev, packed_new], 2)?,
+                None => packed_new,
+            });
+            self.key_sigma = Some(match self.key_sigma.take() {
+                Some(prev) => concatenate_axis(&[prev, sigma_new], 2)?,
+                None => sigma_new,
+            });
+            self.key_mean = Some(match self.key_mean.take() {
+                Some(prev) => concatenate_axis(&[prev, mean_new], 2)?,
+                None => mean_new,
+            });
+            self.quant_v = Some(match self.quant_v.take() {
+                Some(prev) => concatenate_axis(&[prev, vq], 2)?,
+                None => vq,
+            });
+            self.v_scales = Some(match self.v_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, vs], 2)?,
+                None => vs,
+            });
+            self.v_biases = Some(match self.v_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, vbi], 2)?,
+                None => vbi,
+            });
+        }
+
+        self.offset += t_new;
+        Ok((d, dtype))
+    }
+
+    pub fn with_seed(seed: u64) -> Self {
+        Self { seed, ..Self::new() }
+    }
+
+    /// Override sink-token count. Set to 0 to disable.
+    pub fn with_sink_tokens(mut self, n: i32) -> Self {
+        self.sink_tokens = n.max(0);
+        self
+    }
+
+    /// Override V quantization config. `bits` must be 4 or 8.
+    pub fn with_v_quant(mut self, bits: i32, group_size: i32) -> Self {
+        self.v_bits = bits;
+        self.v_group_size = group_size;
+        self
+    }
+
+    /// Drop the last `n_drop` tokens from the cache (O(1) slice on each
+    /// underlying array). Used by speculative-decoding rollback when the
+    /// target rejects some drafted positions. Compressed-bulk tokens are
+    /// dropped first; if `n_drop` exceeds the bulk size, the sink is
+    /// trimmed too.
+    pub fn trim(&mut self, n_drop: i32) -> Result<(), Exception> {
+        if n_drop <= 0 || self.offset == 0 {
+            return Ok(());
+        }
+        let n_drop = n_drop.min(self.offset);
+        let n_sink_cur = self
+            .sink_keys
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let n_bulk_cur = self.offset - n_sink_cur;
+        let drop_bulk = n_drop.min(n_bulk_cur);
+        let drop_sink = n_drop - drop_bulk;
+
+        if drop_bulk > 0 {
+            let keep_bulk = n_bulk_cur - drop_bulk;
+            if keep_bulk == 0 {
+                self.packed_keys = None;
+                self.key_sigma = None;
+                self.key_mean = None;
+                self.quant_v = None;
+                self.v_scales = None;
+                self.v_biases = None;
+            } else {
+                self.packed_keys = self
+                    .packed_keys
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk, ..)));
+                self.key_sigma = self
+                    .key_sigma
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk)));
+                self.key_mean = self
+                    .key_mean
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk)));
+                self.quant_v = self
+                    .quant_v
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk, ..)));
+                self.v_scales = self
+                    .v_scales
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk, ..)));
+                self.v_biases = self
+                    .v_biases
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_bulk, ..)));
+            }
+        }
+
+        if drop_sink > 0 {
+            let keep_sink = n_sink_cur - drop_sink;
+            if keep_sink == 0 {
+                self.sink_keys = None;
+                self.sink_values = None;
+            } else {
+                self.sink_keys = self
+                    .sink_keys
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_sink, ..)));
+                self.sink_values = self
+                    .sink_values
+                    .take()
+                    .map(|a| a.index((Ellipsis, ..keep_sink, ..)));
+            }
+        }
+
+        self.offset -= n_drop;
+        Ok(())
+    }
+
+    /// Reconstruct the full keys tensor `[B, H, offset, D]` at the
+    /// caller-requested dtype: concatenates the native-dtype sink prefix
+    /// with the TurboQuant-decompressed bulk.
+    fn reconstruct_keys(&self, dtype: mlx_rs::Dtype, d: i32) -> Result<Array, Exception> {
+        use crate::turboquant::{cached_signs, CENTROIDS_4BIT};
+        let n_sink = self
+            .sink_keys
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let n_compressed = self.offset - n_sink;
+        if self.offset == 0 {
+            return Err(Exception::custom("reconstruct_keys on empty cache"));
+        }
+        let bulk = if n_compressed > 0 {
+            let packed = self
+                .packed_keys
+                .as_ref()
+                .expect("packed_keys unset with compressed positions");
+            let sigma = self.key_sigma.as_ref().expect("sigma unset");
+            let mean = self.key_mean.as_ref().expect("mean unset");
+            let shape = packed.shape().to_vec();
+            let b = shape[0];
+            let h = shape[1];
+            let packed_w = packed.index((Ellipsis, ..n_compressed, ..));
+            let sigma_w = sigma.index((Ellipsis, ..n_compressed));
+            let mean_w = mean.index((Ellipsis, ..n_compressed));
+            let signs_vec = cached_signs(d, self.seed);
+            let signs = Array::from_slice(&signs_vec, &[d]);
+            let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+            let out_shape = vec![b, h, n_compressed, d];
+            Some(crate::metal_kernels::tq_decompress_4bit(
+                &packed_w, &sigma_w, &mean_w, &signs, &centroids, &out_shape, dtype,
+            )?)
+        } else {
+            None
+        };
+        match (self.sink_keys.as_ref(), bulk) {
+            (Some(s), Some(b)) => concatenate_axis(&[s.clone(), b], 2),
+            (Some(s), None) => Ok(s.clone()),
+            (None, Some(b)) => Ok(b),
+            (None, None) => Err(Exception::custom("reconstruct_keys: nothing to return")),
+        }
+    }
+
+    /// Reconstruct the full values tensor `[B, H, offset, D]` by
+    /// concatenating sink V with dequantized bulk V.
+    fn reconstruct_values(&self, dtype: mlx_rs::Dtype) -> Result<Array, Exception> {
+        let n_sink = self
+            .sink_values
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let n_compressed = self.offset - n_sink;
+        if self.offset == 0 {
+            return Err(Exception::custom("reconstruct_values on empty cache"));
+        }
+        let bulk = if n_compressed > 0 {
+            let q = self.quant_v.as_ref().expect("quant_v unset");
+            let s = self.v_scales.as_ref().expect("v_scales unset");
+            let bi = self.v_biases.as_ref().expect("v_biases unset");
+            // q shape: [B, H, n_compressed, packed_cols]
+            // s/bi shape: [B, H, n_compressed, n_groups]
+            // We flatten to [B*H*n_compressed, packed_cols] for dequantize,
+            // then reshape back.
+            let qs = q.shape();
+            let b = qs[0];
+            let h = qs[1];
+            let t = qs[2];
+            let packed_cols = qs[3];
+            let n_groups = s.shape()[3];
+            let head_dim = n_groups * self.v_group_size;
+            let q_flat = q.reshape(&[b * h * t, packed_cols])?;
+            let s_flat = s.reshape(&[b * h * t, n_groups])?;
+            let bi_flat = bi.reshape(&[b * h * t, n_groups])?;
+            let deq = mlx_rs::ops::dequantize(
+                &q_flat,
+                &s_flat,
+                &bi_flat,
+                self.v_group_size,
+                self.v_bits,
+                None::<&str>,
+            )?
+            .as_dtype(dtype)?
+            .reshape(&[b, h, t, head_dim])?;
+            Some(deq)
+        } else {
+            None
+        };
+        match (self.sink_values.as_ref(), bulk) {
+            (Some(s), Some(b)) => concatenate_axis(&[s.clone(), b], 2),
+            (Some(s), None) => Ok(s.clone()),
+            (None, Some(b)) => Ok(b),
+            (None, None) => Err(Exception::custom("reconstruct_values: nothing to return")),
+        }
+    }
+}
+
+impl Default for TurboQuantKVCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyValueCache for TurboQuantKVCache {
+    fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        None
+    }
+
+    fn trim_kv(&mut self, n_drop: i32) -> Result<(), Exception> {
+        TurboQuantKVCache::trim(self, n_drop)
+    }
+
+    fn reset(&mut self) {
+        self.packed_keys = None;
+        self.key_sigma = None;
+        self.key_mean = None;
+        self.sink_keys = None;
+        self.quant_v = None;
+        self.v_scales = None;
+        self.v_biases = None;
+        self.sink_values = None;
+        self.offset = 0;
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+    ) -> Result<(Array, Array), Exception> {
+        let (d, dtype) = self.append_block(keys, values)?;
+        let k_full = self.reconstruct_keys(dtype, d)?;
+        let v_full = self.reconstruct_values(dtype)?;
+        Ok((k_full, v_full))
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        if self.offset == 0 {
+            return None;
+        }
+        // Infer head_dim + dtype from whichever side has the larger
+        // surface (sink for very small caches, compressed otherwise).
+        let (d, dtype) = if let Some(s) = self.sink_values.as_ref() {
+            (s.shape()[3], s.dtype())
+        } else if let Some(q) = self.quant_v.as_ref() {
+            let packed_cols = q.shape()[3];
+            // Recover D from packed_cols: packed_cols * 32 / v_bits.
+            let d = (packed_cols * 32) / self.v_bits;
+            // quant_v is uint32-packed and doesn't carry the original dtype;
+            // use the dtype captured at the first append (bf16 only as a last
+            // resort if the cache was somehow populated without one).
+            (d, self.model_dtype.unwrap_or(mlx_rs::Dtype::Bfloat16))
+        } else {
+            return None;
+        };
+        let k = self.reconstruct_keys(dtype, d).ok()?;
+        let v = self.reconstruct_values(dtype).ok()?;
+        Some((k, v))
+    }
+
+    fn try_fused_attention(
+        &mut self,
+        q: &Array,
+        k_new: Array,
+        v_new: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        kv_repeat: i32,
+    ) -> Result<Option<Array>, Exception> {
+        use crate::turboquant::CENTROIDS_4BIT;
+        // Spike scope: q_len=1 only. Prefill / multi-token verify
+        // (q_len > 1) takes the standard update_and_fetch + SDPA path.
+        let qs = q.shape();
+        if qs.len() != 4 || qs[2] != 1 {
+            return Ok(None);
+        }
+        // The fused SDPA kernels (tq_sdpa_4bit{,_online,_online_simd}) hardcode
+        // 8-bit V packing (D/4 u32 words, 4 values/word). With v_bits != 8 the
+        // V unpack reads the wrong words/lanes and can run off the buffer, so
+        // fall back to the reconstruct+SDPA path (which honors v_bits) by
+        // returning None BEFORE appending — the caller runs its own
+        // update_and_fetch on None, matching the q_len > 1 early return above.
+        if self.v_bits != 8 {
+            return Ok(None);
+        }
+        let b = qs[0];
+        let h_q = qs[1];
+        let d = qs[3];
+        let dtype = q.dtype();
+
+        // Append the new block first so subsequent reasoning sees the
+        // updated offset and the right sink/bulk split. Append-only: no
+        // full-cache reconstruct graph is built (that cost the old
+        // `update_and_fetch` call here paid on every decode token).
+        self.append_block(k_new, v_new)?;
+        // Materialize the signs array up front (single &mut borrow) so the
+        // fast paths below can hold shared borrows of the packed buffers.
+        let signs = self.signs(d);
+
+        let n_sink = self
+            .sink_keys
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let n_bulk = self.offset - n_sink;
+
+        // FAST PATH: fully-fused single-dispatch SDPA. Requires:
+        //   - no sink tokens (set TURBOQUANT_SINK_TOKENS=0)
+        //   - bulk fits in the kernel's scratch buffer (TQ_SDPA_MAX_KV)
+        //   - kv_len ≥ TURBOQUANT_FUSED_KV_MIN.
+        //
+        // Default kv_min is high (8192) because at small kv_len the
+        // single-threadgroup-per-head design (8 thread-groups × 64
+        // threads = 512 threads total) underutilises the GPU vs stock
+        // mlx SDPA which schedules thousands of threadgroups. The fused
+        // kernel becomes a win only at long contexts where K-decompress
+        // bytes dominate kernel-launch + V-matmul costs.
+        let fused_min = self.fused_kv_min;
+        // NOTE: with the default fused_min (8192) > TQ_SDPA_MAX_KV (2048)
+        // this path is intentionally unreachable — the bounded-kv kernel
+        // only wins when explicitly tuned. It activates when
+        // TURBOQUANT_FUSED_KV_MIN is lowered to ≤ TQ_SDPA_MAX_KV (e.g. for
+        // benchmarking); the online kernel below (path B) is the default
+        // long-context fast path.
+        let bulk_ok = n_sink == 0
+            && n_bulk >= fused_min
+            && n_bulk <= crate::metal_kernels::TQ_SDPA_MAX_KV;
+        if bulk_ok {
+            // FAST PATH A: bounded-kv (≤ TQ_SDPA_MAX_KV) shared-mem-scores
+            // kernel. Lowest latency when kv fits the scratch buffer; unlike
+            // path B it has no `d % 64 == 0` requirement.
+            let packed = self.packed_keys.as_ref().unwrap();
+            let sigma = self.key_sigma.as_ref().unwrap();
+            let mean = self.key_mean.as_ref().unwrap();
+            let pv = self.quant_v.as_ref().unwrap();
+            let vs = self.v_scales.as_ref().unwrap();
+            let vb = self.v_biases.as_ref().unwrap();
+            let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+            let out = crate::metal_kernels::tq_sdpa_4bit(
+                q, packed, sigma, mean, pv, vs, vb,
+                &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
+            )?;
+            return Ok(Some(out));
+        }
+        // FAST PATH B: online-softmax kernel for kv > TQ_SDPA_MAX_KV.
+        // Single Metal dispatch processes kv in 64-element tiles with
+        // flash-attention v2 streaming softmax, V dequantised once per
+        // tile into threadgroup memory (s_v_tile[64*64]) so the 64
+        // output threads read V from shared.  hermes_chat_simple bench
+        // (5183 tok, Gemma4-26B-A4B) lands at 4.5 tok/s decode vs 3.1
+        // partial-fuse and 1.8 BF16 baseline. Default ON; disable with
+        // TURBOQUANT_ONLINE=0.
+        let online_enabled = self.online_enabled;
+        if let (true, Some(packed)) = (
+            online_enabled && n_sink == 0 && n_bulk >= fused_min && d % 64 == 0,
+            self.packed_keys.as_ref(),
+        ) {
+            let sigma = self.key_sigma.as_ref().unwrap();
+            let mean = self.key_mean.as_ref().unwrap();
+            let pv = self.quant_v.as_ref().unwrap();
+            let vs = self.v_scales.as_ref().unwrap();
+            let vb = self.v_biases.as_ref().unwrap();
+            let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+            // TURBOQUANT_SIMD_MATMUL selects the wide 256-thread online kernel
+            // (tq_sdpa_4bit_online_simd). It now passes
+            // online_softmax_simd_matches_reference; gains over the default v2
+            // kernel are marginal (V matmul is a small fraction of decode), so
+            // it stays opt-in. Gate on != "0" so `=0` disables it, matching the
+            // TURBOQUANT_ONLINE convention (presence alone must not enable it).
+            let out = if self.simd_matmul {
+                crate::metal_kernels::tq_sdpa_4bit_online_simd(
+                    q, packed, sigma, mean, pv, vs, vb,
+                    &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
+                )?
+            } else {
+                crate::metal_kernels::tq_sdpa_4bit_online(
+                    q, packed, sigma, mean, pv, vs, vb,
+                    &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
+                )?
+            };
+            return Ok(Some(out));
+        }
+
+        // SLOW PATH: partially-fused (QK kernel + standalone softmax + V
+        // matmul) handles sink-token mixtures and oversized contexts.
+        // The cache was already updated at the top of this method.
+
+        // 2. Score the sink (BF16) prefix via a standard matmul.
+        // Output shape: [B, Hq, 1, n_sink].
+        let sink_scores = if n_sink > 0 {
+            let sk = self.sink_keys.as_ref().unwrap(); // [B, Hkv, n_sink, D]
+            let h_kv = sk.shape()[1];
+            // Expand sink K to GQA layout by repeating along head axis.
+            // Cheapest: matmul Q with sink K^T directly via per-head loop
+            // would be slow; instead reshape Q to [B, Hkv, kv_repeat, 1, D]
+            // and broadcast against sink K [B, Hkv, 1, n_sink, D]^T.
+            // Simpler: reshape Q to [B*Hq, 1, D] and tile sink K to
+            // [B*Hq, n_sink, D].
+            let sk_dt = sk.as_dtype(dtype)?;
+            // Tile sink K along head axis by kv_repeat.
+            // Reshape to [B, Hkv, 1, n_sink, D] → broadcast to
+            // [B, Hkv, kv_repeat, n_sink, D] → [B, Hq, n_sink, D].
+            let sk_5d = sk_dt
+                .reshape(&[b, h_kv, 1, n_sink, d])?;
+            let sk_tiled = mlx_rs::ops::broadcast_to(
+                &sk_5d,
+                &[b, h_kv, kv_repeat, n_sink, d],
+            )?
+            .reshape(&[b, h_q, n_sink, d])?;
+            // Q [B, Hq, 1, D] @ sk_tiled [B, Hq, D, n_sink].
+            let sk_t = sk_tiled.transpose_axes(&[0, 1, 3, 2])?;
+            Some(q.matmul(&sk_t)?.as_dtype(mlx_rs::Dtype::Float32)?)
+        } else {
+            None
+        };
+
+        // 3. Fused QK on the compressed bulk via tq_qk_score.
+        // Output shape: [B, Hq, 1, n_bulk] f32.
+        let bulk_scores = if n_bulk > 0 {
+            let packed = self
+                .packed_keys
+                .as_ref()
+                .ok_or_else(|| Exception::custom("bulk requested but packed_keys unset"))?;
+            let sigma = self.key_sigma.as_ref().unwrap();
+            let mean = self.key_mean.as_ref().unwrap();
+            let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
+            let scores = crate::metal_kernels::tq_qk_score(
+                q,
+                packed,
+                sigma,
+                mean,
+                &signs,
+                &centroids,
+                kv_repeat,
+            )?;
+            Some(scores)
+        } else {
+            None
+        };
+
+        // 4. Concatenate scores along the kv axis (sink first, then bulk).
+        let mut scores = match (sink_scores, bulk_scores) {
+            (Some(s), Some(b)) => concatenate_axis(&[s, b], 3)?,
+            (Some(s), None) => s,
+            (None, Some(b)) => b,
+            (None, None) => {
+                return Err(Exception::custom("try_fused_attention: empty cache"));
+            }
+        };
+
+        // 5. Scale + mask + softmax.
+        scores = scores.multiply(mlx_rs::array!(scale))?;
+        if let Some(m) = mask {
+            let m_f = m.as_dtype(mlx_rs::Dtype::Float32)?;
+            scores = scores.add(&m_f)?;
+        }
+        let attn = mlx_rs::ops::softmax_axis(&scores, -1, Some(true))?
+            .as_dtype(dtype)?;
+
+        // 6. V multiply on the reconstructed values (still dequantize V
+        // for the spike — fused V-mul is the next deferred item).
+        let v_full = self.reconstruct_values(dtype)?; // [B, Hkv, offset, D]
+        let h_kv = v_full.shape()[1];
+        let v_5d = v_full.reshape(&[b, h_kv, 1, self.offset, d])?;
+        let v_tiled = mlx_rs::ops::broadcast_to(&v_5d, &[b, h_kv, kv_repeat, self.offset, d])?
+            .reshape(&[b, h_q, self.offset, d])?;
+        let out = attn.matmul(&v_tiled)?;
+        Ok(Some(out))
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        let mut arrays: Vec<&Array> = Vec::new();
+        if let Some(a) = &self.packed_keys  { arrays.push(a); }
+        if let Some(a) = &self.key_sigma    { arrays.push(a); }
+        if let Some(a) = &self.key_mean     { arrays.push(a); }
+        if let Some(a) = &self.sink_keys    { arrays.push(a); }
+        if let Some(a) = &self.quant_v      { arrays.push(a); }
+        if let Some(a) = &self.v_scales     { arrays.push(a); }
+        if let Some(a) = &self.v_biases     { arrays.push(a); }
+        if let Some(a) = &self.sink_values  { arrays.push(a); }
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// QuantizedKVCache — K=q8, V=q4 mixed-precision KV cache
+// ============================================================================
+
+/// Mixed-precision KV cache: keys stored at q8, values at q4.
+///
+/// Tokens accumulate in an fp16 residual buffer until `step` tokens are
+/// ready, then the full block is quantized and appended.  Every call to
+/// `update_and_fetch` returns a fully dequantized view so attention
+/// computation is unaffected.
+///
+/// Storage shape convention (B=batch, H=heads, T=tokens, D=head_dim):
+/// - `k_q`      : `[B, H, n_quantized, D/(32/k_bits)]`
+/// - `k_scales` : `[B, H, n_quantized, D/group_size]`
+/// - `k_biases` : same shape as scales
+/// - Residual   : `[B, H, r, D]`  where `r < step`
+#[derive(Debug, Clone)]
+pub struct QuantizedKVCache {
+    // Quantized key storage [B, H, n_quantized, packed_cols]
+    k_q: Option<Array>,
+    k_scales: Option<Array>,
+    k_biases: Option<Array>,
+    // Quantized value storage [B, H, n_quantized, packed_cols]
+    v_q: Option<Array>,
+    v_scales: Option<Array>,
+    v_biases: Option<Array>,
+    // fp16 residual (tokens not yet quantized)
+    k_residual: Option<Array>,
+    v_residual: Option<Array>,
+    /// Group size used for quantization (must divide head_dim).
+    pub group_size: i32,
+    /// Bits per element for keys (8 recommended).
+    pub k_bits: i32,
+    /// Bits per element for values (4 recommended).
+    pub v_bits: i32,
+    /// Accumulate this many tokens before quantizing.
+    pub step: i32,
+    // Dimensions (set on first update_and_fetch)
+    batch: i32,
+    n_kv_heads: i32,
+    k_head_dim: i32,
+    v_head_dim: i32,
+    // Total tokens quantized (not counting residual)
+    n_quantized: i32,
+    offset: i32,
+}
+
+impl QuantizedKVCache {
+    /// Create a cache with explicit configuration.
+    ///
+    /// # Params
+    /// - `group_size` : quantization group size (must divide head_dim, typically 64)
+    /// - `k_bits`     : bits for keys (8)
+    /// - `v_bits`     : bits for values (4)
+    /// - `step`       : tokens to buffer before quantizing (256 matches KVCache default)
+    pub fn new(group_size: i32, k_bits: i32, v_bits: i32, step: i32) -> Self {
+        Self {
+            k_q: None,
+            k_scales: None,
+            k_biases: None,
+            v_q: None,
+            v_scales: None,
+            v_biases: None,
+            k_residual: None,
+            v_residual: None,
+            group_size,
+            k_bits,
+            v_bits,
+            step,
+            batch: 0,
+            n_kv_heads: 0,
+            k_head_dim: 0,
+            v_head_dim: 0,
+            n_quantized: 0,
+            offset: 0,
+        }
+    }
+
+    /// Default: K=q8, V=q4, group_size=64, step=256.
+    pub fn default_config() -> Self {
+        Self::new(64, 8, 4, 256)
+    }
+
+    /// Append a block of tokens: grow the unquantized residual and flush full
+    /// `step`-sized blocks into the quantized stores. Unlike `update_and_fetch`
+    /// this does NOT call `reconstruct`, so the fused attention path can append
+    /// and then attend directly on the quantized data, skipping the O(n)
+    /// full-history dequantize that every decode step would otherwise pay.
+    fn append(&mut self, keys: Array, values: Array) -> Result<(), Exception> {
+        let ks = keys.shape();
+        let b = ks[0];
+        let h = ks[1];
+        let t = ks[2];
+        let kd = ks[3];
+        let vd = values.shape()[3];
+
+        if self.batch == 0 {
+            if kd % self.group_size != 0 {
+                return Err(Exception::custom(format!(
+                    "QuantizedKVCache: k_head_dim={kd} not divisible by group_size={}",
+                    self.group_size
+                )));
+            }
+            if vd % self.group_size != 0 {
+                return Err(Exception::custom(format!(
+                    "QuantizedKVCache: v_head_dim={vd} not divisible by group_size={}",
+                    self.group_size
+                )));
+            }
+            self.batch = b;
+            self.n_kv_heads = h;
+            self.k_head_dim = kd;
+            self.v_head_dim = vd;
+        } else if b != self.batch || h != self.n_kv_heads {
+            return Err(Exception::custom(format!(
+                "QuantizedKVCache: batch/heads mismatch: expected ({},{}) got ({b},{h})",
+                self.batch, self.n_kv_heads
+            )));
+        }
+
+        let k_res = match self.k_residual.take() {
+            Some(prev) => concatenate_axis(&[prev, keys], 2)?,
+            None => keys,
+        };
+        let v_res = match self.v_residual.take() {
+            Some(prev) => concatenate_axis(&[prev, values], 2)?,
+            None => values,
+        };
+
+        let res_len = k_res.shape()[2];
+        let n_full_steps = res_len / self.step;
+
+        if n_full_steps > 0 {
+            let tokens_to_q = n_full_steps * self.step;
+            let remaining = res_len - tokens_to_q;
+
+            let k_to_q = k_res.index((Ellipsis, ..tokens_to_q, ..));
+            let v_to_q = v_res.index((Ellipsis, ..tokens_to_q, ..));
+
+            let (new_kq, new_ks, new_kb) =
+                Self::quantize_block(&k_to_q, b, h, tokens_to_q, kd, self.group_size, self.k_bits)?;
+            let (new_vq, new_vs, new_vb) =
+                Self::quantize_block(&v_to_q, b, h, tokens_to_q, vd, self.group_size, self.v_bits)?;
+
+            self.k_q = Some(match self.k_q.take() {
+                Some(prev) => concatenate_axis(&[prev, new_kq], 2)?,
+                None => new_kq,
+            });
+            self.k_scales = Some(match self.k_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, new_ks], 2)?,
+                None => new_ks,
+            });
+            self.k_biases = Some(match self.k_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, new_kb], 2)?,
+                None => new_kb,
+            });
+            self.v_q = Some(match self.v_q.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vq], 2)?,
+                None => new_vq,
+            });
+            self.v_scales = Some(match self.v_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vs], 2)?,
+                None => new_vs,
+            });
+            self.v_biases = Some(match self.v_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, new_vb], 2)?,
+                None => new_vb,
+            });
+
+            self.n_quantized += tokens_to_q;
+
+            if remaining > 0 {
+                self.k_residual = Some(k_res.index((Ellipsis, tokens_to_q.., ..)));
+                self.v_residual = Some(v_res.index((Ellipsis, tokens_to_q.., ..)));
+            }
+        } else {
+            self.k_residual = Some(k_res);
+            self.v_residual = Some(v_res);
+        }
+
+        self.offset += t;
+        Ok(())
+    }
+
+    /// Dequantize stored keys/values and concatenate with residual.
+    fn reconstruct(&self) -> Result<(Array, Array), Exception> {
+        let b = self.batch;
+        let h = self.n_kv_heads;
+        let kd = self.k_head_dim;
+        let vd = self.v_head_dim;
+        let n_q = self.n_quantized;
+
+        let (quant_k, quant_v) = if n_q > 0 {
+            // Flatten [B, H, n_q, packed] → [B*H*n_q, packed] for dequantize
+            let kq = self.k_q.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let ks = self.k_scales.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let kb = self.k_biases.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let k_deq = dequantize(&kq, &ks, &kb, self.group_size, self.k_bits, None::<&str>)?
+                .reshape(&[b, h, n_q, kd])?;
+
+            let vq = self.v_q.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let vs = self.v_scales.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let vb = self.v_biases.as_ref().unwrap().reshape(&[b * h * n_q, -1])?;
+            let v_deq = dequantize(&vq, &vs, &vb, self.group_size, self.v_bits, None::<&str>)?
+                .reshape(&[b, h, n_q, vd])?;
+
+            (Some(k_deq), Some(v_deq))
+        } else {
+            (None, None)
+        };
+
+        let full_k = match (quant_k, self.k_residual.as_ref()) {
+            (Some(qk), Some(r)) => concatenate_axis(&[qk, r.clone()], 2)?,
+            (Some(qk), None) => qk,
+            (None, Some(r)) => r.clone(),
+            (None, None) => return Err(Exception::custom("QuantizedKVCache: reconstruct on empty cache")),
+        };
+        let full_v = match (quant_v, self.v_residual.as_ref()) {
+            (Some(qv), Some(r)) => concatenate_axis(&[qv, r.clone()], 2)?,
+            (Some(qv), None) => qv,
+            (None, Some(r)) => r.clone(),
+            (None, None) => return Err(Exception::custom("QuantizedKVCache: reconstruct on empty cache")),
+        };
+
+        Ok((full_k, full_v))
+    }
+
+    /// Quantize a `[B, H, T, D]` block and store into `[B, H, T, packed_cols]`.
+    fn quantize_block(
+        arr: &Array,
+        b: i32, h: i32, t: i32, d: i32,
+        group_size: i32, bits: i32,
+    ) -> Result<(Array, Array, Array), Exception> {
+        // Flatten to 2D for the MLX quantize op
+        let flat = arr.reshape(&[b * h * t, d])?;
+        let (q, s, bv) = quantize(&flat, group_size, bits, None::<&str>)?;
+        // Reshape back so tokens stay on axis-2
+        let packed_cols = q.shape()[1];
+        let scale_cols = s.shape()[1];
+        Ok((
+            q.reshape(&[b, h, t, packed_cols])?,
+            s.reshape(&[b, h, t, scale_cols])?,
+            bv.reshape(&[b, h, t, scale_cols])?,
+        ))
+    }
+}
+
+impl Default for QuantizedKVCache {
+    fn default() -> Self {
+        Self::default_config()
+    }
+}
+
+impl QuantizedKVCache {
+    /// Persist the cache state to a single safetensors file.
+    ///
+    /// Each populated Option<Array> field (`k_q`/`k_scales`/`k_biases`/`v_q`/
+    /// `v_scales`/`v_biases`/`k_residual`/`v_residual`) is written under its
+    /// field name. Scalars (`group_size`, `k_bits`, `v_bits`, `step`,
+    /// `batch`, `n_kv_heads`, `k_head_dim`, `v_head_dim`, `n_quantized`,
+    /// `offset`) go into the safetensors metadata block. Returns an error
+    /// if the cache is uninitialised (`offset == 0`).
+    pub fn save_to_path(&self, path: impl AsRef<std::path::Path>) -> Result<(), Exception> {
+        if self.offset == 0 {
+            return Err(Exception::custom("QuantizedKVCache::save_to_path: empty cache"));
+        }
+        let mut tensors: Vec<(&str, &Array)> = Vec::new();
+        if let Some(t) = self.k_q.as_ref() { tensors.push(("k_q", t)); }
+        if let Some(t) = self.k_scales.as_ref() { tensors.push(("k_scales", t)); }
+        if let Some(t) = self.k_biases.as_ref() { tensors.push(("k_biases", t)); }
+        if let Some(t) = self.v_q.as_ref() { tensors.push(("v_q", t)); }
+        if let Some(t) = self.v_scales.as_ref() { tensors.push(("v_scales", t)); }
+        if let Some(t) = self.v_biases.as_ref() { tensors.push(("v_biases", t)); }
+        if let Some(t) = self.k_residual.as_ref() { tensors.push(("k_residual", t)); }
+        if let Some(t) = self.v_residual.as_ref() { tensors.push(("v_residual", t)); }
+
+        let mut meta = std::collections::HashMap::new();
+        for (k, v) in [
+            ("group_size", self.group_size),
+            ("k_bits", self.k_bits),
+            ("v_bits", self.v_bits),
+            ("step", self.step),
+            ("batch", self.batch),
+            ("n_kv_heads", self.n_kv_heads),
+            ("k_head_dim", self.k_head_dim),
+            ("v_head_dim", self.v_head_dim),
+            ("n_quantized", self.n_quantized),
+            ("offset", self.offset),
+        ] {
+            meta.insert(k.to_string(), v.to_string());
+        }
+        mlx_rs::Array::save_safetensors(tensors, Some(&meta), path.as_ref())
+            .map_err(|e| Exception::custom(format!("save_safetensors: {e}")))?;
+        Ok(())
+    }
+
+    /// Restore a QuantizedKVCache from a file produced by `save_to_path`.
+    pub fn load_from_path(path: impl AsRef<std::path::Path>) -> Result<Self, Exception> {
+        let (map, meta) = mlx_rs::Array::load_safetensors_with_metadata(path.as_ref())
+            .map_err(|e| Exception::custom(format!("load_safetensors_with_metadata: {e}")))?;
+        let get_int = |k: &str| -> Result<i32, Exception> {
+            meta.get(k)
+                .and_then(|v| v.parse::<i32>().ok())
+                .ok_or_else(|| Exception::custom(format!(
+                    "QuantizedKVCache::load_from_path: missing/invalid '{k}' in metadata"
+                )))
+        };
+        Ok(Self {
+            k_q: map.get("k_q").cloned(),
+            k_scales: map.get("k_scales").cloned(),
+            k_biases: map.get("k_biases").cloned(),
+            v_q: map.get("v_q").cloned(),
+            v_scales: map.get("v_scales").cloned(),
+            v_biases: map.get("v_biases").cloned(),
+            k_residual: map.get("k_residual").cloned(),
+            v_residual: map.get("v_residual").cloned(),
+            group_size: get_int("group_size")?,
+            k_bits: get_int("k_bits")?,
+            v_bits: get_int("v_bits")?,
+            step: get_int("step")?,
+            batch: get_int("batch")?,
+            n_kv_heads: get_int("n_kv_heads")?,
+            k_head_dim: get_int("k_head_dim")?,
+            v_head_dim: get_int("v_head_dim")?,
+            n_quantized: get_int("n_quantized")?,
+            offset: get_int("offset")?,
+        })
+    }
+}
+
+impl KeyValueCache for QuantizedKVCache {
+    fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        None
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new(self.group_size, self.k_bits, self.v_bits, self.step);
+    }
+
+    /// Drop the last `n_drop` tokens (F20). Only the unquantized residual is
+    /// trimmable — quantized blocks can't be partially un-quantized cheaply.
+    /// Speculative rollback only ever drops the just-appended draft tokens,
+    /// which are still in the residual (drafts are recent and `block_len` is
+    /// far smaller than `step`), so this covers the real case; trimming past
+    /// the residual into a quantized block returns an error rather than
+    /// silently corrupting.
+    fn trim_kv(&mut self, n_drop: i32) -> Result<(), Exception> {
+        if n_drop <= 0 {
+            return Ok(());
+        }
+        let res_len = self.k_residual.as_ref().map(|r| r.shape()[2]).unwrap_or(0);
+        if n_drop > res_len {
+            return Err(Exception::custom(format!(
+                "QuantizedKVCache::trim_kv: n_drop={n_drop} exceeds unquantized \
+                 residual={res_len}; trimming into quantized blocks is unsupported"
+            )));
+        }
+        let keep = res_len - n_drop;
+        if keep == 0 {
+            self.k_residual = None;
+            self.v_residual = None;
+        } else {
+            self.k_residual =
+                Some(self.k_residual.as_ref().unwrap().index((Ellipsis, ..keep, ..)));
+            self.v_residual =
+                Some(self.v_residual.as_ref().unwrap().index((Ellipsis, ..keep, ..)));
+        }
+        self.offset -= n_drop;
+        Ok(())
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+    ) -> Result<(Array, Array), Exception> {
+        self.append(keys, values)?;
+        self.reconstruct()
+    }
+
+    /// Fused decode attention on quantized K/V (F9). Computes
+    /// `softmax(Q·Kᵀ·scale)·V` directly from the quantized stores via
+    /// `quantized_matmul` (QKᵀ with `transpose=true`, PV with `transpose=false`)
+    /// plus a plain matmul over the small unquantized residual, so the full
+    /// O(n) dequantize that `update_and_fetch`→`reconstruct` performs on every
+    /// decode step is skipped. Only handles unmasked single-query decode; other
+    /// shapes return `None` (before appending) so the caller takes the
+    /// reconstruct+SDPA path. Output is `[B, Hq, 1, D]`.
+    fn try_fused_attention(
+        &mut self,
+        q: &Array,
+        k_new: Array,
+        v_new: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        kv_repeat: i32,
+    ) -> Result<Option<Array>, Exception> {
+        let qs = q.shape();
+        if qs.len() != 4 || qs[2] != 1 || mask.is_some() {
+            return Ok(None);
+        }
+        self.append(k_new, v_new)?;
+        if self.offset == 0 {
+            return Ok(None);
+        }
+
+        let (b, hq, d) = (qs[0], qs[1], qs[3]);
+        let hkv = self.n_kv_heads;
+
+        // GQA: fold the repeat factor into the q_len axis instead of
+        // expanding the quantized stores to Hq heads. The old
+        // broadcast_to + reshape expand materialized `kv_repeat` copies of
+        // the ENTIRE quantized K/V history per decode step per layer
+        // (reshaping a broadcast view forces the copy). Query head
+        // `hkv_idx * rep + r` maps to kv head `hkv_idx` in both layouts,
+        // so [B, Hq, 1, D] → [B, Hkv, rep, D] is the same pairing with the
+        // repeat sitting on the (batched-matmul) row axis.
+        let q_f = q.reshape(&[b, hkv, kv_repeat, d])?;
+
+        let n_q = self.n_quantized;
+        let n_res = self.k_residual.as_ref().map(|r| r.shape()[2]).unwrap_or(0);
+
+        // --- scores: [B, Hkv, rep, n] = concat(Q·K_qᵀ, Q·K_resᵀ) ---
+        let mut score_parts: Vec<Array> = Vec::new();
+        if n_q > 0 {
+            score_parts.push(mlx_rs::ops::quantized_matmul(
+                &q_f,
+                self.k_q.as_ref().unwrap(),
+                self.k_scales.as_ref().unwrap(),
+                self.k_biases.as_ref().unwrap(),
+                Some(true),
+                Some(self.group_size),
+                Some(self.k_bits),
+                None,
+            )?);
+        }
+        if n_res > 0 {
+            let kr = self.k_residual.as_ref().unwrap();
+            let kr_t = kr.transpose_axes(&[0, 1, 3, 2])?; // [B, Hkv, d, n_res]
+            score_parts.push(mlx_rs::ops::matmul(&q_f, &kr_t)?);
+        }
+        let scores = if score_parts.len() == 1 {
+            score_parts.pop().unwrap()
+        } else {
+            concatenate_axis(&score_parts.iter().collect::<Vec<_>>(), -1)?
+        };
+        let scale_arr = mlx_rs::array!(scale).as_dtype(scores.dtype())?;
+        let scores = scores.multiply(&scale_arr)?;
+        let probs = mlx_rs::ops::softmax_axis(&scores, -1, true)?; // [B, Hkv, rep, n]
+
+        // --- weighted V: P_q·V_q + P_res·V_res ---
+        let mut out: Option<Array> = None;
+        if n_q > 0 {
+            let p_q = probs.index((Ellipsis, ..n_q));
+            // P_q [.., n_q] · V[n_q, d]: contract n_q, V_q quantized along d →
+            // transpose=false (x · dequant(w)).
+            let o = mlx_rs::ops::quantized_matmul(
+                &p_q,
+                self.v_q.as_ref().unwrap(),
+                self.v_scales.as_ref().unwrap(),
+                self.v_biases.as_ref().unwrap(),
+                Some(false),
+                Some(self.group_size),
+                Some(self.v_bits),
+                None,
+            )?;
+            out = Some(o);
+        }
+        if n_res > 0 {
+            let p_res = probs.index((Ellipsis, n_q..));
+            let vr = self.v_residual.as_ref().unwrap(); // [B, Hkv, n_res, d]
+            let o = mlx_rs::ops::matmul(&p_res, vr)?; // [B, Hkv, rep, d]
+            out = Some(match out {
+                Some(prev) => prev.add(&o)?,
+                None => o,
+            });
+        }
+        // [B, Hkv, rep, d] → [B, Hq, 1, d]
+        out.map(|o| o.reshape(&[b, hq, 1, d]))
+            .transpose()}
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        if self.offset == 0 {
+            return None;
+        }
+        self.reconstruct().ok()
+    }
+
+    fn eval(&self) -> Result<(), Exception> {
+        let mut arrays: Vec<&Array> = Vec::new();
+        macro_rules! push_opt {
+            ($f:expr) => { if let Some(a) = &$f { arrays.push(a); } };
+        }
+        push_opt!(self.k_q);
+        push_opt!(self.k_scales);
+        push_opt!(self.k_biases);
+        push_opt!(self.v_q);
+        push_opt!(self.v_scales);
+        push_opt!(self.v_biases);
+        push_opt!(self.k_residual);
+        push_opt!(self.v_residual);
+        if !arrays.is_empty() {
+            mlx_rs::transforms::eval(arrays)?;
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::Array;
+
+    fn make_kv(b: i32, h: i32, t: i32, d: i32, seed: f32) -> (Array, Array) {
+        // Simple deterministic fill: value = (index * seed) % 1.0
+        let k_size = (b * h * t * d) as usize;
+        let k_data: Vec<f32> = (0..k_size).map(|i| ((i as f32) * seed) % 1.0).collect();
+        let v_data: Vec<f32> = (0..k_size).map(|i| ((i as f32) * seed * 0.5) % 1.0).collect();
+        (
+            Array::from_slice(&k_data, &[b, h, t, d]),
+            Array::from_slice(&v_data, &[b, h, t, d]),
+        )
+    }
+
+    #[test]
+    fn quantized_kv_cache_output_shape_single_call() {
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 256);
+        let (k, v) = make_kv(1, 4, 10, 256, 0.01);
+        let (k_out, v_out) = cache.update_and_fetch(k, v).unwrap();
+        assert_eq!(k_out.shape(), &[1, 4, 10, 256]);
+        assert_eq!(v_out.shape(), &[1, 4, 10, 256]);
+        assert_eq!(cache.offset(), 10);
+    }
+
+    #[test]
+    fn quantized_kv_cache_grows_across_decode_steps() {
+        // step=8 so quantization triggers after 8 tokens
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 8);
+        for i in 0..4_i32 {
+            let (k, v) = make_kv(1, 2, 4, 256, 0.01);
+            let (k_out, v_out) = cache.update_and_fetch(k, v).unwrap();
+            let expected = (i + 1) * 4;
+            assert_eq!(k_out.shape()[2], expected);
+            assert_eq!(v_out.shape()[2], expected);
+            assert_eq!(cache.offset(), expected);
+        }
+    }
+
+    #[test]
+    fn quantized_kv_cache_step_triggers_quantization() {
+        // After exactly `step` tokens the residual should be empty
+        let step = 64_i32;
+        let mut cache = QuantizedKVCache::new(64, 8, 4, step);
+        let (k, v) = make_kv(1, 4, step, 256, 0.01);
+        let _ = cache.update_and_fetch(k, v).unwrap();
+        assert_eq!(cache.n_quantized, step);
+        assert!(cache.k_residual.is_none(), "residual should be empty after full step");
+    }
+
+    #[test]
+    fn quantized_kv_cache_reset_clears_state() {
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 8);
+        let (k, v) = make_kv(1, 2, 8, 256, 0.01);
+        cache.update_and_fetch(k, v).unwrap();
+        assert_eq!(cache.offset(), 8);
+        cache.reset();
+        assert_eq!(cache.offset(), 0);
+        assert_eq!(cache.n_quantized, 0);
+        assert!(cache.k_q.is_none());
+        assert!(cache.k_residual.is_none());
+    }
+
+    #[test]
+    fn quantized_kv_cache_prefill_then_decode() {
+        // Prefill 100 tokens, then decode 50 single-token steps
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 64);
+        let (k_pre, v_pre) = make_kv(1, 4, 100, 256, 0.01);
+        let (k_out, _) = cache.update_and_fetch(k_pre, v_pre).unwrap();
+        assert_eq!(k_out.shape()[2], 100);
+
+        for step in 1..=50_i32 {
+            let (k, v) = make_kv(1, 4, 1, 256, 0.01 + step as f32 * 0.001);
+            let (k_out, _) = cache.update_and_fetch(k, v).unwrap();
+            assert_eq!(k_out.shape()[2], 100 + step);
+            assert_eq!(cache.offset(), 100 + step);
+        }
+    }
+
+    #[test]
+    fn quantized_kv_cache_residual_matches_fp16_before_quantize() {
+        // With step=256, first 255 tokens stay in residual; output should be
+        // numerically identical to KVCache (no quantization applied yet).
+        let mut fp16 = KVCache::new();
+        let mut qkv = QuantizedKVCache::new(64, 8, 4, 256);
+
+        for i in 0..10_i32 {
+            let (k, v) = make_kv(1, 4, 1, 256, 0.01 + i as f32 * 0.001);
+            let (fp_k, fp_v) = fp16.update_and_fetch(k.clone(), v.clone()).unwrap();
+            let (q_k, q_v) = qkv.update_and_fetch(k, v).unwrap();
+            assert_eq!(fp_k.shape(), q_k.shape(), "K shape mismatch at step {i}");
+            assert_eq!(fp_v.shape(), q_v.shape(), "V shape mismatch at step {i}");
+            // Pre-quantization the residual path must be bit-exact with
+            // KVCache, not just shape-compatible.
+            let k_eq = mlx_rs::ops::all_close(&fp_k, &q_k, None, None, None)
+                .unwrap()
+                .item::<bool>();
+            let v_eq = mlx_rs::ops::all_close(&fp_v, &q_v, None, None, None)
+                .unwrap()
+                .item::<bool>();
+            assert!(k_eq, "K values diverge from KVCache at step {i}");
+            assert!(v_eq, "V values diverge from KVCache at step {i}");
+        }
+        // No quantization triggered yet
+        assert_eq!(qkv.n_quantized, 0);
+        assert!(qkv.k_q.is_none());
+    }
+
+    #[test]
+    fn quantized_kv_cache_invalid_group_size_errors() {
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 256);
+        // head_dim=100 is not divisible by group_size=64
+        let (k, v) = make_kv(1, 4, 1, 100, 0.01);
+        let result = cache.update_and_fetch(k, v);
+        assert!(result.is_err(), "Expected error for non-divisible head_dim");
+    }
+
+    // F20: trim_kv drops recent tokens from the unquantized residual (the
+    // speculative-rollback case) and errors if asked to trim into a quantized
+    // block rather than corrupting silently.
+    #[test]
+    fn quantized_kv_trim_kv_residual() {
+        let mut cache = QuantizedKVCache::new(64, 8, 4, 256);
+        let (k, v) = make_kv(1, 2, 5, 64, 0.02); // 5 < step → all in residual
+        cache.update_and_fetch(k, v).unwrap();
+        assert_eq!(cache.offset(), 5);
+
+        cache.trim_kv(2).unwrap();
+        assert_eq!(cache.offset(), 3);
+        let (rk, _rv) = cache.current_kv().expect("non-empty");
+        assert_eq!(rk.shape()[2], 3, "reconstruct reflects the trim");
+
+        // Trimming past the residual is unsupported (would need to un-quantize).
+        assert!(cache.trim_kv(10).is_err());
+    }
+
+    // F9: the fused quantized-attention path must match the reconstruct+SDPA
+    // reference (both operate on identical quantized state, so they should
+    // agree up to float-accumulation order). Uses step=4 so a handful of tokens
+    // produce BOTH quantized blocks and an unquantized residual, and GQA
+    // (Hq=4, Hkv=2) so head expansion is exercised.
+    #[test]
+    fn quantized_kv_fused_attention_matches_reference() {
+        let (group_size, d, step) = (64i32, 64i32, 4i32);
+        let (b, hkv, hq) = (1i32, 2i32, 4i32);
+        let kv_repeat = hq / hkv;
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let mut cf = QuantizedKVCache::new(group_size, 8, 4, step);
+        let mut cr = QuantizedKVCache::new(group_size, 8, 4, step);
+        for i in 0..9 {
+            let (k, v) = make_kv(b, hkv, 1, d, 0.01 + i as f32 * 0.004);
+            cf.update_and_fetch(k.clone(), v.clone()).unwrap();
+            cr.update_and_fetch(k, v).unwrap();
+        }
+
+        // Decode query [B, Hq, 1, D] and the new K/V block.
+        let (q, _) = make_kv(b, hq, 1, d, 0.05);
+        let (kn, vn) = make_kv(b, hkv, 1, d, 0.07);
+
+        let fused = cf
+            .try_fused_attention(&q, kn.clone(), vn.clone(), scale, None, kv_repeat)
+            .unwrap()
+            .expect("fused path engaged");
+
+        // Reference: reconstruct full K/V, then GQA SDPA in plain ops.
+        let (fk, fv) = cr.update_and_fetch(kn, vn).unwrap(); // [B, Hkv, n, D]
+        let n = fk.shape()[2];
+        let expand = |x: &Array| -> Array {
+            let x32 = x
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .unwrap()
+                .reshape(&[b, hkv, 1, n, d])
+                .unwrap();
+            let xb = mlx_rs::ops::broadcast_to(&x32, &[b, hkv, kv_repeat, n, d]).unwrap();
+            xb.reshape(&[b, hq, n, d]).unwrap()
+        };
+        let kref = expand(&fk);
+        let vref = expand(&fv);
+        let scores = mlx_rs::ops::matmul(&q, kref.transpose_axes(&[0, 1, 3, 2]).unwrap())
+            .unwrap()
+            .multiply(mlx_rs::array!(scale))
+            .unwrap();
+        let p = mlx_rs::ops::softmax_axis(&scores, -1, true).unwrap();
+        let ref_out = mlx_rs::ops::matmul(&p, &vref).unwrap();
+
+        let fused_v = fused.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        mlx_rs::transforms::eval([&fused_v, &ref_out]).unwrap();
+        let fs = fused_v.as_slice::<f32>();
+        let rs = ref_out.as_slice::<f32>();
+        assert_eq!(fs.len(), rs.len());
+        let mut worst = 0f32;
+        for (a, c) in fs.iter().zip(rs.iter()) {
+            let diff = (a - c).abs() / c.abs().max(1.0);
+            if diff > worst {
+                worst = diff;
+            }
+        }
+        assert!(worst < 0.02, "fused vs reconstruct+SDPA rel-error {worst}");
+    }
+
+    // F21: current_kv must reconstruct at the model's dtype, not a hardcoded
+    // bf16. With sink_tokens=0 the bulk (quant_v) branch is taken, which
+    // previously always returned Bfloat16 and corrupted f16/f32 models.
+    #[test]
+    fn turboquant_current_kv_preserves_dtype() {
+        let mut cache = TurboQuantKVCache::new().with_sink_tokens(0);
+        let (k, v) = make_kv(1, 2, 8, 64, 0.01);
+        let k = k.as_dtype(mlx_rs::Dtype::Float16).unwrap();
+        let v = v.as_dtype(mlx_rs::Dtype::Float16).unwrap();
+        cache.update_and_fetch(k, v).unwrap();
+        let (rk, _rv) = cache.current_kv().expect("cache populated");
+        assert_eq!(
+            rk.dtype(),
+            mlx_rs::Dtype::Float16,
+            "current_kv must preserve the model dtype captured at append"
+        );
+    }
+
+    // F3: the TurboQuant fused SDPA kernels assume 8-bit V packing, so a
+    // v_bits=4 cache must NOT take the fused path (which would silently read
+    // the wrong bytes / run off the buffer). It falls back by returning None
+    // before appending, leaving the caller to run the v_bits-aware slow path.
+    #[test]
+    fn turboquant_v_bits_4_falls_back_from_fused_path() {
+        let mut cache = TurboQuantKVCache::new().with_v_quant(4, 32);
+        let (k, v) = make_kv(1, 2, 1, 64, 0.01); // q_len == 1, eligible shape
+        let q = Array::from_slice(&vec![0f32; 2 * 64], &[1, 2, 1, 64]);
+        let out = cache
+            .try_fused_attention(&q, k, v, 0.125, None, 1)
+            .unwrap();
+        assert!(
+            out.is_none(),
+            "v_bits=4 must fall back; the fused kernels assume 8-bit V"
+        );
+        // Guard returns before append, so nothing was consumed into the cache.
+        assert_eq!(cache.offset(), 0);
     }
 }

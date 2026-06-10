@@ -460,7 +460,7 @@ impl StepAudio2Pipeline {
     ) -> Result<Self> {
         let model = StepAudio2::load(&model_dir)?;
 
-        let mut pipeline = Self::new(model, config);
+        let pipeline = Self::new(model, config);
 
         // Load TTS decoder if enabled
         #[cfg(feature = "tts")]
@@ -608,6 +608,19 @@ impl StepAudio2Pipeline {
             // Store calls and results
             response.tool_calls.extend(calls);
             response.tool_results.extend(results.clone());
+
+            // Strip the processed <tool_call> spans from the text BEFORE
+            // appending results: `has_tool_call` rescans the whole text, so
+            // leaving the spans in place re-executed the same calls on every
+            // iteration up to max_tool_iterations.
+            while let Some(start) = response.text.find(crate::tools::markers::TOOL_CALL_START) {
+                let Some(end_rel) = response.text[start..].find(crate::tools::markers::TOOL_CALL_END)
+                else {
+                    break;
+                };
+                let end = start + end_rel + crate::tools::markers::TOOL_CALL_END.len();
+                response.text.replace_range(start..end, "");
+            }
 
             // TODO: Feed results back to model for continuation
             // For now, just append results to response

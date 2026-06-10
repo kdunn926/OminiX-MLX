@@ -22,8 +22,11 @@ where
 {
     let shapeless = shapeless.into().unwrap_or(false);
     move |args| {
-        // NOTE: we have to place this here to avoid the lifetime issue
-        // `f.compile` will look up the cached compiled function so it shouldn't result in re-compilation
+        // NOTE: constructed per call to avoid the GAT lifetime issue on
+        // `Args<'a>`. This is cheap because the backend compile cache is
+        // keyed by `F`'s TypeId and persists across `CompiledState`
+        // instances (see the no-Drop note on `CompiledState`), so
+        // `call_mut` hits the cached trace instead of recompiling.
         let mut compiled = f.compile(shapeless);
         compiled.call_mut(args)
     }
@@ -348,13 +351,7 @@ fn call_mut_inner(
     let result_vector = VectorArray::try_from_op(|res| unsafe {
         mlx_sys::mlx_closure_apply(res, compiled.as_ptr(), inner_inputs_vector.as_ptr())
     })?;
-    let result_plus_state_output: Vec<Array> = result_vector.try_into_values()?;
-
-    let result_len = result_plus_state_output.len();
-    Ok(result_plus_state_output
-        .into_iter()
-        .take(result_len)
-        .collect())
+    result_vector.try_into_values()
 }
 
 impl<F> CompiledState<F> {

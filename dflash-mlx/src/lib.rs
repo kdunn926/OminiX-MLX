@@ -1,0 +1,37 @@
+pub mod cache;
+pub mod engine;
+pub mod kernels;
+pub mod model;
+pub mod rollback;
+pub mod runtime;
+pub mod verify_qmm;
+
+pub use engine::acceptance::match_acceptance_length;
+pub use engine::config::{AdaptiveBlockPolicy, DDTreeConfig, SpeculativeCycleConfig};
+pub use engine::copyspec::CopySpecIndex;
+pub use engine::draft_adapter::DFlashDraftAdapter;
+pub use engine::gemma4_adapter::Gemma4TargetAdapter;
+pub use engine::qwen36_adapter::{DraftCheckpointInfo, MockDraftAdapter, Qwen36TargetAdapter};
+pub use engine::ddtree::{
+    accept_path, build_tree, compile_tree_inputs, topk_per_position, verify_tree_fused,
+    verify_tree_naive, GemmaTreeTarget, TreeNode,
+};
+pub use engine::spec_epoch::{
+    DFlashSession, DraftBlock, DraftModel, GenerateEvent, SessionMetrics, TargetModel,
+};
+pub use kernels::{gated_delta_with_tape, tape_replay};
+pub use verify_qmm::{
+    m4_ksplit_np_eligible, m4_ksplit_np_kparts, mma2big_eligible, verify_qmm_dispatch,
+    verify_qmm_m16_mma2big, verify_qmm_m4_ksplit_np,
+};
+pub use model::{DFlashDraftLayer, DFlashDraftModel, DFlashDraftModelArgs};
+pub use rollback::RecurrentRollbackCache;
+pub use runtime::loading::discover_draft_for_target;
+
+#[cfg(test)]
+pub(crate) fn mlx_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}

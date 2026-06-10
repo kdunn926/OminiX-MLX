@@ -239,26 +239,12 @@ impl TextAttention {
         let q = self.rope.apply(&q, 0)?;
         let k = self.rope.apply(&k, 0)?;
 
-        // Repeat KV heads for GQA
-        let num_groups = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(&k, num_groups)?;
-        let v = repeat_kv(&v, num_groups)?;
-
-        // Scaled dot-product attention
-        let attn = mlx_rs::ops::matmul(&q, &k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let attn = mlx_rs::ops::multiply(&attn, &Array::from_f32(self.scale))?;
-
-        // Apply mask if provided
-        let attn = if let Some(mask) = mask {
-            mlx_rs::ops::add(&attn, mask)?
-        } else {
-            attn
-        };
-
-        let attn = mlx_rs::ops::softmax_axis(&attn, -1, None)?;
-
-        // Apply attention to values
-        let out = mlx_rs::ops::matmul(&attn, &v)?;
+        // Fused SDPA: handles GQA natively (no K/V pre-tiling) and never
+        // materializes the [B, H, L, L] score tensor the manual
+        // matmul+softmax+matmul chain did.
+        let sdpa_mask = mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
+        let out =
+            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, sdpa_mask)?;
 
         // Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         let out = out.transpose_axes(&[0, 2, 1, 3])?
@@ -268,23 +254,6 @@ impl TextAttention {
     }
 }
 
-/// Repeat KV heads for GQA
-fn repeat_kv(x: &Array, num_groups: i32) -> Result<Array, Exception> {
-    if num_groups == 1 {
-        return Ok(x.clone());
-    }
-
-    let shape = x.shape();
-    let batch = shape[0];
-    let num_kv_heads = shape[1];
-    let seq_len = shape[2];
-    let head_dim = shape[3];
-
-    // [batch, kv_heads, seq, head_dim] -> [batch, kv_heads, num_groups, seq, head_dim]
-    let x = x.reshape(&[batch, num_kv_heads, 1, seq_len, head_dim])?;
-    let x = mlx_rs::ops::broadcast_to(&x, &[batch, num_kv_heads, num_groups, seq_len, head_dim])?;
-    x.reshape(&[batch, num_kv_heads * num_groups, seq_len, head_dim])
-}
 
 /// MLP with SwiGLU activation
 #[derive(Debug)]
@@ -396,8 +365,8 @@ impl QwenTextEncoder {
 
         // Create padding mask: -inf for padding (0), 0 for valid (1)
         // attention_mask: [batch, seq_len] -> [batch, 1, 1, seq_len]
-        let zeros_mask = Array::zeros::<f32>(&attention_mask.shape())?;
-        let neginf_mask = mlx_rs::ops::full::<f32>(&attention_mask.shape(), &neginf)?;
+        let zeros_mask = Array::zeros::<f32>(attention_mask.shape())?;
+        let neginf_mask = mlx_rs::ops::full::<f32>(attention_mask.shape(), &neginf)?;
         let one = Array::from_int(1);
         let mask_bool = attention_mask.eq(&one)?;
         let padding_mask = mlx_rs::ops::r#where(&mask_bool, &zeros_mask, &neginf_mask)?;
@@ -427,8 +396,19 @@ pub fn load_text_encoder_weights(
     encoder: &mut QwenTextEncoder,
     weights: HashMap<String, Array>,
 ) -> Result<(), Exception> {
+    // Track which checkpoint keys actually land in a parameter, so a
+    // naming drift surfaces as a loud warning instead of layers silently
+    // keeping their (zero/random) init.
+    let consumed = std::cell::RefCell::new(std::collections::HashSet::<&str>::new());
+    let get = |key: &str| {
+        weights.get_key_value(key).map(|(k, v)| {
+            consumed.borrow_mut().insert(k.as_str());
+            v
+        })
+    };
+
     // Load embedding
-    if let Some(w) = weights.get("encoder.embed_tokens.weight") {
+    if let Some(w) = get("encoder.embed_tokens.weight") {
         *encoder.embed_tokens.weight = w.clone();
     }
 
@@ -437,58 +417,75 @@ pub fn load_text_encoder_weights(
         let prefix = format!("encoder.layers.{}", i);
 
         // Input layernorm
-        if let Some(w) = weights.get(&format!("{}.input_layernorm.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.input_layernorm.weight", prefix)) {
             *layer.input_layernorm.weight = w.clone();
         }
 
         // Self attention
-        if let Some(w) = weights.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.self_attn.q_proj.weight", prefix)) {
             *layer.self_attn.q_proj.weight = w.clone();
         }
-        if let Some(b) = weights.get(&format!("{}.self_attn.q_proj.bias", prefix)) {
+        if let Some(b) = get(&format!("{}.self_attn.q_proj.bias", prefix)) {
             layer.self_attn.q_proj.bias = Some(Param::new(b.clone()));
         }
-        if let Some(w) = weights.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.self_attn.k_proj.weight", prefix)) {
             *layer.self_attn.k_proj.weight = w.clone();
         }
-        if let Some(b) = weights.get(&format!("{}.self_attn.k_proj.bias", prefix)) {
+        if let Some(b) = get(&format!("{}.self_attn.k_proj.bias", prefix)) {
             layer.self_attn.k_proj.bias = Some(Param::new(b.clone()));
         }
-        if let Some(w) = weights.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.self_attn.v_proj.weight", prefix)) {
             *layer.self_attn.v_proj.weight = w.clone();
         }
-        if let Some(b) = weights.get(&format!("{}.self_attn.v_proj.bias", prefix)) {
+        if let Some(b) = get(&format!("{}.self_attn.v_proj.bias", prefix)) {
             layer.self_attn.v_proj.bias = Some(Param::new(b.clone()));
         }
-        if let Some(w) = weights.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.self_attn.o_proj.weight", prefix)) {
             *layer.self_attn.o_proj.weight = w.clone();
         }
 
         // Load rotary embedding inv_freq if present
-        if let Some(inv_freq) = weights.get(&format!("{}.self_attn.rotary_emb.inv_freq", prefix)) {
+        if let Some(inv_freq) = get(&format!("{}.self_attn.rotary_emb.inv_freq", prefix)) {
             layer.self_attn.rope.inv_freq = inv_freq.clone();
         }
 
         // Post attention layernorm
-        if let Some(w) = weights.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.post_attention_layernorm.weight", prefix)) {
             *layer.post_attention_layernorm.weight = w.clone();
         }
 
         // MLP
-        if let Some(w) = weights.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.mlp.gate_proj.weight", prefix)) {
             *layer.mlp.gate_proj.weight = w.clone();
         }
-        if let Some(w) = weights.get(&format!("{}.mlp.up_proj.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.mlp.up_proj.weight", prefix)) {
             *layer.mlp.up_proj.weight = w.clone();
         }
-        if let Some(w) = weights.get(&format!("{}.mlp.down_proj.weight", prefix)) {
+        if let Some(w) = get(&format!("{}.mlp.down_proj.weight", prefix)) {
             *layer.mlp.down_proj.weight = w.clone();
         }
     }
 
     // Load final norm
-    if let Some(w) = weights.get("encoder.norm.weight") {
+    if let Some(w) = get("encoder.norm.weight") {
         *encoder.norm.weight = w.clone();
+    }
+
+    let consumed = consumed.into_inner();
+    if consumed.len() < weights.len() {
+        let mut unmatched: Vec<&str> = weights
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !consumed.contains(k))
+            .collect();
+        unmatched.sort_unstable();
+        eprintln!(
+            "[qwen-image text_encoder] WARNING: {} of {} checkpoint tensors were not \
+             mapped to any parameter (first few: {:?})",
+            unmatched.len(),
+            weights.len(),
+            &unmatched[..unmatched.len().min(5)]
+        );
     }
 
     Ok(())

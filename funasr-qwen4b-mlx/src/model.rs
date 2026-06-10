@@ -13,7 +13,7 @@ use mlx_rs::ops::indexing::{IndexOp, NewAxis};
 use mlx_rs::quantization::MaybeQuantized;
 use qwen3_mlx::{
     Model as Qwen3Model, KVCache, Generate, load_model, load_tokenizer,
-    AttentionInput, sample, create_attention_mask, AttentionMask,
+    AttentionInput, sample, create_attention_mask,
 };
 use std::path::Path;
 use tokenizers::Tokenizer;
@@ -958,13 +958,10 @@ impl FunASRQwen4B {
                 .collect();
         }
 
-        // Create attention mask
-        let mask = match create_attention_mask(embeddings, cache, Some(true))
-            .map_err(|e| Error::ModelLoad(format!("Mask creation failed: {:?}", e)))?
-        {
-            Some(AttentionMask::Array(m)) => Some(m),
-            _ => None,
-        };
+        // Create attention mask: prefer the SDPA causal-mode marker so MLX takes
+        // the fused causal path instead of materializing an explicit O(T^2) array.
+        let mask = create_attention_mask(embeddings, cache, Some(false))
+            .map_err(|e| Error::ModelLoad(format!("Mask creation failed: {:?}", e)))?;
 
         // Forward through transformer layers
         let mut h = embeddings.clone();

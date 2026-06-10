@@ -6,7 +6,6 @@ use std::{
 };
 
 use mlx_rs::{
-    argmax_axis, array, categorical,
     builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
@@ -23,6 +22,7 @@ use tokenizers::Tokenizer;
 use mlx_rs_core::{
     cache::KeyValueCache,
     error::Error,
+    fused_swiglu,
     memory::MemoryGuard,
     utils::{
         create_attention_mask, initialize_rope, scaled_dot_product_attention,
@@ -147,7 +147,7 @@ impl Attention {
 
 pub struct AttentionInput<'a, C> {
     pub x: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: Option<&'a mut C>,
 }
 
@@ -194,6 +194,29 @@ where
                 .build()?;
             keys = self.rope.forward(k_input)?;
 
+            // Decode fast path: a paged cache can append + attend in one fused
+            // kernel, skipping the gather. `KVCache` returns `None` here, so
+            // this is a no-op for the default backend. Gated on `L == 1` so
+            // the clone stays cheap and prefill is untouched.
+            if L == 1 {
+                let kv_repeat = (self.n_heads / self.n_kv_heads) as i32;
+                let fused_mask = match mask {
+                    Some(AttentionMask::Array(m)) => Some(m),
+                    _ => None,
+                };
+                if let Some(attn) = cache.try_fused_attention(
+                    &queries,
+                    keys.clone(),
+                    values.clone(),
+                    self.scale,
+                    fused_mask,
+                    kv_repeat,
+                )? {
+                    let output = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[B, L, -1])?;
+                    return self.o_proj.forward(&output);
+                }
+            }
+
             (keys, values) = cache.update_and_fetch(keys, values)?;
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;
@@ -201,7 +224,8 @@ where
         }
 
         let sdpa_mask = match mask {
-            Some(m) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Array(m)) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Causal) => Some(SdpaMask::Causal),
             None if L > 1 => Some(SdpaMask::Causal),
             None => None,
         };
@@ -262,8 +286,9 @@ impl Module<&Array> for Mlp {
     type Error = Exception;
 
     fn forward(&mut self, input: &Array) -> std::result::Result<Self::Output, Self::Error> {
-        let activated = nn::silu(self.gate_proj.forward(input)?)?
-            .multiply(self.up_proj.forward(input)?)?;
+        let gate = self.gate_proj.forward(input)?;
+        let up = self.up_proj.forward(input)?;
+        let activated = fused_swiglu(&up, &gate)?;
         self.down_proj.forward(&activated)
     }
 
@@ -381,7 +406,7 @@ impl Qwen3Model {
 
 pub struct ModelInput<'a, C> {
     pub inputs: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: &'a mut Vec<Option<C>>,
 }
 
@@ -397,16 +422,15 @@ where
 
         let mut h = self.embed_tokens.forward(inputs)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only `Array` mask is supported"))
-                }
-                None => None,
-            },
+        // Prefer caller-supplied mask; otherwise let create_attention_mask return
+        // an `AttentionMask::Causal` marker (no array materialization) for full
+        // prefill, or an `Array` only when a sliding window forces a bounded mask.
+        let computed_mask = if mask.is_none() {
+            create_attention_mask(&h, cache, Some(false))?
+        } else {
+            None
         };
+        let layer_mask = mask.or(computed_mask.as_ref());
 
         if cache.is_empty() {
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
@@ -415,7 +439,7 @@ where
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
             let layer_input = AttentionInput {
                 x: &h,
-                mask: mask.as_ref(),
+                mask: layer_mask,
                 cache: c.as_mut(),
             };
             h = layer.forward(layer_input)?;
@@ -498,6 +522,29 @@ where
     }
 }
 
+impl Model {
+    /// Run the transformer and project only the last sequence position through the
+    /// LM head, returning a `[B, vocab]` tensor. Skips a `[B, T, vocab]` matmul
+    /// during prefill where only the final token's logits are sampled.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> std::result::Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed_tokens) => embed_tokens.as_linear(&last),
+                MaybeQuantized::Quantized(q_embed_tokens) => q_embed_tokens.as_linear(&last),
+            },
+        }
+    }
+}
+
 // ============================================================================
 // Model Loading
 // ============================================================================
@@ -538,6 +585,10 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
         let weights_filename = model_dir.join(weight_file);
         model.load_safetensors(&weights_filename)?;
     }
+
+    // Materialize parameters before first generation so the initial request
+    // doesn't pay the lazy-graph cost (the quantized path already does this).
+    model.eval()?;
 
     Ok(model)
 }
@@ -731,15 +782,7 @@ fn load_model_quantized(model_dir: &Path, args: &ModelArgs) -> Result<Model, Err
 // Generation
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> std::result::Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
-        }
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,
@@ -784,8 +827,13 @@ where
             mask: None,
             cache: self.cache,
         };
+        // During decode L=1, so the [B, T-1, vocab] save from
+        // forward_last_logits doesn't apply — and the extra hidden-state
+        // slice it introduces makes per-token decode measurably slower
+        // (~35% on M-series). Keep the original [B, 1, vocab] full forward
+        // and slice logits at the sample step.
         let logits = self.model.forward(input)?;
-        sample(&logits, self.temp)
+        sample(&logits.index((.., -1, ..)), self.temp)
     }
 }
 
@@ -814,8 +862,8 @@ where
                     mask: None,
                     cache: self.cache,
                 };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let logits = tri!(self.model.forward_last_logits(input));
+                let y = tri!(sample(&logits, self.temp));
 
                 let _ = async_eval([&y]);
                 let next_y = tri!(self.compute_next(&y));

@@ -157,6 +157,7 @@ impl ASRProcessor {
 }
 
 /// Alternative: Use external ASR tool via subprocess
+#[allow(dead_code)] // offline preprocessing utility, not wired into the pipeline yet
 pub struct ExternalASR {
     /// Path to the ASR script/binary
     pub command: String,
@@ -164,6 +165,7 @@ pub struct ExternalASR {
     pub args: Vec<String>,
 }
 
+#[allow(dead_code)] // offline preprocessing utility, not wired into the pipeline yet
 impl ExternalASR {
     /// Create an external ASR processor that calls a Python script
     pub fn python_funasr(python_path: &str, script_path: &str) -> Self {
@@ -215,6 +217,7 @@ impl ExternalASR {
 }
 
 /// Parse GPT-SoVITS transcript list file
+#[allow(dead_code)] // offline preprocessing utility, not wired into the pipeline yet
 pub fn parse_transcript_list<P: AsRef<Path>>(path: P) -> Result<Vec<(PathBuf, String, String)>> {
     let content = std::fs::read_to_string(path.as_ref())?;
     let mut results = Vec::new();

@@ -152,8 +152,11 @@ pub struct WebSearchTool {
     /// Maximum results to return
     pub max_results: usize,
     /// Custom search function (for testing or custom backends)
-    search_fn: Option<Box<dyn Fn(&str) -> Result<Vec<SearchResult>> + Send + Sync>>,
+    search_fn: Option<SearchFn>,
 }
+
+/// Pluggable search backend used by [`WebSearchTool`].
+type SearchFn = Box<dyn Fn(&str) -> Result<Vec<SearchResult>> + Send + Sync>;
 
 /// Search result
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,7 +428,10 @@ impl ToolManager {
     /// Create with default tools (web search, calculator)
     pub fn with_defaults() -> Self {
         let mut manager = Self::new();
-        manager.register(Box::new(WebSearchTool::new(None)));
+        // NOTE: WebSearchTool is NOT registered by default — it is a mock
+        // that fabricates example.com results, which would silently feed
+        // invented search data back into model responses. Register it
+        // explicitly (e.g. in tests) if the placeholder behavior is wanted.
         manager.register(Box::new(CalculatorTool::new()));
         manager
     }
@@ -621,16 +627,27 @@ mod tests {
         assert!(manager.get("nonexistent").is_none());
     }
 
+    /// Test fixture: the default manager plus the mock web-search tool
+    /// (which is opt-in at runtime because it fabricates results).
+    fn manager_with_mock_search() -> ToolManager {
+        let mut manager = ToolManager::with_defaults();
+        manager.register(Box::new(WebSearchTool::new(None)));
+        manager
+    }
+
     #[test]
     fn test_tool_manager_with_defaults() {
         let manager = ToolManager::with_defaults();
-        assert!(manager.get("web_search").is_some());
+        assert!(
+            manager.get("web_search").is_none(),
+            "mock web search must be opt-in, not a default tool"
+        );
         assert!(manager.get("calculator").is_some());
     }
 
     #[test]
     fn test_parse_tool_call() {
-        let manager = ToolManager::with_defaults();
+        let manager = manager_with_mock_search();
 
         let output = r#"Let me search for that.
 <tool_call>
@@ -648,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_parse_multiple_tool_calls() {
-        let manager = ToolManager::with_defaults();
+        let manager = manager_with_mock_search();
 
         let output = r#"
 <tool_call>
@@ -680,7 +697,7 @@ mod tests {
 
     #[test]
     fn test_tool_execution() {
-        let manager = ToolManager::with_defaults();
+        let manager = manager_with_mock_search();
 
         let call = ToolCall::web_search("rust programming");
         let result = manager.execute(&call);
@@ -700,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_generate_tool_prompt() {
-        let manager = ToolManager::with_defaults();
+        let manager = manager_with_mock_search();
         let prompt = manager.generate_tool_prompt();
 
         assert!(prompt.contains("web_search"));

@@ -54,7 +54,7 @@ fn parse_cmudict(content: &str) -> HashMap<String, Vec<Vec<String>>> {
                     word.clone()
                 };
 
-                dict.entry(base_word).or_insert_with(Vec::new).push(phonemes);
+                dict.entry(base_word).or_default().push(phonemes);
             }
         }
     }

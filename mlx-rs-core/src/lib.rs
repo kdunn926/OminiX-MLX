@@ -12,7 +12,6 @@
 //! - **Sampler**: Token sampling strategies
 //! - **Generate**: Generic token generation infrastructure
 //! - **Audio**: Audio processing utilities (mel spectrograms, etc.)
-//! - **Speculative**: Speculative decoding support
 //! - **Convert**: Model conversion utilities (optional, requires `convert` feature)
 
 pub mod audio;
@@ -23,13 +22,27 @@ pub mod error;
 pub mod generate;
 pub mod memory;
 pub mod metal_kernels;
+pub mod paged;
+pub mod paged_disk;
 pub mod sampler;
-pub mod speculative;
+pub mod turboquant;
 pub mod utils;
 
-pub use cache::{ConcatKeyValueCache, KVCache, KeyValueCache};
+pub use cache::{
+    ConcatKeyValueCache, KVCache, KeyValueCache, QuantizedKVCache, TurboQuantKVCache,
+};
 pub use error::{Error, Result};
-pub use metal_kernels::{flash_attention, fused_modulate, fused_swiglu};
+pub use memory::{
+    clear_cache, flush_cache_if_needed, get_device_info, get_memory_stats, reset_peak_memory,
+    set_cache_limit, set_memory_limit, set_wired_limit, DeviceInfo, MemoryStats,
+};
+pub use metal_kernels::{
+    deltanet_recurrence, deltanet_tape_replay, deltanet_with_tape, flash_attention,
+    fused_modulate, fused_swiglu,
+    kv_compact, moe_dense_matmul, moe_dense_matmul_batched, per_position_rope, tq_compress_4bit,
+    tq_decompress_4bit, tq_qk_score, tq_sdpa_4bit, tq_sdpa_4bit_online, tq_sdpa_4bit_online_simd,
+    TQ_SDPA_MAX_KV,
+};
 pub use sampler::{DefaultSampler, Sampler};
 pub use utils::{
     create_attention_mask, initialize_rope, scaled_dot_product_attention,

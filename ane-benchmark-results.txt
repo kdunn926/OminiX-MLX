@@ -1,0 +1,40 @@
+=== ANE vs MLX GPU Benchmark Results ===
+Machine: Apple Silicon (Mac)
+Date: 2026-05-15 08:26:03 
+MLX backend: OminiX-MLX libmlx.a (same underlying C backend)
+
+=== ANE availability ===
+ANE available: yes
+Compile budget: general run 8/108 used; Qwen run 10/108 used
+Runtime note: initial 4x4 probe logged mapIOSurfacesWithModel Code=13 (Program IOSurfaces map failure 0x2), but benchmark layers successfully used the fast _ANEClient path.
+
+=== General benchmark (existing ane_bench configs) ===
+Label                              | GPU mean us | ANE mean us | Result         | Compile ms | Max diff
+-----------------------------------+-------------+-------------+----------------+------------+---------
+tiny  (B=1,   512→512)             | 190.2       | 403.0       | 2.12x slower   | 47.1       | 0.01956
+small (B=8,   512→512)             | 196.9       | 406.9       | 2.07x slower   | 29.6       | 0.02052
+med   (B=32,  512→2048)            | 305.1       | 1222.1      | 4.01x slower   | 51.9       | 0.02960
+large (B=64,  768→3072)            | 292.4       | 2360.4      | 8.07x slower   | 81.0       | 0.03163
+xl    (B=128, 1024→4096)           | 411.5       | 4175.6      | 10.15x slower  | 109.9      | 0.04359
+xxl   (B=256, 1024→4096)           | 524.6       | 4972.5      | 9.48x slower   | 116.3      | 0.04534
+
+=== Qwen3.6-35B specific configs ===
+Label                              | GPU mean us | ANE mean us | Result         | Compile ms | Max diff
+-----------------------------------+-------------+-------------+----------------+------------+---------
+Q-proj  (B=1,  2048→4096)          | 318.2       | 7784.6      | 24.46x slower  | 709.2      | 0.00699
+KV-proj (B=1,  2048→512)           | 217.3       | 1089.5      | 5.01x slower   | 104.5      | 0.00627
+O-proj  (B=1,  4096→2048)          | 299.9       | 7690.9      | 25.65x slower  | 643.6      | 0.00933
+Expert  (B=1,  2048→512)           | 214.9       | 1072.9      | 4.99x slower   | 102.2      | 0.00627
+Q-proj  (B=16, 2048→4096)          | 506.2       | 7859.3      | 15.53x slower  | 191.8      | 0.01296
+KV-proj (B=16, 2048→512)           | 205.8       | 1153.8      | 5.61x slower   | 47.1       | 0.01363
+Q-proj  (B=64, 2048→4096)          | 446.2       | 8202.7      | 18.38x slower  | 189.7      | 0.01236
+KV-proj (B=64, 2048→512)           | 381.6       | 1229.9      | 3.22x slower   | 45.4       | 0.01054
+Q-proj  (B=256,2048→4096)          | 735.8       | 9792.1      | 13.31x slower  | 209.8      | 0.01750
+
+=== Analysis ===
+- For B=1 (single-token decode): ANE is 5.0x-25.7x slower than GPU across tested Qwen3.6 projections.
+- For B=16 (DFlash block drafting): ANE is 5.6x-15.5x slower than GPU.
+- For B=64 (prefill chunk): ANE is 3.2x-18.4x slower than GPU.
+- For B=256 (larger prefill): ANE is 13.3x slower than GPU for Q-proj.
+- Recommendation: use MLX GPU, not ANE, for these Qwen3.6 prefill/decode linear layers.
+- Critical finding: no crossover batch size was observed up to B=256; GPU won every test. Separately, Qwen3.6-35B would need about 40 layers x ~6 linear compiles ≈ 240 total compiles, which exceeds both the conservative 108 budget enforced in mlx-rs and the earlier observed ~119 practical ANE compile budget.

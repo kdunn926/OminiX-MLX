@@ -10,7 +10,6 @@ pub mod config;
 pub mod error;
 pub mod generate;
 pub mod metal_kernels;
-pub mod mrope;
 pub mod sampling;
 pub mod speaker_encoder;
 pub mod speech_encoder;
@@ -379,7 +378,6 @@ impl Synthesizer {
         // Decode to waveform
         let decode_start = Instant::now();
         let mut samples = self.decoder.decode(&codes)?;
-        mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         // Apply WSOLA time-stretching for speed > 1.0
@@ -517,7 +515,6 @@ impl Synthesizer {
 
         let decode_start = Instant::now();
         let mut samples = self.decoder.decode(&codes)?;
-        mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         // Apply WSOLA time-stretching for speed > 1.0
@@ -652,7 +649,6 @@ impl Synthesizer {
 
         let decode_start = Instant::now();
         let mut samples = self.decoder.decode(&codes)?;
-        mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         if requested_speed > 1.01 {
@@ -798,7 +794,6 @@ impl Synthesizer {
 
         let decode_start = Instant::now();
         let mut samples = self.decoder.decode(&codes)?;
-        mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         // Apply WSOLA time-stretching for speed > 1.0
@@ -936,7 +931,6 @@ impl Synthesizer {
         info!("Decoding {} codec frames to audio...", codes.len());
         let decode_start = Instant::now();
         let mut samples = self.decoder.decode(&codes)?;
-        mlx_rs::transforms::eval(std::iter::empty::<&mlx_rs::Array>())?;
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
         if requested_speed > 1.01 {
@@ -1001,7 +995,11 @@ impl Synthesizer {
             gen_config.repetition_penalty = rp;
         }
         if let Some(s) = opts.speed_factor {
-            gen_config.speed_factor = s;
+            // Streaming has no WSOLA post-stretch stage; forwarding >1.0
+            // into EOS steering switches it to speed-control mode with a
+            // reduced frame target and prematurely truncates speech.
+            // Match the synthesize_* paths: clamp speed-up to 1.0.
+            gen_config.speed_factor = s.min(1.0);
         }
 
         let encoding = self
@@ -1111,6 +1109,32 @@ fn load_bpe_tokenizer(model_dir: &Path) -> Result<tokenizers::Tokenizer> {
     // Add byte-level decoder
     use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
     tokenizer.with_decoder(Some(ByteLevelDecoder::new(false, true, false)));
+
+    // Register special tokens from tokenizer_config.json — Qwen-style
+    // checkpoints keep them in `added_tokens_decoder`, not vocab.json.
+    // Without this, the ChatML markers the instruct paths encode literally
+    // (`<|im_start|>` etc.) get byte-level-BPE'd into ordinary token runs
+    // instead of single special ids.
+    let config_path = model_dir.join("tokenizer_config.json");
+    if config_path.exists() {
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| Error::Model(format!("read tokenizer_config.json: {e}")))?;
+        let config: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| Error::Model(format!("parse tokenizer_config.json: {e}")))?;
+        if let Some(added) = config.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+            let special_tokens: Vec<_> = added
+                .values()
+                .filter_map(|info| {
+                    info.get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|content| tokenizers::AddedToken::from(content, true))
+                })
+                .collect();
+            if !special_tokens.is_empty() {
+                tokenizer.add_special_tokens(&special_tokens);
+            }
+        }
+    }
 
     Ok(tokenizer)
 }

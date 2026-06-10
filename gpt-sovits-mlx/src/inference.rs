@@ -22,7 +22,6 @@
 //! ```
 
 use mlx_rs::{
-    argmax_axis, array, categorical,
     ops::{concatenate_axis, indexing::IndexOp},
     Array,
 };
@@ -32,6 +31,7 @@ use crate::{
     cache::KeyValueCache,
     error::Error,
     models::t2s::{T2SModel, T2SInput},
+    sampling::{Sampler, SamplingConfig},
     text::{PreprocessorConfig, TextPreprocessor, symbols_to_ids},
 };
 
@@ -131,21 +131,17 @@ pub fn preprocess_text_with_lang(text: &str, language: Option<crate::text::Langu
     (phoneme_ids, phonemes, word2ph, text_normalized)
 }
 
-/// Sample a token from logits
-fn sample_token(logits: &Array, config: &GenerationConfig) -> Result<Array, Error> {
-    if config.temperature == 0.0 {
-        // Greedy decoding
-        argmax_axis!(logits, -1)
-            .map_err(|e| Error::Message(format!("Argmax failed: {e}")))
-    } else {
-        // Temperature scaling
-        let scaled = logits.divide(&array!(config.temperature))
-            .map_err(|e| Error::Message(format!("Temperature scaling failed: {e}")))?;
-
-        // Sample from categorical distribution
-        categorical!(scaled)
-            .map_err(|e| Error::Message(format!("Sampling failed: {e}")))
-    }
+/// Build a stateful sampler honoring all GenerationConfig sampling knobs
+/// (top_k, top_p, temperature, repetition_penalty).
+fn build_sampler(config: &GenerationConfig) -> Sampler {
+    Sampler::new(SamplingConfig {
+        top_k: config.top_k as i32,
+        top_p: config.top_p,
+        // Sampler treats temperature 0 as ~greedy (clamped to 1e-5)
+        temperature: config.temperature,
+        repetition_penalty: config.repetition_penalty,
+        eos_token: config.eos_token_id,
+    })
 }
 
 /// Generate semantic tokens autoregressively
@@ -195,19 +191,21 @@ where
         .squeeze()
         .map_err(|e| Error::Message(format!("Failed to squeeze logits: {e}")))?;
 
-    // Sample first token
-    let mut next_token = sample_token(&next_logits, config)?;
-    next_token = next_token.reshape(&[batch_size, 1])
-        .map_err(|e| Error::Message(format!("Failed to reshape token: {e}")))?;
+    // Sampler honoring top_k / top_p / temperature / repetition_penalty
+    let mut sampler = build_sampler(config);
+
+    // Sample first token; mask EOS if we have not reached min_tokens yet
+    // (the min_tokens gate applies to the first sampled token too).
+    let (first_id, _) = if config.min_tokens > 0 {
+        sampler.sample_with_eos_mask(&next_logits)?
+    } else {
+        sampler.sample(&next_logits)?
+    };
+    sampler.add_token(first_id);
+    let mut next_token = Array::from_slice(&[first_id], &[batch_size, 1]);
     all_tokens.push(next_token.clone());
 
-    let mut finished = false;
-
-    // Check for EOS
-    let next_val: i32 = next_token.item();
-    if next_val == config.eos_token_id {
-        finished = true;
-    }
+    let mut finished = first_id == config.eos_token_id;
 
     // Autoregressive generation
     for step in 1..config.max_tokens {
@@ -231,15 +229,18 @@ where
             .squeeze()
             .map_err(|e| Error::Message(format!("Failed to squeeze: {e}")))?;
 
-        // Sample next token
-        next_token = sample_token(&next_logits, config)?;
-        next_token = next_token.reshape(&[batch_size, 1])
-            .map_err(|e| Error::Message(format!("Failed to reshape token: {e}")))?;
+        // Sample next token; mask EOS until min_tokens is reached
+        let (token_id, _) = if step < config.min_tokens {
+            sampler.sample_with_eos_mask(&next_logits)?
+        } else {
+            sampler.sample(&next_logits)?
+        };
+        sampler.add_token(token_id);
+        next_token = Array::from_slice(&[token_id], &[batch_size, 1]);
         all_tokens.push(next_token.clone());
 
         // Check for EOS
-        let next_val: i32 = next_token.item();
-        if step >= config.min_tokens && next_val == config.eos_token_id {
+        if step >= config.min_tokens && token_id == config.eos_token_id {
             finished = true;
         }
     }

@@ -145,9 +145,9 @@ impl WeightNormConv1d {
         dilation: i32,
     ) -> Result<Self, Exception> {
         let shape = weight_v.shape();
-        let out_channels = shape[0] as i32;
-        let kernel_size = shape[1] as i32;
-        let in_channels = shape[2] as i32;
+        let out_channels = shape[0];
+        let kernel_size = shape[1];
+        let in_channels = shape[2];
 
         Ok(Self {
             weight_g: Param::new(weight_g),
@@ -320,9 +320,9 @@ impl WeightNormConvTranspose1d {
         padding: i32,
     ) -> Result<Self, Exception> {
         let shape = weight_v.shape();
-        let out_channels = shape[0] as i32;
-        let kernel_size = shape[1] as i32;
-        let in_channels = shape[2] as i32;
+        let out_channels = shape[0];
+        let kernel_size = shape[1];
+        let in_channels = shape[2];
 
         Ok(Self {
             weight_g: Param::new(weight_g),
@@ -394,6 +394,7 @@ impl WeightNormConvTranspose1d {
     /// **Important**: We don't scale g because:
     /// - Before normalize: weight = g * v / ||v||
     /// - After normalize:  weight = g * (v/||v||) / 1 = g * v / ||v|| (same!)
+    ///
     /// So the computed weight is preserved when we don't scale g.
     pub fn normalize_v(&mut self) -> Result<(), Exception> {
         // Compute current norm over out_channels and kernel dims (axes 0, 1)

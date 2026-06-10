@@ -471,16 +471,25 @@ impl KleinDoubleBlock {
         let scale = (self.head_dim as f32).sqrt();
 
         // Image attends to combined K/V
-        let img_attn = ops::matmul(&img_q, &combined_k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let img_attn = ops::divide(&img_attn, &array!(scale))?;
-        let img_attn = ops::softmax_axis(&img_attn, -1, None)?;
-        let img_attn_out = ops::matmul(&img_attn, &combined_v)?;
+        // Fused SDPA over the combined K/V (no mask) — replaces two manual
+        // matmul→softmax→matmul chains that each materialized full
+        // [B, H, L_q, L_kv] f32 score tensors.
+        let img_attn_out = mlx_rs::fast::scaled_dot_product_attention(
+            &img_q,
+            &combined_k,
+            &combined_v,
+            1.0 / scale,
+            None,
+        )?;
 
         // Text attends to combined K/V
-        let txt_attn = ops::matmul(&txt_q, &combined_k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let txt_attn = ops::divide(&txt_attn, &array!(scale))?;
-        let txt_attn = ops::softmax_axis(&txt_attn, -1, None)?;
-        let txt_attn_out = ops::matmul(&txt_attn, &combined_v)?;
+        let txt_attn_out = mlx_rs::fast::scaled_dot_product_attention(
+            &txt_q,
+            &combined_k,
+            &combined_v,
+            1.0 / scale,
+            None,
+        )?;
 
         // Transpose back and reshape: [batch, heads, seq, head_dim] -> [batch, seq, hidden]
         let img_attn_out = img_attn_out.transpose_axes(&[0, 2, 1, 3])?;
@@ -653,10 +662,10 @@ impl KleinSingleBlock {
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
 
         let scale = (self.head_dim as f32).sqrt();
-        let attn = ops::matmul(&q, &k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let attn = ops::divide(&attn, &array!(scale))?;
-        let attn = ops::softmax_axis(&attn, -1, None)?;
-        let attn_out = ops::matmul(&attn, &v)?;
+        // Fused SDPA (no mask in these blocks) — the manual chain
+        // materialized a [B, H, L, L] f32 score tensor per block.
+        let attn_out =
+            mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, 1.0 / scale, None)?;
 
         // Reshape back
         let attn_out = attn_out.transpose_axes(&[0, 2, 1, 3])?;

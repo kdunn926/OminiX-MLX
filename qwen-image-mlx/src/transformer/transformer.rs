@@ -89,7 +89,11 @@ pub struct QwenTransformer {
 impl QwenTransformer {
     pub fn new(config: QwenTransformerConfig) -> Result<Self, Exception> {
         let inner_dim = config.inner_dim();
-        let patch_dim = config.patch_size * config.patch_size * config.in_channels;
+        // `in_channels` is the already-packed patch dimension (latent_C·p²,
+        // 64 = 16·2² for Qwen-Image), matching the diffusers config key.
+        // Multiplying by p² again built a 256-wide layer whose shape only
+        // worked because loaded weights overwrote it.
+        let patch_dim = config.in_channels;
 
         // Input projections
         let patch_embed = LinearBuilder::new(patch_dim, inner_dim).build()?;
@@ -256,7 +260,7 @@ mod tests {
     fn test_patchify_unpatchify() {
         let config = QwenTransformerConfig {
             patch_size: 2,
-            in_channels: 4,
+            in_channels: 16, // packed patch dim: 4 latent channels × 2²
             num_layers: 1,
             attention_head_dim: 16,
             num_attention_heads: 4,

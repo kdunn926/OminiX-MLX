@@ -294,12 +294,12 @@ mod tests {
         let segmenter = Segmenter::new();
 
         // Pronouns
-        assert!(segmenter.common_words.get("我们").is_some());
-        assert!(segmenter.common_words.get("你们").is_some());
+        assert!(segmenter.common_words.contains_key("我们"));
+        assert!(segmenter.common_words.contains_key("你们"));
 
         // Verbs
-        assert!(segmenter.common_words.get("喜欢").is_some());
-        assert!(segmenter.common_words.get("知道").is_some());
+        assert!(segmenter.common_words.contains_key("喜欢"));
+        assert!(segmenter.common_words.contains_key("知道"));
 
         // Aspect markers
         assert_eq!(segmenter.common_words.get("了"), Some(&"ul".to_string()));
@@ -331,7 +331,7 @@ mod tests {
         let result = segmenter.cut_for_pos("你好，世界！");
 
         // Should include punctuation
-        let has_punct = result.iter().any(|s| s.pos == "w");
+        let _has_punct = result.iter().any(|s| s.pos == "w");
         // May or may not have punctuation depending on segmentation strategy
         assert!(!result.is_empty());
     }

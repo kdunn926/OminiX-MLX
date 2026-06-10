@@ -340,7 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for h in 0..latent_h as usize {
         for w in 0..latent_w as usize {
             // Frame: index 0
-            for &freq in &frame_freqs {
+            for &_freq in &frame_freqs {
                 img_cos_data.push(1.0);  // cos(0) = 1
                 img_sin_data.push(0.0);  // sin(0) = 0
             }
@@ -544,8 +544,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nSaving image...");
     let img = decoded.index((0, .., .., ..));
     let img = mlx_rs::ops::clip(&img, (-1.0f32, 1.0f32))?;
-    let img = mlx_rs::ops::add(&img, &Array::from_f32(1.0))?;
-    let img = mlx_rs::ops::multiply(&img, &Array::from_f32(127.5))?;
+    let img = mlx_rs::ops::add(&img, Array::from_f32(1.0))?;
+    let img = mlx_rs::ops::multiply(&img, Array::from_f32(127.5))?;
     let img = img.as_dtype(mlx_rs::Dtype::Uint8)?;
 
     let img = img.transpose_axes(&[1, 2, 0])?;

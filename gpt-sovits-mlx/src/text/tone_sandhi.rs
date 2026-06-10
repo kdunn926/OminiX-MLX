@@ -251,44 +251,40 @@ impl ToneSandhi {
         }
 
         // 4. Aspect markers: 了着过 with specific POS tags
-        if word_len == 1 && "了着过".contains(chars[0]) {
-            if pos == "ul" || pos == "uz" || pos == "ug" {
+        if word_len == 1 && "了着过".contains(chars[0])
+            && (pos == "ul" || pos == "uz" || pos == "ug") {
                 if let Some(f) = finals.first_mut() {
                     Self::set_tone(f, '5');
                 }
                 return;
             }
-        }
 
         // 5. 们子 suffix with r, n POS
-        if word_len > 1 && "们子".contains(chars[word_len - 1]) {
-            if (pos == "r" || pos == "n") && !self.must_not_neural_tone_words.contains(word) {
+        if word_len > 1 && "们子".contains(chars[word_len - 1])
+            && (pos == "r" || pos == "n") && !self.must_not_neural_tone_words.contains(word) {
                 if let Some(f) = finals.last_mut() {
                     Self::set_tone(f, '5');
                 }
                 return;
             }
-        }
 
         // 6. Location suffixes: 上下里 with s, l, f POS
-        if word_len > 1 && "上下里".contains(chars[word_len - 1]) {
-            if pos == "s" || pos == "l" || pos == "f" {
+        if word_len > 1 && "上下里".contains(chars[word_len - 1])
+            && (pos == "s" || pos == "l" || pos == "f") {
                 if let Some(f) = finals.last_mut() {
                     Self::set_tone(f, '5');
                 }
                 return;
             }
-        }
 
         // 7. Directional complements: 上来/下去/进出/回过/起开 + 来去
-        if word_len > 1 && "来去".contains(chars[word_len - 1]) {
-            if "上下进出回过起开".contains(chars[word_len - 2]) {
+        if word_len > 1 && "来去".contains(chars[word_len - 1])
+            && "上下进出回过起开".contains(chars[word_len - 2]) {
                 if let Some(f) = finals.last_mut() {
                     Self::set_tone(f, '5');
                 }
                 return;
             }
-        }
 
         // 8. 个 as measure word after numbers
         if let Some(ge_idx) = chars.iter().position(|&c| c == '个') {
@@ -338,18 +334,16 @@ impl ToneSandhi {
 
                 // Check if subwords need neutral tone
                 // First subword
-                if self.must_neural_tone_words.contains(first_word.as_str())
+                if (self.must_neural_tone_words.contains(first_word.as_str())
                     || (first_word.len() >= 2 && {
                         let last_two: String = first_word.chars().rev().take(2).collect::<String>().chars().rev().collect();
                         self.must_neural_tone_words.contains(last_two.as_str())
-                    })
-                {
-                    if first_len > 0 {
+                    }))
+                    && first_len > 0 {
                         if let Some(f) = finals.get_mut(first_len - 1) {
                             Self::set_tone(f, '5');
                         }
                     }
-                }
 
                 // Second subword
                 if self.must_neural_tone_words.contains(second_word.as_str())
@@ -608,8 +602,8 @@ pub fn pre_merge_for_modify(segments: Vec<WordSegment>) -> Vec<WordSegment> {
     // Add continuous three-tone merges (critical for correct sandhi)
     let segments = merge_continuous_three_tones(segments);
     let segments = merge_continuous_three_tones_2(segments);
-    let segments = merge_er(segments);
-    segments
+    
+    merge_er(segments)
 }
 
 /// Merge consecutive words when both are all tone-3

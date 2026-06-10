@@ -11,7 +11,6 @@ use std::{
 };
 
 use mlx_rs::{
-    argmax_axis, array, categorical,
     builder::Builder,
     error::Exception,
     macros::{ModuleParameters, Quantizable},
@@ -152,7 +151,7 @@ impl Glm4Attention {
 
 pub struct AttentionInput<'a, C> {
     pub x: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: Option<&'a mut C>,
 }
 
@@ -203,7 +202,8 @@ where
         }
 
         let sdpa_mask = match mask {
-            Some(m) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Array(m)) => Some(SdpaMask::Array(m)),
+            Some(AttentionMask::Causal) => Some(SdpaMask::Causal),
             None if L > 1 => Some(SdpaMask::Causal),
             None => None,
         };
@@ -398,7 +398,7 @@ impl Glm4Model {
 
 pub struct ModelInput<'a, C> {
     pub inputs: &'a Array,
-    pub mask: Option<&'a Array>,
+    pub mask: Option<&'a AttentionMask>,
     pub cache: &'a mut Vec<Option<C>>,
 }
 
@@ -414,16 +414,12 @@ where
 
         let mut h = self.embed_tokens.forward(inputs)?;
 
-        let mask = match mask {
-            Some(mask) => Some(mask.clone()),
-            None => match create_attention_mask(&h, cache, Some(true))? {
-                Some(AttentionMask::Array(a)) => Some(a),
-                Some(AttentionMask::Causal) => {
-                    return Err(Exception::custom("Only `Array` mask is supported"))
-                }
-                None => None,
-            },
+        let computed_mask = if mask.is_none() {
+            create_attention_mask(&h, cache, Some(false))?
+        } else {
+            None
         };
+        let layer_mask = mask.or(computed_mask.as_ref());
 
         if cache.is_empty() {
             *cache = (0..self.layers.len()).map(|_| Some(C::default())).collect();
@@ -432,7 +428,7 @@ where
         for (layer, c) in self.layers.iter_mut().zip(cache.iter_mut()) {
             h = layer.forward(AttentionInput {
                 x: &h,
-                mask: mask.as_ref(),
+                mask: layer_mask,
                 cache: c.as_mut(),
             })?;
         }
@@ -513,6 +509,27 @@ where
     }
 }
 
+impl Model {
+    /// Project only the last sequence position through the LM head.
+    pub fn forward_last_logits<C>(
+        &mut self,
+        input: ModelInput<'_, C>,
+    ) -> std::result::Result<Array, Exception>
+    where
+        C: KeyValueCache + Default,
+    {
+        let out = self.model.forward(input)?;
+        let last = out.index((.., -1, ..));
+        match self.lm_head.as_mut() {
+            Some(lm_head) => lm_head.forward(&last),
+            None => match &mut self.model.embed_tokens {
+                MaybeQuantized::Original(embed_tokens) => embed_tokens.as_linear(&last),
+                MaybeQuantized::Quantized(q_embed_tokens) => q_embed_tokens.as_linear(&last),
+            },
+        }
+    }
+}
+
 // ============================================================================
 // Model Loading
 // ============================================================================
@@ -550,6 +567,8 @@ pub fn load_model(model_dir: impl AsRef<Path>) -> Result<Model, Error> {
     for weight_file in weight_map.weight_map.values().collect::<HashSet<_>>() {
         model.load_safetensors(&model_dir.join(weight_file))?;
     }
+
+    model.eval()?;
 
     Ok(model)
 }
@@ -720,15 +739,7 @@ fn load_model_quantized(model_dir: &Path, args: &ModelArgs) -> Result<Model, Err
 // Generation
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> std::result::Result<Array, Exception> {
-    match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
-        _ => {
-            let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
-        }
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 pub struct Generate<'a, C> {
     model: &'a mut Model,
@@ -784,8 +795,8 @@ where
                     mask: None,
                     cache: self.cache,
                 };
-                let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
+                let logits = tri!(self.model.forward_last_logits(input));
+                let y = tri!(sample(&logits, self.temp));
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
             }
@@ -797,7 +808,7 @@ where
                     cache: self.cache,
                 };
                 let logits = tri!(self.model.forward(input));
-                let y = tri!(sample(&logits, self.temp));
+                let y = tri!(sample(&logits.index((.., -1, ..)), self.temp));
                 self.state = GenerateState::Decode { y: y.clone() };
                 Some(Ok(y))
             }

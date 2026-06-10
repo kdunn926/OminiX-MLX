@@ -151,7 +151,7 @@ impl Default for TextConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3VLConfig {
     #[serde(default)]
     pub vision_config: VisionConfig,
@@ -179,6 +179,14 @@ impl Default for Qwen3VLConfig {
             vision_end_token_id: 151653,
         }
     }
+}
+
+/// A single message in a multi-turn VL chat, with pre-formatted text content.
+/// `n_visual_tokens` is `Some(n)` only for the one message that contains an image.
+pub struct VlChatMessage {
+    pub role: String,
+    pub text: String,
+    pub n_visual_tokens: Option<usize>,
 }
 
 // ============================================================================
@@ -771,6 +779,20 @@ impl Qwen3VL {
         }
     }
 
+    /// Prefill for text-only input (no image tokens). Avoids passing a dummy visual_features array.
+    pub fn prefill_text_only<C: KeyValueCache + Default>(
+        &mut self,
+        input_ids: &[i32],
+        cache: &mut Vec<C>,
+    ) -> Result<Array> {
+        let ids_arr = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+        let embeds = match &mut self.embed_tokens {
+            MaybeQuantized::Original(emb) => emb.forward(&ids_arr)?,
+            MaybeQuantized::Quantized(qemb) => qemb.forward(&ids_arr)?,
+        };
+        self.lm_forward(&embeds, cache)
+    }
+
     /// Decode a single token (used after prefill).
     pub fn decode_token<C: KeyValueCache + Default>(
         &mut self,
@@ -837,14 +859,7 @@ pub fn preprocess_image(
 // Sampling
 // ============================================================================
 
-pub fn sample(logits: &Array, temp: f32) -> std::result::Result<Array, mlx_rs::error::Exception> {
-    if temp == 0.0 {
-        mlx_rs::argmax_axis!(logits, -1)
-    } else {
-        let scaled = logits.multiply(array!(1.0 / temp))?;
-        mlx_rs::categorical!(scaled)
-    }
-}
+pub use mlx_rs_core::sampler::sample;
 
 // ============================================================================
 // Model loading
@@ -1205,6 +1220,66 @@ pub fn build_chat_tokens(
     Ok(tokens)
 }
 
+pub fn build_chat_tokens_for_messages(
+    tokenizer: &tokenizers::Tokenizer,
+    messages: &[VlChatMessage],
+    config: &Qwen3VLConfig,
+) -> Result<Vec<i32>> {
+    let im_start = tokenizer
+        .token_to_id("<|im_start|>")
+        .ok_or_else(|| Error::Tokenizer("Missing <|im_start|>".into()))? as i32;
+    let im_end = tokenizer
+        .token_to_id("<|im_end|>")
+        .ok_or_else(|| Error::Tokenizer("Missing <|im_end|>".into()))? as i32;
+    let newline = tokenizer.token_to_id("\n").unwrap_or(198) as i32;
+
+    let image_token_id = config.image_token_id;
+    let vision_start = config.vision_start_token_id;
+    let vision_end = config.vision_end_token_id;
+
+    let encode = |text: &str| -> Result<Vec<i32>> {
+        let enc = tokenizer
+            .encode(text, false)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?;
+        Ok(enc.get_ids().iter().map(|&id| id as i32).collect())
+    };
+
+    let mut tokens: Vec<i32> = Vec::new();
+
+    for msg in messages {
+        let role_tokens = encode(&msg.role)?;
+        let text_tokens = if msg.text.is_empty() {
+            vec![]
+        } else {
+            encode(&msg.text)?
+        };
+
+        tokens.push(im_start);
+        tokens.extend_from_slice(&role_tokens);
+        tokens.push(newline);
+
+        if let Some(n_visual) = msg.n_visual_tokens {
+            tokens.push(vision_start);
+            for _ in 0..n_visual {
+                tokens.push(image_token_id);
+            }
+            tokens.push(vision_end);
+            tokens.push(newline);
+        }
+
+        tokens.extend_from_slice(&text_tokens);
+        tokens.push(im_end);
+        tokens.push(newline);
+    }
+
+    let assistant_tokens = encode("assistant")?;
+    tokens.push(im_start);
+    tokens.extend_from_slice(&assistant_tokens);
+    tokens.push(newline);
+
+    Ok(tokens)
+}
+
 /// Run Qwen3-VL inference: image + prompt → generated text.
 ///
 /// `tokenizer_json` is the raw bytes of `tokenizer.json` — passed as bytes to
@@ -1268,4 +1343,36 @@ pub fn generate(
         .map_err(|e| Error::Tokenizer(e.to_string()))?;
 
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vl_chat_message_construction() {
+        let msg = VlChatMessage {
+            role: "user".to_string(),
+            text: "What is in this image?".to_string(),
+            n_visual_tokens: Some(196),
+        };
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.n_visual_tokens, Some(196));
+    }
+
+    #[test]
+    fn test_vl_chat_message_text_only() {
+        let msg = VlChatMessage {
+            role: "user".to_string(),
+            text: "Hello".to_string(),
+            n_visual_tokens: None,
+        };
+        assert!(msg.n_visual_tokens.is_none());
+    }
+
+    #[test]
+    fn test_qwen3vl_config_is_clone() {
+        let config = Qwen3VLConfig::default();
+        let _clone = config.clone();
+    }
 }

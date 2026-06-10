@@ -469,8 +469,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Z-Image uses second-to-last layer (layer 34) for 2560-dim embeddings
     // Try to load Python reference text embeddings if available for exact comparison
+    // Parity-harness hijack is opt-in via ZIMAGE_PARITY=1: stale /tmp dumps
+    // must never silently replace the real prompt embedding.
+    let parity_mode = std::env::var("ZIMAGE_PARITY").is_ok();
     let ref_embed_path = std::path::Path::new("/tmp/ref_text_embed.bin");
-    let txt_embed = if ref_embed_path.exists() {
+    let txt_embed = if parity_mode && ref_embed_path.exists() {
         let bytes = std::fs::read(ref_embed_path)?;
         let floats: Vec<f32> = bytes.chunks(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -640,7 +643,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load exact same initial latents as Python (np.random.seed(42))
     let mut latents = {
         let path = std::path::Path::new("/tmp/ref_initial_latents.bin");
-        if path.exists() {
+        if parity_mode && path.exists() {
             let bytes = std::fs::read(path)?;
             let floats: Vec<f32> = bytes.chunks(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

@@ -645,7 +645,11 @@ mod tests {
         assert_eq!(array.shape(), &[2, 3]);
         assert_eq!(array.dtype(), Dtype::Float32);
 
-        let data: &[f32] = array.as_slice();
+        // `full` evaluates to a 0-stride broadcast view, so `as_slice`
+        // correctly refuses (NotContiguous); copy to a contiguous buffer
+        // before reading.
+        let contiguous = array.contiguous().unwrap();
+        let data: &[f32] = contiguous.as_slice();
         float_eq::float_eq!(*data, [0.0; 6], abs <= [1e-6; 6]);
     }
 

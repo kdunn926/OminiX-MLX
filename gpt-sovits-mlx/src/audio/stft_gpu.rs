@@ -6,18 +6,37 @@
 use mlx_rs::{
     error::Exception,
     fft::rfft,
-    ops::{abs, concatenate_axis, indexing::IndexOp, zeros},
+    ops::{abs, indexing::IndexOp},
     Array,
 };
 use std::f32::consts::PI;
 
 /// Create Hann window as MLX Array
+///
+/// Periodic Hann (denominator = size), matching `torch.hann_window(size)`.
 fn hann_window_mlx(size: i32) -> Array {
-    let mut window = vec![0.0f32; size as usize];
-    for i in 0..size as usize {
-        window[i] = 0.5 * (1.0 - (2.0 * PI * i as f32 / (size as f32 - 1.0)).cos());
-    }
+    let window: Vec<f32> = (0..size as usize)
+        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / size as f32).cos()))
+        .collect();
     Array::from_slice(&window, &[size])
+}
+
+/// Reflect-pad a signal by `pad` samples on each side (like
+/// `torch.nn.functional.pad(..., mode="reflect")`).
+fn reflect_pad(samples: &[f32], pad: usize) -> Vec<f32> {
+    let n = samples.len();
+    debug_assert!(pad < n, "reflect pad ({}) must be < signal length ({})", pad, n);
+    let mut padded = Vec::with_capacity(n + 2 * pad);
+    // Left: samples[pad], samples[pad-1], ..., samples[1]
+    for i in (1..=pad.min(n - 1)).rev() {
+        padded.push(samples[i]);
+    }
+    padded.extend_from_slice(samples);
+    // Right: samples[n-2], samples[n-3], ..., samples[n-1-pad]
+    for i in 1..=pad.min(n - 1) {
+        padded.push(samples[n - 1 - i]);
+    }
+    padded
 }
 
 /// GPU-accelerated STFT using MLX rfft
@@ -33,27 +52,22 @@ pub fn stft_rfft(
     hop_length: i32,
     win_length: i32,
 ) -> Result<Array, Exception> {
-    let num_samples = audio.dim(0) as i32;
-
-    // Center padding (like librosa center=True)
-    let pad_length = n_fft / 2;
-    let left_pad = zeros::<f32>(&[pad_length])?;
-    let right_pad = zeros::<f32>(&[pad_length])?;
-    let padded = concatenate_axis(&[&left_pad, audio, &right_pad], 0)?;
-    let padded_len = padded.dim(0) as i32;
+    // Padding matches GPT-SoVITS's `spectrogram_torch`:
+    // reflect-pad (n_fft - hop_length) / 2 on each side, then torch.stft with
+    // center=False. (NOT librosa center=True, which would zero-pad n_fft/2.)
+    let pad_length = ((n_fft - hop_length) / 2) as usize;
+    let samples: Vec<f32> = audio.as_slice().to_vec();
+    let padded_data = reflect_pad(&samples, pad_length);
+    let padded_len = padded_data.len() as i32;
 
     // Number of frames
     let n_frames = (padded_len - n_fft) / hop_length + 1;
-    let n_freqs = n_fft / 2 + 1;
 
-    // Create window
+    // Create window (hoisted out of the frame loop)
     let window = hann_window_mlx(win_length);
-
-    // Extract all frames at once using unfold-like operation
-    // For efficiency, we'll process frames in a batch
+    let window_data: Vec<f32> = window.as_slice().to_vec();
 
     // Build frame tensor: [n_frames, n_fft]
-    let padded_data: Vec<f32> = padded.as_slice().to_vec();
     let mut frames_data = vec![0.0f32; (n_frames * n_fft) as usize];
 
     for frame_idx in 0..n_frames as usize {
@@ -61,8 +75,8 @@ pub fn stft_rfft(
         for i in 0..win_length as usize {
             if start + i < padded_data.len() {
                 // Apply window
-                let win_val: f32 = window.as_slice::<f32>()[i];
-                frames_data[frame_idx * n_fft as usize + i] = padded_data[start + i] * win_val;
+                frames_data[frame_idx * n_fft as usize + i] =
+                    padded_data[start + i] * window_data[i];
             }
         }
         // Zero-pad if win_length < n_fft (already zero-initialized)

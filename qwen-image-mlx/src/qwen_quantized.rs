@@ -1,6 +1,10 @@
-//! Quantized Qwen-Image Transformer
+//! Quantized Qwen-Image Transformer — **the production path**.
 //!
-//! Matches the weight structure of mlx-community/Qwen-Image-2512-4bit
+//! Matches the weight structure of mlx-community/Qwen-Image-2512-4bit and is
+//! the implementation driven by `examples/generate_qwen_image.rs`. The
+//! sibling `transformer/` (unquantized) and `qwen_full_precision` modules
+//! are alternative implementations that are not exercised by any example
+//! and should be treated as unvalidated.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -214,25 +218,33 @@ impl QwenAttention {
         let v = joint_v.transpose_axes(&[0, 2, 1, 3])?;
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let attn_scores = ops::matmul(&q, &k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let mut attn_scores = ops::multiply(&attn_scores, &Array::from_f32(scale))?;
 
-        // Apply attention mask if provided
-        if let Some(mask) = encoder_hidden_states_mask {
+        // Build additive mask if provided: 0 for real tokens, -1e9 for padding
+        let additive_mask = if let Some(mask) = encoder_hidden_states_mask {
             let img_seq = img_modulated.dim(1);
             let ones_img = Array::ones::<f32>(&[batch, img_seq])?;
             let joint_mask = ops::concatenate_axis(&[mask, &ones_img], 1)?;
-            // Convert to additive mask: 0 for real tokens, -1e9 for padding
-            let additive_mask = ops::multiply(
-                &ops::subtract(&Array::from_f32(1.0), &joint_mask)?,
-                &Array::from_f32(-1e9),
+            let additive = ops::multiply(
+                &ops::subtract(Array::from_f32(1.0), &joint_mask)?,
+                Array::from_f32(-1e9),
             )?;
-            let additive_mask = additive_mask.reshape(&[batch, 1, 1, txt_seq + img_seq])?;
-            attn_scores = ops::add(&attn_scores, &additive_mask)?;
-        }
+            let additive = additive
+                .reshape(&[batch, 1, 1, txt_seq + img_seq])?
+                .as_dtype(q.dtype())?;
+            Some(additive)
+        } else {
+            None
+        };
 
-        let attn = mlx_rs::ops::softmax_axis(&attn_scores, -1, None)?;
-        let out = ops::matmul(&attn, &v)?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            additive_mask
+                .as_ref()
+                .map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
+        )?;
 
         // Transpose back and reshape
         let out = out.transpose_axes(&[0, 2, 1, 3])?;
@@ -311,6 +323,8 @@ impl QwenTransformerBlock {
         // Apply LayerNorm and modulation
         let img_normed = layer_norm(hidden_states, 1e-6)?;
         let (img_modulated, img_gate1) = modulate(&img_normed, &img_mod1)?;
+
+        // Apply LayerNorm and modulation to text
         let txt_normed = layer_norm(encoder_hidden_states, 1e-6)?;
         let (txt_modulated, txt_gate1) = modulate(&txt_normed, &txt_mod1)?;
 
@@ -975,7 +989,7 @@ fn get_timestep_embedding(t: &Array, dim: i32) -> Result<Array, Exception> {
     // exponent = -log(max_period) * arange(0, half) / (half - downscale_freq_shift)
     // With downscale_freq_shift=0: exponent = -log(10000) * i / half
     let log_timescale = (10000.0f32).ln() / half as f32;
-    let freqs = ops::exp(&ops::multiply(&freq_seq, &Array::from_f32(-log_timescale))?)?;
+    let freqs = ops::exp(&ops::multiply(&freq_seq, Array::from_f32(-log_timescale))?)?;
 
     // t: [B] -> [B, 1]
     let t_exp = t.expand_dims(1)?;
@@ -983,7 +997,7 @@ fn get_timestep_embedding(t: &Array, dim: i32) -> Result<Array, Exception> {
     let freqs_exp = freqs.expand_dims(0)?;
 
     // Scale timestep by 1000 (matching diffusers Timesteps scale parameter)
-    let t_scaled = ops::multiply(&t_exp, &Array::from_f32(1000.0))?;
+    let t_scaled = ops::multiply(&t_exp, Array::from_f32(1000.0))?;
 
     let args = ops::multiply(&t_scaled, &freqs_exp)?;
     let sin_emb = ops::sin(&args)?;

@@ -129,7 +129,7 @@ fn main() -> Result<(), Error> {
     }
 
     // Compute total steps
-    let steps_per_epoch = (dataset.len() + args.batch_size - 1) / args.batch_size;
+    let steps_per_epoch = dataset.len().div_ceil(args.batch_size);
     let total_steps = steps_per_epoch * args.epochs;
     println!("  Steps per epoch: {}", steps_per_epoch);
     println!("  Total steps: {}", total_steps);

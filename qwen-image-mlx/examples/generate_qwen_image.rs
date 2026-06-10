@@ -832,14 +832,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let delta = mlx_rs::ops::multiply(&velocity, &dt)?;
         latents = mlx_rs::ops::add(&latents, &delta)?;
 
-        // Print progress (minimal overhead - no eval needed)
+        // Evaluate once per step: without this the lazy graph for all
+        // num_steps×2 transformer forwards accumulates unevaluated (graph
+        // memory balloons and the progress prints report steps that
+        // haven't actually executed).
+        mlx_rs::transforms::eval([&latents])?;
+
         if (step + 1) % 5 == 0 || step == 0 {
             println!("  Step {}/{} (sigma: {:.3})", step + 1, num_steps, sigma);
         }
     }
-
-    // Force evaluation to get accurate timing for diffusion vs VAE
-    mlx_rs::transforms::eval([&latents])?;
 
     let gen_elapsed = start.elapsed();
     println!("Diffusion completed in {:.2?}", gen_elapsed);
@@ -888,8 +890,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clamp to [-1, 1] and rescale to [0, 255]
     let img = decoded.index((0, .., .., ..));  // [3, H, W]
     let img = mlx_rs::ops::clip(&img, (-1.0f32, 1.0f32))?;
-    let img = mlx_rs::ops::add(&img, &Array::from_f32(1.0))?;  // [0, 2]
-    let img = mlx_rs::ops::multiply(&img, &Array::from_f32(127.5))?;  // [0, 255]
+    let img = mlx_rs::ops::add(&img, Array::from_f32(1.0))?;  // [0, 2]
+    let img = mlx_rs::ops::multiply(&img, Array::from_f32(127.5))?;  // [0, 255]
     let img = img.as_dtype(mlx_rs::Dtype::Uint8)?;
 
     // Transpose from [3, H, W] to [H, W, 3] for PPM

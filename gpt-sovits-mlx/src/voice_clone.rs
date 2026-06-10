@@ -58,11 +58,9 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
 use mlx_rs::{Array, module::Module, ops::indexing::IndexOp, random, transforms::eval};
 use tracing::{debug, warn, trace, instrument};
 
@@ -218,11 +216,21 @@ impl SynthesisOptions {
     }
 
     /// Check if timeout has elapsed
-    #[allow(dead_code)]
     fn is_timed_out(&self, start: Instant) -> bool {
         self.timeout
             .map(|t| start.elapsed() > t)
             .unwrap_or(false)
+    }
+
+    /// Return an error if synthesis was cancelled or the deadline has passed
+    fn check_interrupt(&self, start: Instant) -> Result<(), Error> {
+        if self.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if self.is_timed_out(start) {
+            return Err(Error::timeout(start.elapsed()));
+        }
+        Ok(())
     }
 }
 
@@ -275,6 +283,10 @@ pub struct VoiceCloner {
     hubert: Option<HuBertEncoder>,
     audio_config: AudioConfig,
     reference_mel: Option<Array>,
+    /// Cached VITS style embedding for the current reference mel.
+    /// Computed once when the reference audio is set (the embedding only
+    /// depends on the reference), instead of on every decode call.
+    reference_ge: Option<Array>,
     reference_path: Option<String>,
     /// Prompt semantic codes for few-shot mode (extracted from reference audio)
     prompt_semantic: Option<Array>,
@@ -365,6 +377,7 @@ impl VoiceCloner {
             hubert,
             audio_config,
             reference_mel: None,
+            reference_ge: None,
             reference_path: None,
             prompt_semantic: None,
             reference_text: None,
@@ -394,6 +407,19 @@ impl VoiceCloner {
         }
     }
 
+    /// Store a reference mel and precompute the VITS style embedding for it.
+    ///
+    /// The style embedding (`ge`) only depends on the reference audio, so it
+    /// is computed once here instead of on every decode call.
+    fn store_reference_mel(&mut self, mel: Array) -> Result<(), Error> {
+        let ge = self.vits.ref_embedding(&mel)
+            .map_err(|e| Error::Message(format!("Reference embedding failed: {}", e)))?;
+        eval([&ge]).map_err(|e| Error::Message(e.to_string()))?;
+        self.reference_mel = Some(mel);
+        self.reference_ge = Some(ge);
+        Ok(())
+    }
+
     /// Set reference audio for voice cloning (zero-shot mode)
     pub fn set_reference_audio(&mut self, path: impl AsRef<Path>) -> Result<(), Error> {
         let path = path.as_ref();
@@ -404,7 +430,7 @@ impl VoiceCloner {
         let mel = self.load_mel(path)?;
         eval([&mel]).map_err(|e| Error::Message(format!("Failed to evaluate mel: {}", e)))?;
 
-        self.reference_mel = Some(mel);
+        self.store_reference_mel(mel)?;
         self.reference_path = Some(path.to_string_lossy().to_string());
         // Clear few-shot data
         self.prompt_semantic = None;
@@ -479,7 +505,7 @@ impl VoiceCloner {
             ));
         };
 
-        self.reference_mel = Some(mel);
+        self.store_reference_mel(mel)?;
         self.reference_path = Some(audio_path.to_string_lossy().to_string());
         self.prompt_semantic = prompt_semantic;
         self.reference_text = Some(text.to_string());
@@ -576,7 +602,7 @@ impl VoiceCloner {
         // Create Array from codes: [1, 1, num_codes]
         let codes_array = Array::from_slice(&codes, &[1, 1, codes.len() as i32]);
 
-        self.reference_mel = Some(mel);
+        self.store_reference_mel(mel)?;
         self.reference_path = Some(audio_path.to_string_lossy().to_string());
         self.prompt_semantic = Some(codes_array);
         self.reference_text = Some(text.to_string());
@@ -606,7 +632,7 @@ impl VoiceCloner {
         // Create Array from codes: [1, 1, num_codes]
         let codes_array = Array::from_slice(semantic_codes, &[1, 1, semantic_codes.len() as i32]);
 
-        self.reference_mel = Some(mel);
+        self.store_reference_mel(mel)?;
         self.reference_path = Some(audio_path.to_string_lossy().to_string());
         self.prompt_semantic = Some(codes_array);
         self.reference_text = Some(text.to_string());
@@ -700,33 +726,17 @@ impl VoiceCloner {
             return Err(Error::Cancelled);
         }
 
-        // Store options for use in generation loop
-        let timeout = options.timeout;
-        let cancel_token = options.cancel_token.clone();
-
         // Apply speed override if specified
         let original_speed = self.config.speed;
         if let Some(speed) = options.speed_override {
             self.config.speed = speed;
         }
 
-        // Perform synthesis with periodic checks
-        let result = self.synthesize(text);
+        // Perform synthesis with per-chunk cancellation/timeout checks
+        let result = self.synthesize_inner(text, Some((&options, start)));
 
         // Restore original speed
         self.config.speed = original_speed;
-
-        // Check for timeout/cancellation after synthesis
-        if let Some(token) = &cancel_token {
-            if token.load(Ordering::Relaxed) {
-                return Err(Error::Cancelled);
-            }
-        }
-        if let Some(t) = timeout {
-            if start.elapsed() > t {
-                return Err(Error::timeout(start.elapsed()));
-            }
-        }
 
         result
     }
@@ -738,6 +748,27 @@ impl VoiceCloner {
     /// Long segments are further chunked to prevent T2S attention degradation.
     #[instrument(skip(self), fields(text_len = text.len()))]
     pub fn synthesize(&mut self, text: &str) -> Result<AudioOutput, Error> {
+        self.synthesize_inner(text, None)
+    }
+
+    /// Internal synthesis loop with optional cancellation/timeout control.
+    ///
+    /// `ctrl` carries the synthesis options plus the start instant; it is
+    /// checked between chunks in both the T2S and VITS phases so cancellation
+    /// and timeouts take effect mid-synthesis instead of only at the end.
+    fn synthesize_inner(
+        &mut self,
+        text: &str,
+        ctrl: Option<(&SynthesisOptions, Instant)>,
+    ) -> Result<AudioOutput, Error> {
+        let check_interrupt = |phase: &str| -> Result<(), Error> {
+            if let Some((options, start)) = ctrl {
+                options.check_interrupt(start).inspect_err(|_| {
+                    debug!(phase, "Synthesis interrupted");
+                })?;
+            }
+            Ok(())
+        };
         // ===== Input Validation =====
         const MAX_TEXT_LENGTH: usize = 10_000;
 
@@ -786,21 +817,23 @@ impl VoiceCloner {
         let mut total_tokens = 0;
 
         for (i, chunk) in chunks.iter().enumerate() {
+            check_interrupt("t2s")?;
+
             if chunk.trim().is_empty() {
                 continue;
             }
 
             let is_few_shot = self.is_few_shot_mode();
             let preview: String = chunk.chars().take(15).collect();
-            eprintln!("   Processing chunk [{}]: few_shot={}, text=\"{}...\"", i, is_few_shot, preview);
+            debug!(chunk_idx = i, few_shot = is_few_shot, preview = %preview, "Processing chunk");
 
             let (tokens, phone_ids) = if is_few_shot {
-                self.generate_chunk_tokens(&chunk, &ref_mel, i == 0)?
+                self.generate_chunk_tokens(chunk, &ref_mel, i == 0)?
             } else {
-                self.generate_chunk_tokens_zero_shot(&chunk, &ref_mel, i == 0)?
+                self.generate_chunk_tokens_zero_shot(chunk, &ref_mel, i == 0)?
             };
 
-            eprintln!("   Chunk [{}]: {} tokens", i, tokens.len());
+            debug!(chunk_idx = i, num_tokens = tokens.len(), "Chunk T2S done");
             total_tokens += tokens.len();
             chunk_results.push(ChunkT2SResult {
                 semantic_tokens: tokens,
@@ -813,6 +846,8 @@ impl VoiceCloner {
         // If ONNX VITS is available, use batched decode (all chunks in one call).
         // Otherwise, fall back to per-chunk MLX decode with tail trimming.
         if let Some(ref mut vits_onnx) = self.vits_onnx {
+            check_interrupt("vits")?;
+
             // Concatenate all chunks' semantic tokens and phone IDs (like Python)
             let all_tokens: Vec<i32> = chunk_results.iter()
                 .flat_map(|r| r.semantic_tokens.iter().copied())
@@ -844,12 +879,12 @@ impl VoiceCloner {
                 let flat = phone_arr.flatten(None, None).map_err(|e| Error::Message(e.to_string()))?;
                 eval([&flat]).map_err(|e| Error::Message(e.to_string()))?;
                 let ps: &[i32] = flat.as_slice();
-                eprintln!("[ONNX] Chunk[{}]: {} tokens, {} phones, tokens[..10]={:?}",
-                         i, result.semantic_tokens.len(), ps.len(),
-                         &result.semantic_tokens[..result.semantic_tokens.len().min(10)]);
+                trace!(chunk_idx = i, num_tokens = result.semantic_tokens.len(), num_phones = ps.len(),
+                       tokens_head = ?&result.semantic_tokens[..result.semantic_tokens.len().min(10)],
+                       "[ONNX] chunk breakdown");
             }
-            eprintln!("[ONNX] Batched decode: {} tokens, {} phones, refer=[1,{},{}]",
-                     all_tokens.len(), all_phones.len(), mel_channels, mel_time);
+            debug!(num_tokens = all_tokens.len(), num_phones = all_phones.len(),
+                   mel_channels, mel_time, "[ONNX] batched decode");
 
             let raw_samples = vits_onnx.decode(
                 &all_tokens, &all_phones, mel_data, mel_channels, mel_time,
@@ -882,12 +917,12 @@ impl VoiceCloner {
                     }
                 }
 
-                eprintln!("   [ONNX] Chunk [{}]: {} tokens -> {} samples",
-                         i, result.semantic_tokens.len(), samples.len());
+                trace!(chunk_idx = i, num_tokens = result.semantic_tokens.len(),
+                       num_samples = samples.len(), "[ONNX] chunk samples");
 
                 // Append chunk audio + 0.3s silence (matching Python's fragment_interval=0.3)
                 all_samples.extend_from_slice(&samples);
-                all_samples.extend(std::iter::repeat(0.0f32).take(silence_samples));
+                all_samples.extend(std::iter::repeat_n(0.0f32, silence_samples));
             }
 
             let duration = all_samples.len() as f32 / sr;
@@ -910,6 +945,8 @@ impl VoiceCloner {
         let mut all_samples: Vec<f32> = Vec::new();
 
         for (i, result) in chunk_results.iter().enumerate() {
+            check_interrupt("vits")?;
+
             let audio = self.vocode(&result.semantic_tokens, &result.phone_ids, &ref_mel)?;
             let mut samples = array_to_f32_samples(&audio)?;
 
@@ -966,9 +1003,11 @@ impl VoiceCloner {
                                 let sample_start = keep_start * gap_win;
                                 let sample_end = (keep_end * gap_win).min(samples.len());
                                 compressed.extend_from_slice(&samples[sample_start..sample_end]);
-                                eprintln!("   [COMPRESS] Chunk {}: internal silence at {:.1}s-{:.1}s ({}ms) -> {}ms",
-                                         i, run_start as f32 * 0.05, w as f32 * 0.05,
-                                         run_len * 50, keep_wins * 50);
+                                trace!(chunk_idx = i,
+                                       gap_start_s = run_start as f32 * 0.05,
+                                       gap_end_s = w as f32 * 0.05,
+                                       gap_ms = run_len * 50, kept_ms = keep_wins * 50,
+                                       "[COMPRESS] internal silence compressed");
                             } else {
                                 // Short gap — keep as-is
                                 let sample_start = run_start * gap_win;
@@ -1060,8 +1099,10 @@ impl VoiceCloner {
                 let trim_window_idx = if gap_count >= 2 && has_speech_before_gap && burst_is_short {
                     // Cut at the start of the silence gap, with small margin
                     let cut_at = gap_end_window + 1; // keep 1 window into the gap for decay
-                    eprintln!("   [TRIM] Chunk {}: detected silence gap at window {} ({}ms), cutting burst ({} wins) at {}-{}",
-                             i, gap_end_window, gap_end_window * 50, burst_len, energy_block_start, last_energy);
+                    trace!(chunk_idx = i, gap_window = gap_end_window,
+                           gap_ms = gap_end_window * 50, burst_windows = burst_len,
+                           burst_start = energy_block_start, burst_end = last_energy,
+                           "[TRIM] cutting trailing burst at silence gap");
                     cut_at.min(n_windows)
                 } else {
                     // No gap pattern — just trim trailing silence
@@ -1073,13 +1114,13 @@ impl VoiceCloner {
                 // Apply fade-out over last 30ms
                 let fadeout_len = (sr * 0.03) as usize;
                 let fade_start = trim_pos_new.saturating_sub(fadeout_len);
-                for j in fade_start..trim_pos_new {
+                for (j, s) in samples.iter_mut().enumerate().take(trim_pos_new).skip(fade_start) {
                     let t = (trim_pos_new - j) as f32 / fadeout_len as f32;
-                    samples[j] *= t;
+                    *s *= t;
                 }
                 // Zero out everything after trim
-                for j in trim_pos_new..samples.len() {
-                    samples[j] = 0.0;
+                for s in samples.iter_mut().skip(trim_pos_new) {
+                    *s = 0.0;
                 }
                 trim_pos = trim_pos_new;
             }
@@ -1109,12 +1150,12 @@ impl VoiceCloner {
                         // Fade out
                         let fadeout_len = (sr * 0.03) as usize;
                         let fade_start = new_trim.saturating_sub(fadeout_len);
-                        for j in fade_start..new_trim {
+                        for (j, s) in samples.iter_mut().enumerate().take(new_trim).skip(fade_start) {
                             let t = (new_trim - j) as f32 / fadeout_len as f32;
-                            samples[j] *= t;
+                            *s *= t;
                         }
-                        for j in new_trim..trim_pos {
-                            samples[j] = 0.0;
+                        for s in samples.iter_mut().take(trim_pos).skip(new_trim) {
+                            *s = 0.0;
                         }
                         trim_pos = new_trim;
                     }
@@ -1122,8 +1163,9 @@ impl VoiceCloner {
             }
 
             let trimmed = &samples[..trim_pos];
-            eprintln!("   Chunk [{}]: {} tokens -> {} samples (trimmed from {})",
-                     i, result.semantic_tokens.len(), trimmed.len(), samples.len());
+            debug!(chunk_idx = i, num_tokens = result.semantic_tokens.len(),
+                   trimmed_samples = trimmed.len(), original_samples = samples.len(),
+                   "Chunk vocoded");
 
             // Crossfade with previous chunk's tail
             if !all_samples.is_empty() && crossfade_samples > 0 {
@@ -1159,31 +1201,10 @@ impl VoiceCloner {
     /// Generate semantic tokens for a chunk (zero-shot T2S only, no VITS).
     /// Returns (semantic_tokens, target_phone_ids).
     fn generate_chunk_tokens_zero_shot(&mut self, text: &str, _ref_mel: &Array, is_first_chunk: bool) -> Result<(Vec<i32>, Array), Error> {
-        // Reuse the same text preprocessing as synthesize_zero_shot
-        let text = if let Some(first_char) = text.chars().next() {
-            let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
-                                              '，' | '。' | '！' | '？' | '：');
-            let is_english = first_char.is_ascii_alphabetic();
-            let punct_chars = [',', '.', '!', '?', '~', ':', '—', '…', '，', '。', '！', '？', '：'];
-            let first_segment_len = text.chars()
-                .take_while(|c| !punct_chars.contains(c))
-                .count();
-
-            if is_first_chunk && !is_punct && is_english {
-                format!(", {}", text)
-            } else if is_first_chunk && !is_punct && first_segment_len < 4 {
-                eprintln!("   [zero-shot] Short first segment ({}): prepending '.'", first_segment_len);
-                format!(".{}", text)
-            } else {
-                text.to_string()
-            }
-        } else {
-            text.to_string()
-        };
+        let text = prepend_leading_punct(text, is_first_chunk);
 
         let (phoneme_ids, phonemes, word2ph, text_normalized) = preprocess_text_with_lang(&text, Some(crate::text::Language::Chinese));
-        eprintln!("   Phonemes: {:?}", &phonemes[..phonemes.len().min(30)]);
-        eprintln!("   Normalized: \"{}\"", text_normalized);
+        trace!(phonemes = ?&phonemes[..phonemes.len().min(30)], normalized = %text_normalized, "Zero-shot chunk preprocessed");
 
         let text_chars = text_normalized.chars().count();
         let word2ph_for_bert = &word2ph[..text_chars.min(word2ph.len())];
@@ -1192,7 +1213,7 @@ impl VoiceCloner {
         let (all_tokens, generated_count) = self.generate_semantic_tokens(&phoneme_ids, &bert_features, phonemes.len(), None)?;
         let tokens = all_tokens[all_tokens.len().saturating_sub(generated_count)..].to_vec();
 
-        eprintln!("   Semantic tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(20)]);
+        trace!(num_tokens = tokens.len(), tokens_head = ?&tokens[..tokens.len().min(20)], "Semantic tokens generated");
 
         Ok((tokens, phoneme_ids))
     }
@@ -1205,28 +1226,7 @@ impl VoiceCloner {
         let prompt_semantic = self.prompt_semantic.clone()
             .ok_or_else(|| Error::Message("Prompt semantic not set".to_string()))?;
 
-        // Same text preprocessing as synthesize_few_shot
-        let text = if let Some(first_char) = text.chars().next() {
-            let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
-                                              '，' | '。' | '！' | '？' | '：');
-            let is_english = first_char.is_ascii_alphabetic();
-            let punct_chars = [',', '.', '!', '?', '~', ':', '—', '…', '，', '。', '！', '？', '：'];
-            let first_segment_len = text.chars()
-                .take_while(|c| !punct_chars.contains(c))
-                .count();
-
-            if is_first_chunk && !is_punct && is_english {
-                format!(", {}", text)
-            } else if is_first_chunk && !is_punct && first_segment_len < 4 {
-                let preview: String = text.chars().take(15).collect();
-                eprintln!("   [few-shot] Short first segment ({}): \"{}\" -> prepending '.'", first_segment_len, preview);
-                format!(".{}", text)
-            } else {
-                text.to_string()
-            }
-        } else {
-            text.to_string()
-        };
+        let text = prepend_leading_punct(text, is_first_chunk);
 
         // 1. Preprocess reference text
         let (ref_phoneme_ids, ref_phonemes, ref_word2ph, ref_text_normalized) = preprocess_text_with_lang(&ref_text, Some(crate::text::Language::Chinese));
@@ -1237,9 +1237,9 @@ impl VoiceCloner {
 
         // 2. Preprocess target text
         let (target_phoneme_ids, target_phonemes, target_word2ph, target_text_normalized) = preprocess_text_with_lang(&text, Some(crate::text::Language::Chinese));
-        eprintln!("   [few-shot] Target phonemes ({}):", target_phonemes.len());
-        eprintln!("      {:?}", &target_phonemes[..target_phonemes.len().min(20)]);
-        eprintln!("   [few-shot] Target normalized: '{}'", target_text_normalized);
+        trace!(num_phonemes = target_phonemes.len(),
+               phonemes_head = ?&target_phonemes[..target_phonemes.len().min(20)],
+               normalized = %target_text_normalized, "[few-shot] target preprocessed");
 
         let target_text_trimmed = target_text_normalized.trim();
         let target_text_chars = target_text_trimmed.chars().count();
@@ -1266,207 +1266,10 @@ impl VoiceCloner {
         // 5. Extract newly generated tokens
         let new_tokens = all_tokens[all_tokens.len().saturating_sub(generated_count)..].to_vec();
         let prompt_len = prompt_semantic.shape()[2] as usize;
-        eprintln!("   [few-shot] Semantic tokens: all={}, prompt={}, generated={}",
-                  all_tokens.len(), prompt_len, generated_count);
+        debug!(all = all_tokens.len(), prompt = prompt_len, generated = generated_count,
+               "[few-shot] semantic tokens");
 
         Ok((new_tokens, target_phoneme_ids))
-    }
-
-    /// Zero-shot synthesis (no reference text, only reference audio for style)
-    #[allow(dead_code)]
-    fn synthesize_zero_shot(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<AudioOutput, Error> {
-        // Python keeps trailing punctuation as part of the phoneme sequence.
-        // Do NOT strip it - it becomes the sentence delimiter phoneme.
-
-        // Python's pre_seg_text: prepend punctuation if text doesn't start with one
-        // and first segment is short (< 4 chars). This helps T2S model alignment.
-        // Python: if (text[0] not in splits and len(get_first(text)) < 4): text = "。" + text
-        let text = if let Some(first_char) = text.chars().next() {
-            let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
-                                              '，' | '。' | '！' | '？' | '：');
-            let is_english = first_char.is_ascii_alphabetic();
-
-            // get_first: split by punctuation and get first segment
-            let punct_chars = [',', '.', '!', '?', '~', ':', '—', '…', '，', '。', '！', '？', '：'];
-            let first_segment_len = text.chars()
-                .take_while(|c| !punct_chars.contains(c))
-                .count();
-
-            if is_first_chunk && !is_punct && is_english {
-                // Prepend comma for English text - only for first chunk
-                format!(", {}", text)
-            } else if is_first_chunk && !is_punct && first_segment_len < 4 {
-                // Prepend period if first segment < 4 chars (matches Python's behavior)
-                // Only for first chunk - middle chunks shouldn't get extra punctuation
-                eprintln!("   [zero-shot] Short first segment ({}): prepending '.'", first_segment_len);
-                format!(".{}", text)  // Prepend ASCII period like Python
-            } else {
-                text.to_string()
-            }
-        } else {
-            text.to_string()
-        };
-
-        // 1. Text preprocessing (word2ph comes from preprocessor for correct handling of mixed text)
-        let (phoneme_ids, phonemes, word2ph, text_normalized) = preprocess_text_with_lang(&text, Some(crate::text::Language::Chinese));
-        eprintln!("   Phonemes: {:?}", &phonemes[..phonemes.len().min(30)]);
-        eprintln!("   Normalized: \"{}\"", text_normalized);
-
-        // 2. BERT encoding - use normalized text (quotes/parentheses removed)
-        let text_chars = text_normalized.chars().count();
-        let word2ph_for_bert = &word2ph[..text_chars.min(word2ph.len())];
-        let bert_features = self.extract_bert_features(&text_normalized, word2ph_for_bert, phonemes.len())?;
-
-        // DEBUG: Print BERT features info
-        eval([&bert_features]).map_err(|e| Error::Message(e.to_string()))?;
-        let bert_shape = bert_features.shape();
-        eprintln!("   BERT features shape: {:?}", bert_shape);
-        // Print first 5 values of first position
-        let bert_flat: Vec<f32> = bert_features.flatten(None, None)
-            .map_err(|e| Error::Message(e.to_string()))?
-            .as_slice().to_vec();
-        eprintln!("   BERT features[0,:5]: {:?}", &bert_flat[..5.min(bert_flat.len())]);
-        // Also print position 1 (skip first 1024 values)
-        if bert_flat.len() > 1024 {
-            eprintln!("   BERT features[1,:5]: {:?}", &bert_flat[1024..1029.min(bert_flat.len())]);
-        }
-
-        // 3. Generate semantic tokens
-        // For zero-shot, all tokens are newly generated (no prompt)
-        let (all_tokens, generated_count) = self.generate_semantic_tokens(&phoneme_ids, &bert_features, phonemes.len(), None)?;
-        // Use last generated_count tokens (for zero-shot, this equals all_tokens since no prompt)
-        let tokens = &all_tokens[all_tokens.len().saturating_sub(generated_count)..];
-
-        // DEBUG: Print semantic tokens for comparison with Python
-        eprintln!("   Semantic tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(20)]);
-
-        // 4. VITS vocoding
-        let audio = self.vocode(tokens, &phoneme_ids, ref_mel)?;
-
-        // 5. Convert to output
-        let samples = array_to_f32_samples(&audio)?;
-        let duration = samples.len() as f32 / self.config.sample_rate as f32;
-
-        Ok(AudioOutput {
-            samples,
-            sample_rate: self.config.sample_rate,
-            duration,
-            num_tokens: tokens.len(),
-        })
-    }
-
-    /// Few-shot synthesis (with reference text and prompt semantic codes)
-    #[allow(dead_code)]
-    fn synthesize_few_shot(&mut self, text: &str, ref_mel: &Array, is_first_chunk: bool) -> Result<AudioOutput, Error> {
-        let ref_text = self.reference_text.clone()
-            .ok_or_else(|| Error::Message("Reference text not set".to_string()))?;
-        let prompt_semantic = self.prompt_semantic.clone()
-            .ok_or_else(|| Error::Message("Prompt semantic not set".to_string()))?;
-
-        // Python keeps trailing punctuation as part of the phoneme sequence.
-        // Do NOT strip it - it becomes the sentence delimiter phoneme.
-
-        // Python's pre_seg_text: prepend punctuation if text doesn't start with one
-        // and first segment is short (< 4 chars). This helps T2S model alignment.
-        let text = if let Some(first_char) = text.chars().next() {
-            let is_punct = matches!(first_char, ',' | '.' | '!' | '?' | '~' | ':' | '—' | '…' |
-                                              '，' | '。' | '！' | '？' | '：');
-            let is_english = first_char.is_ascii_alphabetic();
-
-            // get_first: split by punctuation and get first segment
-            let punct_chars = [',', '.', '!', '?', '~', ':', '—', '…', '，', '。', '！', '？', '：'];
-            let first_segment_len = text.chars()
-                .take_while(|c| !punct_chars.contains(c))
-                .count();
-
-            let result = if is_first_chunk && !is_punct && is_english {
-                // Prepend comma for English text - only for first chunk
-                format!(", {}", text)
-            } else if is_first_chunk && !is_punct && first_segment_len < 4 {
-                // Short first segment - prepend period to match Python's behavior
-                // Only for first chunk - middle chunks shouldn't get extra punctuation
-                let preview: String = text.chars().take(15).collect();
-                eprintln!("   [few-shot] Short first segment ({}): \"{}\" -> prepending '.'", first_segment_len, preview);
-                format!(".{}", text)  // Prepend ASCII period like Python
-            } else {
-                text.to_string()
-            };
-            let preview: String = text.chars().take(20).collect();
-            eprintln!("   [few-shot] Input text: \"{}...\" -> first_char='{}', first_segment_len={}",
-                     preview, first_char, first_segment_len);
-            result
-        } else {
-            text.to_string()
-        };
-
-        // 1. Preprocess reference text
-        // Note: preprocess_text produces the same phoneme sequence as Python (no special markers)
-        let (ref_phoneme_ids, ref_phonemes, ref_word2ph, ref_text_normalized) = preprocess_text_with_lang(&ref_text, Some(crate::text::Language::Chinese));
-
-        // Trim whitespace from normalized text for BERT alignment
-        let ref_text_trimmed = ref_text_normalized.trim();
-        let ref_text_chars = ref_text_trimmed.chars().count();
-        let ref_word2ph_for_bert = &ref_word2ph[..ref_text_chars.min(ref_word2ph.len())];
-        let ref_bert_features = self.extract_bert_features(ref_text_trimmed, ref_word2ph_for_bert, ref_phonemes.len())?;
-
-        // 2. Preprocess target text - use normalized text for BERT
-        let (target_phoneme_ids, target_phonemes, target_word2ph, target_text_normalized) = preprocess_text_with_lang(&text, Some(crate::text::Language::Chinese));
-        eprintln!("   [few-shot] Target phonemes ({}):", target_phonemes.len());
-        eprintln!("      {:?}", &target_phonemes[..target_phonemes.len().min(20)]);
-        eprintln!("   [few-shot] Target normalized: '{}'", target_text_normalized);
-
-        // Trim whitespace from normalized text for BERT alignment
-        let target_text_trimmed = target_text_normalized.trim();
-        let target_text_chars = target_text_trimmed.chars().count();
-        let target_word2ph_for_bert = &target_word2ph[..target_text_chars.min(target_word2ph.len())];
-        let target_bert_features = self.extract_bert_features(target_text_trimmed, target_word2ph_for_bert, target_phonemes.len())?;
-
-        // 3. Combine: ref_phones + target_phones (NO extra period — Python doesn't append one)
-        let combined_phoneme_ids = mlx_rs::ops::concatenate_axis(&[&ref_phoneme_ids, &target_phoneme_ids], 1)
-            .map_err(|e| Error::Message(format!("Failed to concat phonemes: {}", e)))?;
-        eval([&combined_phoneme_ids]).map_err(|e| Error::Message(e.to_string()))?;
-
-        // 4. Combine: all_bert = ref_bert + target_bert (Python: torch.cat([prompt_data["bert_features"], item["bert_features"]], 1))
-        let combined_bert_features = mlx_rs::ops::concatenate_axis(&[&ref_bert_features, &target_bert_features], 1)
-            .map_err(|e| Error::Message(format!("Failed to concat BERT features: {}", e)))?;
-        eval([&combined_bert_features]).map_err(|e| Error::Message(e.to_string()))?;
-
-        // 5. Generate semantic tokens
-        // Use TARGET phoneme count for bounds - prompt_semantic covers ref portion,
-        // we only generate new tokens for target text
-        let (all_tokens, generated_count) = self.generate_semantic_tokens(
-            &combined_phoneme_ids,
-            &combined_bert_features,
-            target_phonemes.len(),  // Bounds based on target only
-            Some(&prompt_semantic),
-        )?;
-
-        // 6. Extract only newly generated tokens for VITS (like Python: item[-idx:])
-        // Python uses item[-idx:] where idx is the exact count of newly generated tokens
-        // This matches exactly - take the LAST generated_count tokens
-        let new_tokens = &all_tokens[all_tokens.len().saturating_sub(generated_count)..];
-        let prompt_len = prompt_semantic.shape()[2] as usize;  // Shape is [1, 1, N]
-        eprintln!("   [few-shot] Semantic tokens: all={}, prompt={}, generated={}",
-                  all_tokens.len(), prompt_len, generated_count);
-        eprintln!("   [few-shot] First 10 new tokens: {:?}", &new_tokens[..new_tokens.len().min(10)]);
-
-
-        // Don't pad - the tokens should be correct with Python prompt codes
-        let new_tokens: Vec<i32> = new_tokens.to_vec();
-
-        // 7. VITS vocoding with target phonemes only (NO extra period — matching Python)
-        let audio = self.vocode(&new_tokens, &target_phoneme_ids, ref_mel)?;
-
-        // 8. Convert to output
-        let samples = array_to_f32_samples(&audio)?;
-        let duration = samples.len() as f32 / self.config.sample_rate as f32;
-
-        Ok(AudioOutput {
-            samples,
-            sample_rate: self.config.sample_rate,
-            duration,
-            num_tokens: new_tokens.len(),
-        })
     }
 
     /// Extract BERT features with proper alignment
@@ -1481,11 +1284,11 @@ impl VoiceCloner {
         use crate::text::{detect_language, Language};
 
         let language = detect_language(text);
-        eprintln!("   [BERT] text='{}', detected={:?}", text, language);
+        trace!(text = %text, detected = ?language, "[BERT] language detected");
 
         // Pure English: all zeros
         if matches!(language, Language::English) {
-            eprintln!("   [BERT] Using zeros (non-Chinese)");
+            trace!("[BERT] using zeros (non-Chinese)");
             let bert_features = Array::zeros::<f32>(&[1, phoneme_count as i32, 1024])
                 .map_err(|e| Error::Message(e.to_string()))?;
             eval([&bert_features]).map_err(|e| Error::Message(e.to_string()))?;
@@ -1496,7 +1299,7 @@ impl VoiceCloner {
         // This matches Python's all_zh path which uses LangSegment to split,
         // then get_bert_inf returns real features for zh and zeros for en.
         if matches!(language, Language::Mixed) {
-            eprintln!("   [BERT] Mixed text - segmenting by language");
+            trace!("[BERT] mixed text - segmenting by language");
             use crate::text::preprocessor::segment_by_language;
 
             let segments = segment_by_language(text);
@@ -1529,8 +1332,8 @@ impl VoiceCloner {
                     let zeros = Array::zeros::<f32>(&[1, seg_phoneme_count, 1024])
                         .map_err(|e| Error::Message(e.to_string()))?;
                     all_parts.push(zeros);
-                    eprintln!("   [BERT] English segment '{}': {} phonemes (zeros)",
-                             &seg.text.chars().take(20).collect::<String>(), seg_phoneme_count);
+                    trace!(segment = %seg.text.chars().take(20).collect::<String>(),
+                           phonemes = seg_phoneme_count, "[BERT] English segment (zeros)");
                 } else {
                     // Chinese: real BERT
                     // Strip whitespace from segment text since chinese_g2p skips spaces
@@ -1552,14 +1355,14 @@ impl VoiceCloner {
                         bert_raw
                     };
                     all_parts.push(bert);
-                    eprintln!("   [BERT] Chinese segment '{}': {} phonemes (real BERT)",
-                             &seg.text.chars().take(20).collect::<String>(), seg_phoneme_count);
+                    trace!(segment = %seg.text.chars().take(20).collect::<String>(),
+                           phonemes = seg_phoneme_count, "[BERT] Chinese segment (real BERT)");
                 }
                 w2p_idx = end_idx;
             }
 
             // Handle any remaining phonemes (e.g., trailing punctuation)
-            let total_bert: i32 = all_parts.iter().map(|a| a.shape()[1] as i32).sum();
+            let total_bert: i32 = all_parts.iter().map(|a| a.shape()[1]).sum();
             let phoneme_count_i32 = phoneme_count as i32;
             if total_bert < phoneme_count_i32 {
                 let pad = Array::zeros::<f32>(&[1, phoneme_count_i32 - total_bert, 1024])
@@ -1591,7 +1394,7 @@ impl VoiceCloner {
         let bert_features_raw = self.bert.extract_features(text, word2ph)?;
         eval([&bert_features_raw]).map_err(|e| Error::Message(e.to_string()))?;
 
-        let bert_seq_len = bert_features_raw.shape()[1] as i32;
+        let bert_seq_len = bert_features_raw.shape()[1];
         let phoneme_count = phoneme_count as i32;
 
         let bert_features = if bert_seq_len < phoneme_count {
@@ -1657,7 +1460,7 @@ impl VoiceCloner {
                 .map_err(|e| Error::Message(e.to_string()))?;
             // If it's 1D, add batch dimension
             if prompt_squeezed.ndim() == 1 {
-                let seq_len = prompt_squeezed.shape()[0] as i32;
+                let seq_len = prompt_squeezed.shape()[0];
                 prompt_squeezed.reshape(&[1, seq_len])
                     .map_err(|e| Error::Message(e.to_string()))?
             } else {
@@ -1694,11 +1497,16 @@ impl VoiceCloner {
         };
         let mut sampler = Sampler::new(sampling_config);
 
+        // Seed the sampler history with the prompt tokens: Python applies the
+        // repetition penalty to ALL previous tokens (y includes the prompts),
+        // starting from the very first sampled token.
+        for &t in &prompt_tokens {
+            sampler.add_token(t);
+        }
+
         // Python masks EOS during first 11 tokens (idx < 11), so we mask here (idx=0)
-        // IMPORTANT: For first token, DON'T apply penalty to prompt tokens
-        // Python's behavior: penalty is only applied to previously GENERATED tokens
-        // At step 0, there are no generated tokens yet, so no penalty
         let (mut token_id, _) = sampler.sample_with_eos_mask(&last_logits)?;
+        sampler.add_token(token_id);
         semantic_ids = Array::from_slice(&[token_id], &[1, 1]);
         // all_tokens contains prompt + generated (Python behavior: returns prompts + new tokens to VITS)
         // This matches Python's infer_panel which returns pred_semantic that includes prompt semantic
@@ -1753,8 +1561,8 @@ impl VoiceCloner {
             let eos_detected = token_id == eos_token || argmax_token == eos_token;
 
             if eos_detected {
-                eprintln!("   [T2S] EOS at step {}: token={}, argmax={}, eos_token={}",
-                         generated_count, token_id, argmax_token, eos_token);
+                debug!(step = generated_count, token = token_id, argmax = argmax_token,
+                       eos = eos_token, "[T2S] EOS");
                 break;
             }
 
@@ -1764,7 +1572,7 @@ impl VoiceCloner {
 
             // Repetition detection for longer patterns (check only generated portion)
             if generated_count > min_tokens && detect_repetition(&all_tokens[prompt_len..], 3, 8) {
-                eprintln!("   [T2S] Repetition detected at step {}", generated_count);
+                debug!(step = generated_count, "[T2S] repetition detected");
                 while generated_count > min_tokens && detect_repetition(&all_tokens[prompt_len..], 3, 5) {
                     all_tokens.pop();
                     generated_count -= 1;
@@ -1788,8 +1596,13 @@ impl VoiceCloner {
             .map_err(|e| Error::Message(e.to_string()))?;
         let text_for_vits = text_ids.index(mlx_rs::ops::indexing::NewAxis);
 
-        let audio = self.vits.decode(&codes, &text_for_vits, Some(ref_mel), self.config.noise_scale, self.config.speed)
-            .map_err(|e| Error::Message(e.to_string()))?;
+        // Use the style embedding cached when the reference was set; only
+        // recompute from the mel if no cached embedding is available.
+        let audio = if let Some(ge) = self.reference_ge.clone() {
+            self.vits.decode_with_ge(&codes, &text_for_vits, Some(&ge), self.config.noise_scale, self.config.speed)
+        } else {
+            self.vits.decode(&codes, &text_for_vits, Some(ref_mel), self.config.noise_scale, self.config.speed)
+        }.map_err(|e| Error::Message(e.to_string()))?;
 
         eval([&audio]).map_err(|e| Error::Message(e.to_string()))?;
 
@@ -1882,41 +1695,34 @@ impl VoiceCloner {
     }
 }
 
-/// Compute word2ph (phonemes per character) for text
-#[allow(dead_code)]
-fn compute_word2ph(text: &str) -> Vec<i32> {
-    let mut word2ph = Vec::new();
-    for c in text.chars() {
-        if c == '，' || c == '。' || c == '！' || c == '？' || c == '；' || c == '：'
-            || c == ',' || c == '.' || c == '!' || c == '?' || c == ';' || c == ':'
-        {
-            word2ph.push(1);
-        } else if c.is_whitespace() {
-            word2ph.push(1);
-        } else {
-            word2ph.push(2); // Most Chinese chars have 2 phonemes (initial + final)
-        }
+/// Punctuation set used by Python's `pre_seg_text` / `get_first`
+const LEADING_PUNCT_CHARS: [char; 13] =
+    [',', '.', '!', '?', '~', ':', '—', '…', '，', '。', '！', '？', '：'];
+
+/// Python's `pre_seg_text`: prepend punctuation when the first chunk doesn't
+/// start with one. This helps T2S model alignment.
+///
+/// - English first chunk: prepend ", "
+/// - Short first segment (< 4 chars before the first punctuation): prepend "."
+/// - Otherwise (or for non-first chunks): unchanged
+fn prepend_leading_punct(text: &str, is_first_chunk: bool) -> String {
+    let Some(first_char) = text.chars().next() else {
+        return text.to_string();
+    };
+    if !is_first_chunk || LEADING_PUNCT_CHARS.contains(&first_char) {
+        return text.to_string();
     }
-    word2ph
-}
-
-/// Global language detector (lazy initialized)
-/// Uses lingua for ML-based language detection like Python's LangSegment
-#[allow(dead_code)]
-static LANG_DETECTOR: OnceLock<LanguageDetector> = OnceLock::new();
-
-#[allow(dead_code)]
-fn get_lang_detector() -> &'static LanguageDetector {
-    LANG_DETECTOR.get_or_init(|| {
-        LanguageDetectorBuilder::from_languages(&[
-            Language::Chinese,
-            Language::English,
-            Language::Japanese,
-            Language::Korean,
-        ])
-        .with_preloaded_language_models()
-        .build()
-    })
+    if first_char.is_ascii_alphabetic() {
+        return format!(", {}", text);
+    }
+    let first_segment_len = text.chars()
+        .take_while(|c| !LEADING_PUNCT_CHARS.contains(c))
+        .count();
+    if first_segment_len < 4 {
+        debug!(first_segment_len, "Short first segment: prepending '.'");
+        return format!(".{}", text);
+    }
+    text.to_string()
 }
 
 /// Check if a character is CJK (Chinese, Japanese, or Korean)
@@ -2031,343 +1837,6 @@ fn cut5_split(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Language-aware text segmentation (like Python's LangSegment)
-///
-/// Uses a hybrid approach:
-/// 1. First splits by character class (ASCII letters = English, CJK = Chinese/Japanese/Korean)
-/// 2. Uses lingua ML model for ambiguous cases
-///
-/// This matches Python's LangSegment which uses regex for obvious patterns
-/// and py3langid for edge cases.
-#[allow(dead_code)]
-fn split_text_by_language(text: &str) -> Vec<String> {
-    #[derive(Clone, Copy, PartialEq, Debug)]
-    enum Lang { English, Cjk, Other }
-
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-
-    // Helper: check if a character is a digit or decimal point
-    let is_digit_or_dot = |c: char| c.is_ascii_digit() || c == '.';
-
-    // Step 1: Split by character class (like Python's regex patterns)
-    // Special handling: numbers followed directly by CJK go with CJK (e.g., "126.4亿斤")
-    let mut char_segments: Vec<(Lang, String)> = Vec::new();
-    let mut current = String::new();
-    let mut current_lang = Lang::Other;
-
-    let mut i = 0;
-    while i < len {
-        let ch = chars[i];
-        let char_lang = if ch.is_ascii_alphabetic() {
-            Lang::English
-        } else if is_cjk_char(ch) {
-            Lang::Cjk
-        } else {
-            Lang::Other  // punctuation, numbers, spaces, quotes
-        };
-
-        match char_lang {
-            Lang::English => {
-                if current_lang == Lang::Cjk && !current.is_empty() {
-                    char_segments.push((Lang::Cjk, std::mem::take(&mut current)));
-                }
-                current.push(ch);
-                current_lang = Lang::English;
-            }
-            Lang::Cjk => {
-                if current_lang == Lang::English && !current.is_empty() {
-                    char_segments.push((Lang::English, std::mem::take(&mut current)));
-                }
-                current.push(ch);
-                current_lang = Lang::Cjk;
-            }
-            Lang::Other => {
-                // Check if this is a number followed directly by CJK
-                if is_digit_or_dot(ch) {
-                    // Look ahead to see what follows the number
-                    let mut j = i;
-                    while j < len && is_digit_or_dot(chars[j]) {
-                        j += 1;
-                    }
-                    // If number is followed directly by CJK (no space), treat as CJK
-                    if j < len && is_cjk_char(chars[j]) {
-                        // Push current English segment if any
-                        if current_lang == Lang::English && !current.is_empty() {
-                            char_segments.push((Lang::English, std::mem::take(&mut current)));
-                        }
-                        // Add all the digits to CJK segment
-                        while i < j {
-                            current.push(chars[i]);
-                            i += 1;
-                        }
-                        current_lang = Lang::Cjk;
-                        continue;  // Don't increment i again
-                    }
-                }
-                // Otherwise, punctuation/numbers/quotes attach to current segment
-                current.push(ch);
-            }
-        }
-        i += 1;
-    }
-    if !current.is_empty() {
-        char_segments.push((current_lang, current));
-    }
-
-    // Step 2: For CJK segments, use lingua to detect if it's Japanese/Korean vs Chinese
-    // (This matters for phoneme processing)
-    let detector = get_lang_detector();
-    let mut lang_segments: Vec<(Language, String)> = Vec::new();
-
-    for (lang, text) in char_segments {
-        if text.trim().is_empty() {
-            continue;
-        }
-        match lang {
-            Lang::English => {
-                lang_segments.push((Language::English, text));
-            }
-            Lang::Cjk | Lang::Other => {
-                // Use lingua to detect Chinese vs Japanese vs Korean
-                if let Some(detected) = detector.detect_language_of(&text) {
-                    lang_segments.push((detected, text));
-                } else {
-                    // Default to Chinese
-                    lang_segments.push((Language::Chinese, text));
-                }
-            }
-        }
-    }
-
-    // Step 3: Split CJK segments at sentence-ending punctuation
-    let cjk_sentence_end: std::collections::HashSet<char> =
-        ['。', '？', '！', '．'].into_iter().collect();
-
-    let mut result = Vec::new();
-    for (lang, text) in lang_segments {
-        if matches!(lang, Language::Chinese | Language::Japanese | Language::Korean) {
-            // Split CJK at sentence-ending punctuation
-            let mut sub = String::new();
-            for ch in text.chars() {
-                sub.push(ch);
-                if cjk_sentence_end.contains(&ch) {
-                    if !sub.trim().is_empty() {
-                        result.push(sub.clone());
-                    }
-                    sub.clear();
-                }
-            }
-            if !sub.trim().is_empty() {
-                result.push(sub);
-            }
-        } else {
-            // Keep English segments whole
-            if !text.trim().is_empty() {
-                result.push(text);
-            }
-        }
-    }
-
-    // Step 4: Filter out segments that are too short (only punctuation, less than 2 actual characters)
-    let result: Vec<String> = result.into_iter().filter(|s| {
-        let content_chars = s.chars().filter(|c| {
-            !matches!(*c, ',' | '.' | ';' | '?' | '!' | '、' | '，' | '。' | '？' | '！' | '；' | '：' | '…' | '\u{201C}' | '\u{201D}' | '\'' | '（' | '）' | '(' | ')' | '《' | '》' | '【' | '】')
-        }).count();
-        content_chars >= 2
-    }).collect();
-
-    // If filtering removed all segments, return original text as single segment
-    if result.is_empty() {
-        return vec![text.to_string()];
-    }
-
-    // Step 5: Merge very short Chinese segments (<=4 content chars) with adjacent Chinese segments
-    // This prevents isolated short Chinese chunks after English from having poor context
-    let mut merged: Vec<String> = Vec::new();
-    for seg in result {
-        let content_chars: usize = seg.chars().filter(|c| is_cjk_char(*c)).count();
-        let is_short_cjk = content_chars > 0 && content_chars <= 4;
-
-        if is_short_cjk {
-            if let Some(prev) = merged.last() {
-                // Check if we can merge with previous segment
-                let prev_has_cjk = prev.chars().any(|c| is_cjk_char(c));
-                let prev_ends_with_punct = prev.chars().last()
-                    .map(|c| matches!(c, '）' | ')' | '》' | '】' | '"'))
-                    .unwrap_or(false);
-
-                if prev_has_cjk || prev_ends_with_punct {
-                    // Merge with previous segment
-                    if let Some(prev) = merged.pop() {
-                        merged.push(format!("{}{}", prev, seg));
-                        continue;
-                    }
-                }
-            }
-        }
-        merged.push(seg);
-    }
-
-    // Note: Step 6 removed - was a hard-coded split for "合并，并" patterns.
-    // The proper fix is to zero out BERT features at punctuation positions (SP phonemes)
-    // which prevents the T2S model from being confused by punctuation context.
-
-    merged
-}
-
-/// Estimate phoneme count for a text segment
-///
-/// Rough estimation: Chinese chars ~2 phonemes, English words ~3-4 phonemes
-#[allow(dead_code)]
-fn estimate_phoneme_count(text: &str) -> usize {
-    let mut count = 0;
-    let mut in_english_word = false;
-
-    for c in text.chars() {
-        if c.is_ascii_alphabetic() {
-            if !in_english_word {
-                // Start of English word: estimate 3-4 phonemes per word
-                count += 3;
-                in_english_word = true;
-            }
-        } else {
-            in_english_word = false;
-            if is_cjk_char(c) {
-                // Chinese char: ~2 phonemes (initial + final)
-                count += 2;
-            } else if c.is_ascii_punctuation() || matches!(c, '，' | '。' | '？' | '！' | '、' | '；' | '：') {
-                // Punctuation: 1 phoneme (SP or similar)
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
-/// Chunk segments that exceed max_phonemes by splitting at comma/space boundaries
-///
-/// This prevents T2S attention degradation on very long sequences.
-#[allow(dead_code)]
-fn chunk_segments_by_length(segments: &[String], max_phonemes: usize) -> Vec<String> {
-    let comma_chars: std::collections::HashSet<char> = ['，', ',', '、', '；', ';'].into_iter().collect();
-
-    let mut result = Vec::new();
-
-    for segment in segments {
-        let estimated = estimate_phoneme_count(segment);
-
-        if estimated <= max_phonemes {
-            // Segment is short enough, keep as-is
-            result.push(segment.clone());
-        } else {
-            // Split at comma/pause boundaries
-            let mut current = String::new();
-            let mut current_est = 0;
-            let mut _last_split_point = 0;
-            let chars: Vec<char> = segment.chars().collect();
-
-            for (i, &c) in chars.iter().enumerate() {
-                current.push(c);
-
-                // Update estimate
-                if c.is_ascii_alphabetic() {
-                    // Rough: each English letter adds ~0.5 phoneme
-                    current_est += 1;  // Will be divided by 2 effectively
-                } else if is_cjk_char(c) {
-                    current_est += 2;
-                } else if c.is_ascii_punctuation() || matches!(c, '，' | '。' | '？' | '！' | '、' | '；' | '：') {
-                    current_est += 1;
-                }
-
-                // Check if we hit a comma and have enough content
-                let at_comma = comma_chars.contains(&c);
-                let at_space = c == ' ' && current_est > 30;  // Also split at space for English
-
-                if (at_comma || at_space) && current_est >= 20 {
-                    // Check if remaining segment is substantial
-                    let remaining_est = estimate_phoneme_count(&chars[i+1..].iter().collect::<String>());
-                    if remaining_est >= 10 || at_comma {
-                        if !current.trim().is_empty() {
-                            result.push(current.clone());
-                            current.clear();
-                            current_est = 0;
-                            _last_split_point = i + 1;
-                        }
-                    }
-                }
-
-                // Force split if we're way over limit
-                if current_est > max_phonemes + 30 {
-                    if !current.trim().is_empty() {
-                        result.push(current.clone());
-                        current.clear();
-                        current_est = 0;
-                        _last_split_point = i + 1;
-                    }
-                }
-            }
-
-            // Add remaining
-            if !current.trim().is_empty() {
-                result.push(current);
-            }
-        }
-    }
-
-    result
-}
-
-/// Split text at punctuation marks (like Python's cut5 method)
-///
-/// This splits text at: , . ; ? ! 、，。？！；：…
-/// Numbers with decimal points (e.g., "3.14") are kept together.
-#[allow(dead_code)]
-fn split_text_at_punctuation(text: &str) -> Vec<String> {
-    let punctuation: std::collections::HashSet<char> = [
-        ',', '.', ';', '?', '!',  // English
-        '、', '，', '。', '？', '！', '；', '：', '…',  // Chinese
-    ].into_iter().collect();
-
-    let chars: Vec<char> = text.chars().collect();
-    let mut segments = Vec::new();
-    let mut current = String::new();
-
-    for (i, &ch) in chars.iter().enumerate() {
-        if punctuation.contains(&ch) {
-            // Check if it's a decimal point (digit.digit)
-            if ch == '.' && i > 0 && i < chars.len() - 1 {
-                if chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit() {
-                    current.push(ch);
-                    continue;
-                }
-            }
-            // Add punctuation to current segment
-            current.push(ch);
-            // Save segment if it has content
-            let trimmed = current.trim();
-            if !trimmed.is_empty() && !trimmed.chars().all(|c| punctuation.contains(&c)) {
-                segments.push(current.clone());
-            }
-            current.clear();
-        } else {
-            current.push(ch);
-        }
-    }
-
-    // Add remaining text
-    if !current.trim().is_empty() {
-        segments.push(current);
-    }
-
-    // If no segments were created, return original text
-    if segments.is_empty() {
-        vec![text.to_string()]
-    } else {
-        segments
-    }
-}
-
 /// Convert audio array to f32 samples
 fn array_to_f32_samples(audio: &Array) -> Result<Vec<f32>, Error> {
     eval([audio]).map_err(|e| Error::Message(e.to_string()))?;
@@ -2384,9 +1853,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compute_word2ph() {
-        let word2ph = compute_word2ph("你好，世界！");
-        assert_eq!(word2ph, vec![2, 2, 1, 2, 2, 1]); // 你(2) 好(2) ，(1) 世(2) 界(2) ！(1)
+    fn test_prepend_leading_punct() {
+        // Non-first chunks are never modified
+        assert_eq!(prepend_leading_punct("好", false), "好");
+        // Already starts with punctuation: unchanged
+        assert_eq!(prepend_leading_punct("，你好", true), "，你好");
+        // English first chunk gets ", "
+        assert_eq!(prepend_leading_punct("Hello世界", true), ", Hello世界");
+        // Short first segment gets a '.'
+        assert_eq!(prepend_leading_punct("好。你好世界", true), ".好。你好世界");
+        // Long first segment: unchanged
+        assert_eq!(prepend_leading_punct("你好世界啊。", true), "你好世界啊。");
     }
 
     #[test]

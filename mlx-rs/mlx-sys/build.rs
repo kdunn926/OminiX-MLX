@@ -1,6 +1,6 @@
 extern crate cmake;
 
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{env, fs, path::{Path, PathBuf}, process::Command};
 
 /// Version tag for the GitHub Release containing pre-built artifacts.
 const PREBUILT_RELEASE_TAG: &str = "mlx-prebuilt-v0.1.0";
@@ -100,7 +100,7 @@ fn download_prebuilt() -> PathBuf {
         for entry in fs::read_dir(&extracted_dir).expect("Failed to read extracted dir") {
             let entry = entry.unwrap();
             let dest = prebuilt_dir.join(entry.file_name());
-            if let Err(_) = fs::rename(entry.path(), &dest) {
+            if fs::rename(entry.path(), &dest).is_err() {
                 fs::copy(entry.path(), &dest).expect("Failed to copy artifact");
             }
         }
@@ -153,7 +153,7 @@ fn copy_metallib_to_target_dir(metallib_src: &PathBuf) {
 
 // ─── Linking ─────────────────────────────────────────────────────
 
-fn link_prebuilt(prebuilt_dir: &PathBuf) {
+fn link_prebuilt(prebuilt_dir: &Path) {
     println!(
         "cargo:rustc-link-search=native={}",
         prebuilt_dir.display()
@@ -171,7 +171,7 @@ fn link_prebuilt(prebuilt_dir: &PathBuf) {
 }
 
 /// Patch the MLX source files to work around macOS Tahoe beta issues
-fn patch_metal_version(out_dir: &PathBuf) {
+fn patch_metal_version(out_dir: &Path) {
     // Patch device.cpp to force Metal 3.2
     let device_cpp = out_dir.join("build/_deps/mlx-src/mlx/backend/metal/device.cpp");
     if device_cpp.exists() {

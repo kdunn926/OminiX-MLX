@@ -194,14 +194,21 @@ struct CompiledState<F> {
     id: usize,
 }
 
-impl<F> Drop for CompiledState<F> {
-    fn drop(&mut self) {
-        unsafe {
-            // remove the compiled structure from the back end
-            mlx_sys::mlx_detail_compile_erase(self.id);
-        }
-    }
-}
+// NOTE: deliberately NO `Drop` impl erasing the backend cache entry.
+//
+// `id` is derived from the *type* of `F` (`type_id_to_usize`), so every
+// instance of the same function type shares one backend cache slot. The
+// old `Drop` impl called `mlx_detail_compile_erase(self.id)` per instance,
+// which had two bugs:
+//   1. `compile()`'s returned closure constructs a fresh `CompiledState`
+//      on every invocation (forced by the GAT lifetime on `Args<'a>`), so
+//      each call erased the cache entry it had just populated — every call
+//      re-traced and re-fused, contradicting the module docs.
+//   2. `Compiled`/`CompiledState` derive `Clone`; dropping any clone
+//      erased the shared entry out from under the others.
+// Cache entries now live until `clear_cache()` — bounded by the number of
+// distinct compiled function types in the program, matching the behavior
+// of MLX's Python bindings.
 
 fn type_id_to_usize<T>(_val: &T) -> usize
 where

@@ -34,6 +34,7 @@ impl VitsOnnx {
     ///
     /// - `speed`: Speed factor (1.0 = normal, >1.0 = faster speech)
     ///   Applied via linear interpolation on output audio.
+    #[allow(clippy::too_many_arguments)]
     pub fn decode(
         &mut self,
         codes: &[i32],

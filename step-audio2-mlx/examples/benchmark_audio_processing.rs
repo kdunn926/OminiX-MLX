@@ -72,10 +72,10 @@ fn compute_mel_cpu(samples: &[f32], config: &AudioConfig) -> Vec<f32> {
         for k in 0..n_freqs {
             let mut real = 0.0f32;
             let mut imag = 0.0f32;
-            for n in 0..n_fft {
+            for (n, &w) in windowed.iter().enumerate().take(n_fft) {
                 let angle = 2.0 * PI * k as f32 * n as f32 / n_fft as f32;
-                real += windowed[n] * angle.cos();
-                imag -= windowed[n] * angle.sin();
+                real += w * angle.cos();
+                imag -= w * angle.sin();
             }
             power[k * effective_frames + frame] = real * real + imag * imag;
         }

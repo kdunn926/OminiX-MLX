@@ -1,0 +1,19 @@
+{
+  "model": "models/qwen3-asr-1.7b",
+  "input_name": "mel_chunk",
+  "input_shape": [
+    1,
+    128,
+    100
+  ],
+  "n_mels": 128,
+  "chunk_frames": 100,
+  "n_out_tokens": 13,
+  "output_dim": 2048,
+  "d_model": 1024,
+  "output_elements": 26624,
+  "compute_units": "cpuAndNeuralEngine",
+  "recommended_units": "cpuAndGpu",
+  "precision": "float16",
+  "notes": "Single 100-frame mel chunk encoder. In a streaming ASR pipeline spawn predict on ANE while GPU decodes text tokens for the previous chunk \u2014 CoreMlModel is Send, use std::thread::spawn + mpsc::channel."
+}

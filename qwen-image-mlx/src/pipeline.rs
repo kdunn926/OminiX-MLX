@@ -33,8 +33,8 @@ impl FlowMatchEulerScheduler {
         let sigmas: Vec<f32> = timesteps
             .iter()
             .map(|&t| {
-                let shifted = shift * t / (1.0 + (shift - 1.0) * t);
-                shifted
+                
+                shift * t / (1.0 + (shift - 1.0) * t)
             })
             .collect();
 
@@ -142,8 +142,11 @@ impl QwenImagePipeline {
         let mut latents = self.scheduler.scale_noise(&latents)?;
 
         // Denoising loop
-        for (idx, &t) in self.scheduler.timesteps().iter().enumerate() {
-            let timestep = Array::from_slice(&[t], &[batch]);
+        for idx in 0..self.scheduler.timesteps().len() {
+            // The model must be conditioned on the shifted sigma (same value used
+            // by the Euler step), not the unshifted linear timestep.
+            let sigma = self.scheduler.sigmas()[idx];
+            let timestep = ops::broadcast_to(Array::from_f32(sigma), &[batch])?;
             let timestep = timestep.as_dtype(Dtype::Float32)?;
 
             // Predict velocity
@@ -218,8 +221,10 @@ impl QwenImagePipeline {
         let batched_prompt = ops::concatenate_axis(&[&pos_padded, &neg_padded], 0)?; // [2, T, D]
 
         // Denoising loop — single batched forward per step
-        for (idx, &t) in self.scheduler.timesteps().iter().enumerate() {
-            let timestep = Array::from_slice(&[t], &[1]);
+        for idx in 0..self.scheduler.timesteps().len() {
+            // Condition the model on the shifted sigma (matches the Euler step).
+            let sigma = self.scheduler.sigmas()[idx];
+            let timestep = Array::from_slice(&[sigma], &[1]);
             let timestep = timestep.as_dtype(Dtype::Float32)?;
 
             // Broadcast latents to batch=2
@@ -323,6 +328,7 @@ pub fn encode_reference_latent(vae: &mut QwenVAE, image: &Array) -> Result<Array
 pub fn ref_shape_from_latent(latent_h: i32, latent_w: i32) -> (i32, i32, i32) {
     (1, latent_h / 2, latent_w / 2)
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -90,7 +90,6 @@ pub fn run_generation_loop(
     params: &GenerationLoopParams,
     seed: Option<u64>,
 ) -> Result<Vec<[u32; 16]>> {
-    let vocab_size = talker.vocab_size();
     let hidden_size = talker.hidden_size();
 
     let mut rng = match seed {
@@ -150,15 +149,16 @@ pub fn run_generation_loop(
             let eos_logit = logits[params.eos_token as usize];
             info!("EOS at step {}, logits[eos]={:.3}, min_new_tokens={}", step, eos_logit, params.min_new_tokens);
             if step < params.min_new_tokens {
-                // This should be impossible — EOS was suppressed
-                panic!("BUG: EOS sampled at step {} < min_new_tokens {} with logit={:.3}", step, params.min_new_tokens, eos_logit);
+                // EOS is suppressed below min_new_tokens, so this is only
+                // reachable when the logits have gone non-finite (NaN ties
+                // make the top-k order arbitrary). Surface it as an error
+                // instead of panicking inside a library loop.
+                return Err(crate::error::Error::Generation(format!(
+                    "EOS sampled at step {step} < min_new_tokens {} (logits[eos]={eos_logit:.3}) — logits are likely non-finite",
+                    params.min_new_tokens
+                )));
             }
             break;
-        }
-
-        if step < 5 {
-            info!("Step {}: token0={}, logits[0..3]={:.3} {:.3} {:.3}, logits[eos]={:.3}",
-                step, token0, logits[0], logits[1], logits[2], logits[params.eos_token as usize]);
         }
 
         prev_tokens.push(token0);

@@ -93,9 +93,9 @@ struct Args {
 
 /// Expand ~ in paths
 fn expand_path(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
+    if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]);
+            return home.join(rest);
         }
     }
     PathBuf::from(path)
@@ -119,6 +119,7 @@ struct Metadata {
 }
 
 /// Process a single audio file
+#[allow(clippy::too_many_arguments)]
 fn process_sample(
     audio_path: &Path,
     text: &str,
@@ -171,7 +172,7 @@ fn process_sample(
 
     // 3. Extract phonemes
     let preprocessor_output = text_processor.preprocess(text, None);
-    let phoneme_ids: Vec<i32> = preprocessor_output.phoneme_ids.iter().map(|&x| x as i32).collect();
+    let phoneme_ids: Vec<i32> = preprocessor_output.phoneme_ids.to_vec();
     let phoneme_len = phoneme_ids.len();
 
     // 4. Extract BERT features (raw, without word2ph alignment)
@@ -197,15 +198,15 @@ fn process_sample(
 
     // Save phoneme IDs as numpy
     let phoneme_array = Array::from_slice(&phoneme_ids, &[phoneme_ids.len() as i32]);
-    phoneme_array.save_numpy(&phoneme_dir.join(format!("{}.npy", sample_id)))
+    phoneme_array.save_numpy(phoneme_dir.join(format!("{}.npy", sample_id)))
         .map_err(|e| Error::Message(format!("Failed to save phonemes: {}", e)))?;
 
     // Save BERT features
-    bert_ncl.save_numpy(&bert_dir.join(format!("{}.npy", sample_id)))
+    bert_ncl.save_numpy(bert_dir.join(format!("{}.npy", sample_id)))
         .map_err(|e| Error::Message(format!("Failed to save BERT: {}", e)))?;
 
     // Save semantic IDs
-    semantic_ids_1d.save_numpy(&semantic_dir.join(format!("{}.npy", sample_id)))
+    semantic_ids_1d.save_numpy(semantic_dir.join(format!("{}.npy", sample_id)))
         .map_err(|e| Error::Message(format!("Failed to save semantic: {}", e)))?;
 
     // Optionally save HuBERT features (for VITS training)
@@ -216,7 +217,7 @@ fn process_sample(
         // hubert_ncl: [1, 768, time] -> [768, time]
         let hubert_2d = hubert_ncl.squeeze_axes(&[0])
             .map_err(|e| Error::Message(e.to_string()))?;
-        hubert_2d.save_numpy(&hubert_dir.join(format!("{}.npy", sample_id)))
+        hubert_2d.save_numpy(hubert_dir.join(format!("{}.npy", sample_id)))
             .map_err(|e| Error::Message(format!("Failed to save HuBERT: {}", e)))?;
     }
 
