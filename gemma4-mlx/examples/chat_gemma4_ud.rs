@@ -13,6 +13,11 @@ use std::{env, error::Error, path::PathBuf};
 use gemma4_mlx::{
     load_tokenizer, ud_loader::load_ud_mlx_4bit, Generate, KVCache, EOS_TOKEN_IDS,
 };
+// NOTE: this example stays on Vec<KVCache> (flat/unbounded) because the
+// prompt-cache API (save_kv_caches / try_load_kv_caches) is typed to KVCache.
+// Switching to init_layered_cache would require extending the save/load API to
+// handle SlidingKVCache snapshots — tracked separately. Use chat_text for the
+// layered-cache default path on e4b / 12B.
 use mlx_rs::{
     ops::indexing::{IndexOp, NewAxis},
     Array,

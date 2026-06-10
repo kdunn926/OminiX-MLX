@@ -11,7 +11,8 @@
 use std::{env, error::Error, path::PathBuf};
 
 use gemma4_mlx::{
-    load_model, load_tokenizer, ud_loader::load_ud_mlx_4bit, Generate, KVCache, EOS_TOKEN_IDS,
+    load_model, load_tokenizer, mixed_cache::init_layered_cache, ud_loader::load_ud_mlx_4bit,
+    Generate, EOS_TOKEN_IDS,
 };
 use mlx_rs::{
     ops::indexing::{IndexOp, NewAxis},
@@ -85,7 +86,7 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let prompt_tokens = Array::from_slice(&ids, &[ids.len() as i32]).index(NewAxis);
 
-    let mut cache = Vec::<KVCache>::new();
+    let mut cache = init_layered_cache(&model);
     let generator = Generate::new(&mut model, &mut cache, 0.0, &prompt_tokens);
 
     let max_tokens: usize = std::env::var("CHAT_MAX_TOKENS")

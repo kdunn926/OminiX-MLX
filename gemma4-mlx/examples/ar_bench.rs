@@ -1,7 +1,10 @@
 //! Minimal Rust AR throughput sanity check for Gemma4 (no DFlash).
 //! Used to baseline the gemma4 verify-path bottleneck and to compare KV
-//! backends. Set `PAGED_KV=1` to run full-attention layers through the paged
-//! KV cache (fused paged-attention kernel); default is the standard fp16 cache.
+//! backends.
+//!
+//! KV backend (default: layered — physical sliding-window trim):
+//!   FLAT_KV=1   unbounded Vec<KVCache> (legacy baseline)
+//!   PAGED_KV=1  full-attn layers paged, sliding layers contiguous
 //!
 //! Loader: defaults to the canonical `load_model`. Try
 //! `LOADER=ud ar_bench <model_dir> …` to route through the UD-MLX-4bit
@@ -10,7 +13,7 @@
 //! checkpoint whose text-side weights match the UD layout).
 
 use anyhow::Result;
-use gemma4_mlx::mixed_cache::init_mixed_paged_cache;
+use gemma4_mlx::mixed_cache::{init_layered_cache, init_mixed_paged_cache};
 use gemma4_mlx::ud_loader::load_ud_mlx_4bit;
 use gemma4_mlx::{load_model, load_tokenizer, Generate, Model};
 use mlx_rs::Array;
@@ -71,17 +74,17 @@ fn main() -> Result<()> {
     let num_slots = *model.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
 
     let paged = std::env::var("PAGED_KV").is_ok();
-    eprintln!(
-        "kv_backend: {}",
-        if paged { "paged (full-attn layers only; sliding stay contiguous)" } else { "standard fp16" }
-    );
+    let flat = std::env::var("FLAT_KV").is_ok();
+    let kv_label = if paged { "paged" } else if flat { "flat (unbounded)" } else { "layered (sliding-trim)" };
+    eprintln!("kv_backend: {kv_label}");
     let (prefill, decode_tok_s, count) = if paged {
-        // Mixed cache: page only full-attention layers; sliding layers stay
-        // on the contiguous KVCache (paging them regresses badly).
         let cache = init_mixed_paged_cache(&model);
         run_with_cache(&mut model, cache, max_tokens, &prompt)?
-    } else {
+    } else if flat {
         let cache: Vec<KVCache> = (0..num_slots).map(|_| Default::default()).collect();
+        run_with_cache(&mut model, cache, max_tokens, &prompt)?
+    } else {
+        let cache = init_layered_cache(&model);
         run_with_cache(&mut model, cache, max_tokens, &prompt)?
     };
 
