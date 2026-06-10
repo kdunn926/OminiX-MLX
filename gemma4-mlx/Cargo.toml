@@ -13,6 +13,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenizers = "0.21"
 image = "0.25"
+# Jinja chat-template rendering. We prefer running the model's bundled
+# `chat_template.jinja` directly (it is what the model was trained on) over
+# the hand-rolled Rust renderer, which has drifted from upstream templates
+# in subtle ways (role name, e4b empty-channel pre-fill, tool-call syntax).
+# `loader` is unused but pulled in to match the other minijinja consumer
+# in this workspace (`mlx-rs-lm`). `pycompat` provides `.get()` / `.split()`
+# bindings the Gemma4 templates rely on.
+minijinja = { version = "2", features = ["loader"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [[example]]
 name = "chat_gemma4"
