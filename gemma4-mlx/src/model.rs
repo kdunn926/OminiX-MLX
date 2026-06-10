@@ -635,9 +635,23 @@ where
             cache.update_and_fetch(new_k, new_v)?
         };
 
+        // Mask sizing must match the *physical* key length the cache returned,
+        // not the logical token count. For unbounded `KVCache` /
+        // `PagedKvCache` they're identical (default `physical_offset()` ==
+        // `offset()`), so this matches the legacy path of using `rope_offset`.
+        //
+        // For `SlidingKVCache` the physical buffer is capped at `window`
+        // even when `offset()` reports a much larger logical position —
+        // we must size the mask to `[L, physical_post]` where
+        // `physical_post = cache.physical_offset()` *after* the update,
+        // i.e. the length of the K tensor SDPA just received. The
+        // `create_causal_mask(L, past, window)` call builds a `[L, past+L]`
+        // mask, so we pass `past = physical_post - L`.
+        let physical_post = keys.shape()[2] as i32;
+        let mask_offset = physical_post - L;
         let sliding_mask = match (mask, self.sliding_window) {
             (None, Some(window)) => {
-                Some(create_causal_mask(L, Some(rope_offset), Some(window), None)?)
+                Some(create_causal_mask(L, Some(mask_offset), Some(window), None)?)
             }
             _ => None,
         };
@@ -655,6 +669,25 @@ where
         )?
         .transpose_axes(&[0, 2, 1, 3])?
         .reshape(&[B, L, -1])?;
+
+        // For sliding-window layers, bound the KV buffer to the last
+        // `window` entries now that SDPA has consumed it. No-op for any
+        // cache impl that didn't override `compact_to_last_n` (default
+        // returns Ok(())) — so unbounded `KVCache` / `PagedKvCache`
+        // behavior is unchanged. Only `SlidingKVCache` actually trims.
+        //
+        // Important: compaction MUST come after SDPA, never inside
+        // `update_and_fetch`. During chunked prefill (L > 1), the early
+        // queries in the chunk need to attend back into the previous
+        // `window - 1` cached positions; truncating before SDPA would
+        // drop the oldest `L` of those, leaving early queries with a
+        // shorter effective window than the model was trained on. By
+        // compacting *after*, the next forward starts with a clean
+        // `window`-bounded buffer while the current forward's SDPA saw
+        // the full `prev_window + L` keys.
+        if let Some(window) = self.sliding_window {
+            cache.compact_to_last_n(window)?;
+        }
 
         self.o_proj.forward(&output)
     }

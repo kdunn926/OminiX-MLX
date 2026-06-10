@@ -1,6 +1,6 @@
 [package]
 name = "gemma4-mlx"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Gemma 4 text-only inference on Apple Silicon with MLX"
 license = "MIT OR Apache-2.0"
@@ -21,6 +21,10 @@ path = "examples/chat_gemma4.rs"
 [[example]]
 name = "chat_text"
 path = "examples/chat_text.rs"
+
+[[example]]
+name = "sliding_bench"
+path = "examples/sliding_bench.rs"
 
 [[example]]
 name = "chat_gemma4_ud"

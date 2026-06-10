@@ -3,6 +3,7 @@
 pub mod assistant;
 pub mod chat;
 pub mod mixed_cache;
+pub mod sliding_cache;
 pub mod vision;
 pub mod model;
 pub mod mtplx_target;
@@ -36,6 +37,8 @@ pub use model::{
     DecoderLayerInput, DenseMlp, Experts, Gemma4Config, Gemma4TextConfig, Gemma4VlModel,
     Generate, GenerateState, LanguageModel, Model, ModelInput, Router, UnscaledRmsNorm,
 };
+pub use mixed_cache::{init_layered_cache, init_mixed_paged_cache, MixedKvCache};
+pub use sliding_cache::SlidingKVCache;
 pub use vision::{preprocess_image_gemma4, EmbedVision, Gemma4VisionConfig, VisionModel};
 pub use unified_vision::{
     load_unified_4bit_vl, load_unified_embed_vision, load_unified_embedder,
