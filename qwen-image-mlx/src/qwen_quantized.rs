@@ -1,6 +1,10 @@
-//! Quantized Qwen-Image Transformer
+//! Quantized Qwen-Image Transformer — **the production path**.
 //!
-//! Matches the weight structure of mlx-community/Qwen-Image-2512-4bit
+//! Matches the weight structure of mlx-community/Qwen-Image-2512-4bit and is
+//! the implementation driven by `examples/generate_qwen_image.rs`. The
+//! sibling `transformer/` (unquantized) and `qwen_full_precision` modules
+//! are alternative implementations that are not exercised by any example
+//! and should be treated as unvalidated.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -88,38 +92,8 @@ impl QwenFeedForward {
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let hidden = self.mlp_in.forward(x)?;
-
-        // Debug FFN
-        static DEBUG_FFN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let debug_ffn = !DEBUG_FFN.swap(true, std::sync::atomic::Ordering::SeqCst);
-        if debug_ffn {
-            mlx_rs::transforms::eval([x, &hidden]).ok();
-            eprintln!("[DEBUG FFN] input: [{:.2}, {:.2}], after mlp_in: [{:.2}, {:.2}]",
-                x.min(None).unwrap().item::<f32>(),
-                x.max(None).unwrap().item::<f32>(),
-                hidden.min(None).unwrap().item::<f32>(),
-                hidden.max(None).unwrap().item::<f32>());
-        }
-
         let hidden = mlx_rs::nn::gelu_approximate(&hidden)?;
-
-        if debug_ffn {
-            mlx_rs::transforms::eval([&hidden]).ok();
-            eprintln!("[DEBUG FFN] after gelu: [{:.2}, {:.2}]",
-                hidden.min(None).unwrap().item::<f32>(),
-                hidden.max(None).unwrap().item::<f32>());
-        }
-
-        let output = self.mlp_out.forward(&hidden)?;
-
-        if debug_ffn {
-            mlx_rs::transforms::eval([&output]).ok();
-            eprintln!("[DEBUG FFN] after mlp_out: [{:.2}, {:.2}]",
-                output.min(None).unwrap().item::<f32>(),
-                output.max(None).unwrap().item::<f32>());
-        }
-
-        Ok(output)
+        self.mlp_out.forward(&hidden)
     }
 }
 
@@ -216,48 +190,11 @@ impl QwenAttention {
         txt_k = txt_k.reshape(&[batch, txt_seq, self.num_heads, self.head_dim])?;
         let txt_v = txt_v.reshape(&[batch, txt_seq, self.num_heads, self.head_dim])?;
 
-        // Debug Q/K before RMSNorm
-        static DEBUG_BEFORE_NORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if false {
-            mlx_rs::transforms::eval([&img_q, &txt_q]).ok();
-            let img_q_norm = mlx_rs::ops::sqrt(&mlx_rs::ops::sum_axis(&mlx_rs::ops::multiply(&img_q, &img_q).unwrap(), -1, false).unwrap()).unwrap();
-            let txt_q_norm = mlx_rs::ops::sqrt(&mlx_rs::ops::sum_axis(&mlx_rs::ops::multiply(&txt_q, &txt_q).unwrap(), -1, false).unwrap()).unwrap();
-            eprintln!("[DEBUG BEFORE NORM] img_q L2 norm: mean={:.4}, txt_q L2 norm: mean={:.4}",
-                img_q_norm.mean(None).unwrap().item::<f32>(),
-                txt_q_norm.mean(None).unwrap().item::<f32>());
-
-            // Debug norm weights
-            let norm_q_weight = &self.norm_q.weight;
-            let norm_added_q_weight = &self.norm_added_q.weight;
-            mlx_rs::transforms::eval([norm_q_weight.as_ref(), norm_added_q_weight.as_ref()]).ok();
-            eprintln!("[DEBUG NORM WEIGHTS] norm_q.weight: shape={:?}, min={:.4}, max={:.4}, mean={:.4}",
-                norm_q_weight.shape(),
-                norm_q_weight.min(None).unwrap().item::<f32>(),
-                norm_q_weight.max(None).unwrap().item::<f32>(),
-                norm_q_weight.mean(None).unwrap().item::<f32>());
-            eprintln!("[DEBUG NORM WEIGHTS] norm_added_q.weight: shape={:?}, min={:.4}, max={:.4}, mean={:.4}",
-                norm_added_q_weight.shape(),
-                norm_added_q_weight.min(None).unwrap().item::<f32>(),
-                norm_added_q_weight.max(None).unwrap().item::<f32>(),
-                norm_added_q_weight.mean(None).unwrap().item::<f32>());
-        }
-
         // Apply RMSNorm
         img_q = self.norm_q.forward(&img_q)?;
         img_k = self.norm_k.forward(&img_k)?;
         txt_q = self.norm_added_q.forward(&txt_q)?;
         txt_k = self.norm_added_k.forward(&txt_k)?;
-
-        // Debug Q/K after norm but before RoPE
-        static DEBUG_NORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if false {
-            mlx_rs::transforms::eval([&img_q, &txt_q]).ok();
-            let img_q_norm = mlx_rs::ops::sqrt(&mlx_rs::ops::sum_axis(&mlx_rs::ops::multiply(&img_q, &img_q).unwrap(), -1, false).unwrap()).unwrap();
-            let txt_q_norm = mlx_rs::ops::sqrt(&mlx_rs::ops::sum_axis(&mlx_rs::ops::multiply(&txt_q, &txt_q).unwrap(), -1, false).unwrap()).unwrap();
-            eprintln!("[DEBUG AFTER NORM] img_q norm: mean={:.4}, txt_q norm: mean={:.4}",
-                img_q_norm.mean(None).unwrap().item::<f32>(),
-                txt_q_norm.mean(None).unwrap().item::<f32>());
-        }
 
         // Apply RoPE if provided
         if let Some((cos, sin)) = img_rotary_emb {
@@ -267,23 +204,6 @@ impl QwenAttention {
         if let Some((cos, sin)) = txt_rotary_emb {
             txt_q = apply_rope_qwen(&txt_q, cos, sin)?;
             txt_k = apply_rope_qwen(&txt_k, cos, sin)?;
-        }
-
-        // Debug Q/K magnitudes
-        static DEBUG_QK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if false {
-            mlx_rs::transforms::eval([&img_q, &txt_q, &img_k, &txt_k]).ok();
-            // Compute L2 norm per token
-            let img_q_norm = mlx_rs::ops::sqrt(&mlx_rs::ops::sum_axis(&mlx_rs::ops::multiply(&img_q, &img_q).unwrap(), -1, false).unwrap()).unwrap();
-            let txt_q_norm = mlx_rs::ops::sqrt(&mlx_rs::ops::sum_axis(&mlx_rs::ops::multiply(&txt_q, &txt_q).unwrap(), -1, false).unwrap()).unwrap();
-            let img_k_norm = mlx_rs::ops::sqrt(&mlx_rs::ops::sum_axis(&mlx_rs::ops::multiply(&img_k, &img_k).unwrap(), -1, false).unwrap()).unwrap();
-            let txt_k_norm = mlx_rs::ops::sqrt(&mlx_rs::ops::sum_axis(&mlx_rs::ops::multiply(&txt_k, &txt_k).unwrap(), -1, false).unwrap()).unwrap();
-            eprintln!("[DEBUG Q/K] img_q norm: mean={:.4}, img_k norm: mean={:.4}",
-                img_q_norm.mean(None).unwrap().item::<f32>(),
-                img_k_norm.mean(None).unwrap().item::<f32>());
-            eprintln!("[DEBUG Q/K] txt_q norm: mean={:.4}, txt_k norm: mean={:.4}",
-                txt_q_norm.mean(None).unwrap().item::<f32>(),
-                txt_k_norm.mean(None).unwrap().item::<f32>());
         }
 
         // Concatenate for joint attention
@@ -298,25 +218,33 @@ impl QwenAttention {
         let v = joint_v.transpose_axes(&[0, 2, 1, 3])?;
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let attn_scores = ops::matmul(&q, &k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let mut attn_scores = ops::multiply(&attn_scores, &Array::from_f32(scale))?;
 
-        // Apply attention mask if provided
-        if let Some(mask) = encoder_hidden_states_mask {
+        // Build additive mask if provided: 0 for real tokens, -1e9 for padding
+        let additive_mask = if let Some(mask) = encoder_hidden_states_mask {
             let img_seq = img_modulated.dim(1);
             let ones_img = Array::ones::<f32>(&[batch, img_seq])?;
             let joint_mask = ops::concatenate_axis(&[mask, &ones_img], 1)?;
-            // Convert to additive mask: 0 for real tokens, -1e9 for padding
-            let additive_mask = ops::multiply(
-                &ops::subtract(&Array::from_f32(1.0), &joint_mask)?,
-                &Array::from_f32(-1e9),
+            let additive = ops::multiply(
+                &ops::subtract(Array::from_f32(1.0), &joint_mask)?,
+                Array::from_f32(-1e9),
             )?;
-            let additive_mask = additive_mask.reshape(&[batch, 1, 1, txt_seq + img_seq])?;
-            attn_scores = ops::add(&attn_scores, &additive_mask)?;
-        }
+            let additive = additive
+                .reshape(&[batch, 1, 1, txt_seq + img_seq])?
+                .as_dtype(q.dtype())?;
+            Some(additive)
+        } else {
+            None
+        };
 
-        let attn = mlx_rs::ops::softmax_axis(&attn_scores, -1, None)?;
-        let out = ops::matmul(&attn, &v)?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            additive_mask
+                .as_ref()
+                .map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
+        )?;
 
         // Transpose back and reshape
         let out = out.transpose_axes(&[0, 2, 1, 3])?;
@@ -382,42 +310,9 @@ impl QwenTransformerBlock {
         txt_rotary_emb: Option<(&Array, &Array)>,
         encoder_hidden_states_mask: Option<&Array>,  // [B, txt_seq] attention mask
     ) -> Result<(Array, Array), Exception> {
-        // Debug hidden_states at start of block
-        static DEBUG_BLOCK_INPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !DEBUG_BLOCK_INPUT.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            mlx_rs::transforms::eval([hidden_states]).ok();
-            eprintln!("[DEBUG BLOCK_INPUT] hidden_states: shape={:?}, range=[{:.2}, {:.2}], mean={:.4}",
-                hidden_states.shape(),
-                hidden_states.min(None).unwrap().item::<f32>(),
-                hidden_states.max(None).unwrap().item::<f32>(),
-                hidden_states.mean(None).unwrap().item::<f32>());
-        }
-
-        // Debug timestep embeddings on first call
-        static DEBUG_TEMB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if false {
-            mlx_rs::transforms::eval([text_embeddings]).ok();
-            eprintln!("[DEBUG TEMB] shape: {:?}, min={:.4}, max={:.4}, mean={:.4}",
-                text_embeddings.shape(),
-                text_embeddings.min(None).unwrap().item::<f32>(),
-                text_embeddings.max(None).unwrap().item::<f32>(),
-                text_embeddings.mean(None).unwrap().item::<f32>());
-        }
-
         // Image modulation
         let img_silu = mlx_rs::nn::silu(text_embeddings)?;
         let img_mod_params = self.img_mod_linear.forward(&img_silu)?;
-
-        // Debug mod_params on first call
-        static DEBUG_MOD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let debug_mod = !DEBUG_MOD.swap(true, std::sync::atomic::Ordering::SeqCst);
-        if debug_mod {
-            mlx_rs::transforms::eval([&img_mod_params]).ok();
-            eprintln!("[DEBUG IMG_MOD_PARAMS] range: [{:.2}, {:.2}]",
-                img_mod_params.min(None).unwrap().item::<f32>(),
-                img_mod_params.max(None).unwrap().item::<f32>());
-        }
-
         let (img_mod1, img_mod2) = split_half(&img_mod_params)?;
 
         // Text modulation
@@ -427,46 +322,11 @@ impl QwenTransformerBlock {
 
         // Apply LayerNorm and modulation to image
         let img_normed = layer_norm(hidden_states, 1e-6)?;
-
-        // Debug img_normed
-        static DEBUG_IMG_NORMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !DEBUG_IMG_NORMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            mlx_rs::transforms::eval([&img_normed]).ok();
-            eprintln!("[DEBUG IMG_NORMED] range=[{:.2}, {:.2}], mean={:.4}",
-                img_normed.min(None).unwrap().item::<f32>(),
-                img_normed.max(None).unwrap().item::<f32>(),
-                img_normed.mean(None).unwrap().item::<f32>());
-        }
-
         let (img_modulated, img_gate1) = modulate(&img_normed, &img_mod1)?;
-
-        // Debug img_modulated
-        static DEBUG_IMG_MODULATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !DEBUG_IMG_MODULATED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            mlx_rs::transforms::eval([&img_modulated]).ok();
-            eprintln!("[DEBUG IMG_MODULATED] range=[{:.2}, {:.2}], mean={:.4}",
-                img_modulated.min(None).unwrap().item::<f32>(),
-                img_modulated.max(None).unwrap().item::<f32>(),
-                img_modulated.mean(None).unwrap().item::<f32>());
-        }
 
         // Apply LayerNorm and modulation to text
         let txt_normed = layer_norm(encoder_hidden_states, 1e-6)?;
         let (txt_modulated, txt_gate1) = modulate(&txt_normed, &txt_mod1)?;
-
-        // Debug gates on first call
-        static DEBUG_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if false {
-            mlx_rs::transforms::eval([&img_gate1, &txt_gate1]).ok();
-            eprintln!("[DEBUG GATE] img_gate1: min={:.4}, max={:.4}, mean={:.4}",
-                img_gate1.min(None).unwrap().item::<f32>(),
-                img_gate1.max(None).unwrap().item::<f32>(),
-                img_gate1.mean(None).unwrap().item::<f32>());
-            eprintln!("[DEBUG GATE] txt_gate1: min={:.4}, max={:.4}, mean={:.4}",
-                txt_gate1.min(None).unwrap().item::<f32>(),
-                txt_gate1.max(None).unwrap().item::<f32>(),
-                txt_gate1.mean(None).unwrap().item::<f32>());
-        }
 
         // Joint attention
         let (img_attn_out, txt_attn_out) = self.attn.forward(
@@ -477,18 +337,6 @@ impl QwenTransformerBlock {
             encoder_hidden_states_mask,
         )?;
 
-        // Debug attention output before gating
-        static DEBUG_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let debug_attn = !DEBUG_ATTN.swap(true, std::sync::atomic::Ordering::SeqCst);
-        if debug_attn {
-            mlx_rs::transforms::eval([&img_attn_out, &txt_attn_out]).ok();
-            eprintln!("[DEBUG ATTN_OUT] img: [{:.2}, {:.2}], txt: [{:.2}, {:.2}]",
-                img_attn_out.min(None).unwrap().item::<f32>(),
-                img_attn_out.max(None).unwrap().item::<f32>(),
-                txt_attn_out.min(None).unwrap().item::<f32>(),
-                txt_attn_out.max(None).unwrap().item::<f32>());
-        }
-
         // Image: gate + residual (no clipping)
         let img_gate1_exp = img_gate1.expand_dims(1)?;
         let hidden_states = ops::add(hidden_states, &ops::multiply(&img_gate1_exp, &img_attn_out)?)?;
@@ -496,15 +344,6 @@ impl QwenTransformerBlock {
         // Text: gate + residual (no clipping)
         let txt_gate1_exp = txt_gate1.expand_dims(1)?;
         let encoder_hidden_states = ops::add(encoder_hidden_states, &ops::multiply(&txt_gate1_exp, &txt_attn_out)?)?;
-
-        if debug_attn {
-            mlx_rs::transforms::eval([&hidden_states, &encoder_hidden_states]).ok();
-            eprintln!("[DEBUG AFTER_ATTN] img: [{:.2}, {:.2}], txt: [{:.2}, {:.2}]",
-                hidden_states.min(None).unwrap().item::<f32>(),
-                hidden_states.max(None).unwrap().item::<f32>(),
-                encoder_hidden_states.min(None).unwrap().item::<f32>(),
-                encoder_hidden_states.max(None).unwrap().item::<f32>());
-        }
 
         // Image FFN with mod2
         let img_normed2 = layer_norm(&hidden_states, 1e-6)?;
@@ -519,15 +358,6 @@ impl QwenTransformerBlock {
         let txt_mlp_out = self.txt_ff.forward(&txt_modulated2)?;
         let txt_gate2_exp = txt_gate2.expand_dims(1)?;
         let encoder_hidden_states = ops::add(&encoder_hidden_states, &ops::multiply(&txt_gate2_exp, &txt_mlp_out)?)?;
-
-        if debug_attn {
-            mlx_rs::transforms::eval([&hidden_states, &encoder_hidden_states]).ok();
-            eprintln!("[DEBUG AFTER_FFN] img: [{:.2}, {:.2}], txt: [{:.2}, {:.2}]",
-                hidden_states.min(None).unwrap().item::<f32>(),
-                hidden_states.max(None).unwrap().item::<f32>(),
-                encoder_hidden_states.min(None).unwrap().item::<f32>(),
-                encoder_hidden_states.max(None).unwrap().item::<f32>());
-        }
 
         Ok((encoder_hidden_states, hidden_states))
     }
@@ -923,7 +753,7 @@ fn layer_norm(x: &Array, eps: f32) -> Result<Array, Exception> {
     let mean = ops::mean_axes(x, &[-1], true)?;
     let x_centered = ops::subtract(x, &mean)?;
     let variance = ops::mean_axes(&ops::square(&x_centered)?, &[-1], true)?;
-    let rsqrt_var = ops::rsqrt(&ops::add(&variance, &Array::from_f32(eps))?)?;
+    let rsqrt_var = ops::rsqrt(&ops::add(&variance, Array::from_f32(eps))?)?;
     ops::multiply(&x_centered, &rsqrt_var)
 }
 
@@ -999,7 +829,7 @@ fn get_timestep_embedding(t: &Array, dim: i32) -> Result<Array, Exception> {
     // exponent = -log(max_period) * arange(0, half) / (half - downscale_freq_shift)
     // With downscale_freq_shift=0: exponent = -log(10000) * i / half
     let log_timescale = (10000.0f32).ln() / half as f32;
-    let freqs = ops::exp(&ops::multiply(&freq_seq, &Array::from_f32(-log_timescale))?)?;
+    let freqs = ops::exp(&ops::multiply(&freq_seq, Array::from_f32(-log_timescale))?)?;
 
     // t: [B] -> [B, 1]
     let t_exp = t.expand_dims(1)?;
@@ -1007,7 +837,7 @@ fn get_timestep_embedding(t: &Array, dim: i32) -> Result<Array, Exception> {
     let freqs_exp = freqs.expand_dims(0)?;
 
     // Scale timestep by 1000 (matching diffusers Timesteps scale parameter)
-    let t_scaled = ops::multiply(&t_exp, &Array::from_f32(1000.0))?;
+    let t_scaled = ops::multiply(&t_exp, Array::from_f32(1000.0))?;
 
     let args = ops::multiply(&t_scaled, &freqs_exp)?;
     let sin_emb = ops::sin(&args)?;

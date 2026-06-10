@@ -12,7 +12,6 @@
 //! - **Sampler**: Token sampling strategies
 //! - **Generate**: Generic token generation infrastructure
 //! - **Audio**: Audio processing utilities (mel spectrograms, etc.)
-//! - **Speculative**: Speculative decoding support
 //! - **Convert**: Model conversion utilities (optional, requires `convert` feature)
 
 pub mod audio;

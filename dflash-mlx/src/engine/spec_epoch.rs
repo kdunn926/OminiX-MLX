@@ -166,10 +166,6 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
         let mut emitted = 0usize;
         let mut last_emitted: Option<u32> = None;
         let mut pending = VecDeque::<Result<u32, Exception>>::new();
-        // Wall-clock start of the current cycle, captured at the top of
-        // each cycle so v0.1.7's adaptive-verify update() can compare
-        // real_tok/s across modes.
-        let mut cycle_start: Option<std::time::Instant> = None;
 
         std::iter::from_fn(move || loop {
             if let Some(item) = pending.pop_front() {
@@ -288,8 +284,9 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                 }
             }
 
-            // Mark cycle start so we can measure wall time at update().
-            cycle_start = Some(std::time::Instant::now());
+            // Wall-clock start of this cycle, so v0.1.7's adaptive-verify
+            // update() can compare real tok/s across modes.
+            let cycle_started_at = std::time::Instant::now();
             match self.adaptive_policy.mode() {
                 crate::engine::config::BlockMode::Large => self.metrics.cycles_large += 1,
                 crate::engine::config::BlockMode::Reduced => self.metrics.cycles_reduced += 1,
@@ -302,7 +299,6 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
             // position predictions align with the target's posterior (the DFlash alignment fix).
             if let Some(staged_emb) = self.target.embed_token(last_token) {
                 self.draft.set_staged_embedding(staged_emb);
-            } else {
             }
 
             // CopySpec short-circuit: if the prompt-tail index has a hit
@@ -475,9 +471,7 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
             // correction) or `speculative_accept`'s host-side softmax read all call
             // `eval`/`as_slice`, which materialize the verify logits. So
             // `cycle_wall_s` reflects real GPU work, not just MLX graph build.
-            let cycle_wall_s = cycle_start
-                .map(|s| s.elapsed().as_secs_f32())
-                .unwrap_or(0.0);
+            let cycle_wall_s = cycle_started_at.elapsed().as_secs_f32();
             self.adaptive_policy.update(
                 n_accepted as f32 / drafted_count as f32,
                 (n_accepted + 1) as f32,
@@ -544,6 +538,7 @@ where
             if let Some(item) = pending.pop_front() {
                 if let Ok(t) = &item {
                     emitted += 1;
+                    self.metrics.total_tokens = emitted;
                     last_token = *t;
                     if emitted >= max_tokens || eos_tokens.contains(t) {
                         finished = true;
@@ -629,8 +624,21 @@ where
             }
 
             let remaining = max_tokens.saturating_sub(emitted);
-            if remaining < 2 {
+            if remaining == 0 {
                 finished = true;
+                return None;
+            }
+            if remaining == 1 {
+                // A tree cycle needs >= 2 tokens of headroom, but the last
+                // verify already captured the target's greedy prediction for
+                // the next position (`root_pred`) — emit it as the final
+                // token instead of stopping one short of max_tokens. KV for
+                // it is never needed (generation ends here).
+                finished = true;
+                if initialized {
+                    pending.push_back(Ok(root_pred));
+                    continue;
+                }
                 return None;
             }
             let block = block_len.min(remaining).max(2);
@@ -645,7 +653,7 @@ where
                 .copyspec
                 .as_ref()
                 .and_then(|c| c.draft_after(last_token, block - 1, None));
-            let (tree, from_copyspec) = if let Some(chain) = copyspec_hit {
+            let (tree, _from_copyspec) = if let Some(chain) = copyspec_hit {
                 self.metrics.copyspec_hits += 1;
                 self.metrics.copyspec_tokens += chain.len();
                 let chain_tree: Vec<crate::engine::ddtree::TreeNode> = chain
@@ -695,7 +703,6 @@ where
                     false,
                 )
             };
-            let _ = from_copyspec;
 
             let kv_offset = self.target.step_count() as i32;
             let start_pos = kv_offset;

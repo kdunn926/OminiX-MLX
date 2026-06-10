@@ -430,14 +430,23 @@ where
     let function_results = &result_plus_state_output[..num_fn_outputs];
     let state_outputs = &result_plus_state_output[num_fn_outputs..];
 
-    // Update state arrays. MLX's compiler may prune unchanged arrays from output,
-    // so zip() handles cases where fewer state arrays are returned than expected.
-    for (s, new_values) in state
-        .borrow_mut()
-        .updatable_states_mut()
-        .into_iter()
-        .zip(state_outputs.iter())
-    {
+    // Update state arrays. The write-back is positional, which is only
+    // correct when the compiled graph returns exactly one output per
+    // updatable state array — if the compiler ever pruned a *middle* state
+    // array, a silent zip would write state i+1's value into state i. Fail
+    // loudly on any count mismatch instead.
+    let mut borrow = state.borrow_mut();
+    let updatable_states: Vec<&mut Array> = borrow.updatable_states_mut().into_iter().collect();
+    if updatable_states.len() != state_outputs.len() {
+        return Err(Exception::custom(format!(
+            "compile_with_state: state output count mismatch - {} updatable state arrays \
+             but the compiled graph returned {}. Positional state write-back would be \
+             misaligned; this indicates an internal compilation error.",
+            updatable_states.len(),
+            state_outputs.len()
+        )));
+    }
+    for (s, new_values) in updatable_states.into_iter().zip(state_outputs.iter()) {
         update_by_replace_with_ref_to_new_array(s, new_values);
     }
 

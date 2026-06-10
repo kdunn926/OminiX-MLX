@@ -20,23 +20,23 @@ use step_audio2_mlx::{
     StepAudio2Pipeline, PipelineConfig, SamplingConfig,
     Result, Error,
 };
-use step_audio2_mlx::pipeline::{Conversation, ConversationTurn, load_audio};
+use step_audio2_mlx::pipeline::load_audio;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
         eprintln!("Step-Audio 2 Conversation Example");
-        eprintln!("");
+        eprintln!();
         eprintln!("Usage: {} <model_path> [--think] [--tools]", args[0]);
-        eprintln!("");
+        eprintln!();
         eprintln!("Arguments:");
         eprintln!("  model_path  Path to Step-Audio-2-mini model directory");
-        eprintln!("");
+        eprintln!();
         eprintln!("Options:");
         eprintln!("  --think     Enable think mode");
         eprintln!("  --tools     Enable tool calling");
-        eprintln!("");
+        eprintln!();
         eprintln!("Example:");
         eprintln!("  {} ./Step-Audio-2-mini --think", args[0]);
         return Err(Error::Config("Invalid arguments".into()));
@@ -56,11 +56,11 @@ fn main() -> Result<()> {
 
     println!("Step-Audio 2 Conversation");
     println!("=========================");
-    println!("");
+    println!();
     println!("Model: {}", model_path.display());
     println!("Think mode: {}", if enable_think { "enabled" } else { "disabled" });
     println!("Tool calling: {}", if enable_tools { "enabled" } else { "disabled" });
-    println!("");
+    println!();
 
     // Configure pipeline
     let config = PipelineConfig::default()
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
     let start = Instant::now();
     let mut pipeline = StepAudio2Pipeline::load(&model_path, config)?;
     println!("Model loaded in {:.2}s", start.elapsed().as_secs_f64());
-    println!("");
+    println!();
 
     // Set system prompt
     pipeline.set_system_prompt("You are a helpful AI assistant.");
@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     println!("  /audio <path>  - Process audio file");
     println!("  /clear         - Clear conversation history");
     println!("  /quit          - Exit");
-    println!("");
+    println!();
 
     // Interactive loop
     loop {
@@ -135,19 +135,19 @@ fn main() -> Result<()> {
                                     let duration = start.elapsed();
 
                                     if let Some(thinking) = &response.thinking {
-                                        println!("");
+                                        println!();
                                         println!("Thinking: {}", thinking);
                                     }
 
-                                    println!("");
+                                    println!();
                                     println!("Assistant: {}", response.text);
 
                                     if !response.tool_calls.is_empty() {
-                                        println!("");
+                                        println!();
                                         println!("Tool calls: {}", response.tool_calls.len());
                                     }
 
-                                    println!("");
+                                    println!();
                                     println!(
                                         "[{} tokens in {:.2}s]",
                                         response.tokens_generated,

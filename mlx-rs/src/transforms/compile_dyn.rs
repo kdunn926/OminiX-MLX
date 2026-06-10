@@ -27,11 +27,17 @@
 use crate::error::Exception;
 use crate::Array;
 
-/// Type-erased compiled callable.
+type BoxedArrayFn = Box<dyn FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send + 'static>;
+
+/// Type-erased callable slot.
 ///
-/// See module docs for usage and caveats.
+/// Despite the name, this does **not** invoke `compile()` itself — it is a
+/// plain `Box<dyn FnMut>` so heterogeneous callables can share a `HashMap`.
+/// Wrap your closure with [`compile`](crate::transforms::compile::compile)
+/// before handing it to [`CompiledFn::new`] if you want an actual compiled
+/// graph; see the module docs for why that still deduplicates correctly.
 pub struct CompiledFn {
-    inner: Box<dyn FnMut(&[Array]) -> Result<Vec<Array>, Exception> + Send + 'static>,
+    inner: BoxedArrayFn,
 }
 
 impl std::fmt::Debug for CompiledFn {

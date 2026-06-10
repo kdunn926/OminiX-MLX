@@ -62,8 +62,8 @@ pub fn generate_signs(dim: usize, seed: u64) -> Vec<f32> {
 
 /// Cache the sign tensor per (dim, seed) so we don't regenerate on every
 /// cache update. Keyed by (dim as u32, seed as u64) → Vec<f32>.
-static SIGNS_CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<(u32, u64), Vec<f32>>>> =
-    OnceLock::new();
+type SignsCache = std::sync::Mutex<std::collections::HashMap<(u32, u64), Vec<f32>>>;
+static SIGNS_CACHE: OnceLock<SignsCache> = OnceLock::new();
 
 pub fn cached_signs(dim: i32, seed: u64) -> Vec<f32> {
     let map = SIGNS_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -303,9 +303,9 @@ mod tests {
         let vs = vs.reshape(&[1, h_kv, kv, n_groups]).unwrap();
         let vb = vb.reshape(&[1, h_kv, kv, n_groups]).unwrap();
         let v_recon = mlx_rs::ops::dequantize(
-            &vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
-            &vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
-            &vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
+            vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
             v_group_size, v_bits, None::<&str>,
         ).unwrap();
         mlx_rs::transforms::eval([&v_recon]).unwrap();
@@ -430,9 +430,9 @@ mod tests {
         let vs = vs.reshape(&[1, h_kv, kv, n_groups]).unwrap();
         let vb = vb.reshape(&[1, h_kv, kv, n_groups]).unwrap();
         let v_recon = mlx_rs::ops::dequantize(
-            &vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
-            &vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
-            &vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
+            vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
             v_group_size, v_bits, None::<&str>,
         ).unwrap();
         mlx_rs::transforms::eval([&v_recon]).unwrap();
@@ -571,9 +571,9 @@ mod tests {
         // V reference: dequantise and use that for the reference V
         // matmul so the comparison is apples-to-apples with the kernel.
         let v_recon = mlx_rs::ops::dequantize(
-            &vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
-            &vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
-            &vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            vq.reshape(&[h_kv * kv, packed_v_cols]).unwrap(),
+            vs.reshape(&[h_kv * kv, n_groups]).unwrap(),
+            vb.reshape(&[h_kv * kv, n_groups]).unwrap(),
             v_group_size, v_bits, None::<&str>,
         ).unwrap();
         mlx_rs::transforms::eval([&v_recon]).unwrap();

@@ -89,7 +89,13 @@ pub fn build_gemma4_vl_chat_tokens(
     }
     for msg in messages {
         normalized.push(GemmaVlChatMessage {
-            role: msg.role.clone(),
+            // Gemma 4 was trained on the `model` role, not `assistant` —
+            // see `Gemma4Role::as_str` in chat.rs for the failure mode.
+            role: if msg.role == "assistant" {
+                "model".to_string()
+            } else {
+                msg.role.clone()
+            },
             content: msg.content.clone(),
             n_vision_tokens: msg.n_vision_tokens,
             has_image: msg.has_image,
@@ -117,7 +123,9 @@ pub fn build_gemma4_vl_chat_tokens(
     }
 
     tokens.push(turn_start);
-    tokens.extend_from_slice(&encode("assistant")?);
+    // Generation prompt uses `model`, matching the shipped chat templates
+    // (`assistant` triggers thought-channel plaintext leaks; see chat.rs).
+    tokens.extend_from_slice(&encode("model")?);
     tokens.push(newline);
     Ok(tokens)
 }

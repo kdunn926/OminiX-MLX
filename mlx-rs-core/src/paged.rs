@@ -249,6 +249,7 @@ impl PagedKvPool {
     /// `[pb*block_size, (pb+1)*block_size)`. A sequence whose physical blocks
     /// are contiguous is then a free slice (no gather) — see
     /// [`PagedKvCache::gather`]. Grows by concatenation on the token axis.
+    #[allow(clippy::too_many_arguments)]
     fn ensure_arena(
         &mut self,
         min_blocks: usize,
@@ -842,7 +843,7 @@ mod tests {
 
     fn approx_eq(a: &Array, b: &Array) -> bool {
         assert_eq!(a.shape(), b.shape(), "shape mismatch");
-        let mut close = a.all_close(b, Some(1e-5), Some(1e-6), None).unwrap();
+        let close = a.all_close(b, Some(1e-5), Some(1e-6), None).unwrap();
         close.as_slice::<bool>()[0]
     }
 
@@ -991,7 +992,7 @@ mod tests {
 
     #[test]
     fn try_fused_attention_matches_gather_then_sdpa() {
-        let (b, hq, hkv, d) = (1, 2, 2, 4);
+        let (_b, hq, hkv, d) = (1, 2, 2, 4);
         let block = 4;
         let mut cache = PagedKvCache::new(block);
         cache
@@ -1011,7 +1012,7 @@ mod tests {
         // Reference over the now-6-token gathered cache.
         let (kg, vg) = cache.current_kv().unwrap();
         let kt = kg.transpose_axes(&[0, 1, 3, 2]).unwrap();
-        let scores = mlx_rs::ops::multiply(&q.matmul(&kt).unwrap(), &scale_arr).unwrap();
+        let scores = mlx_rs::ops::multiply(q.matmul(&kt).unwrap(), &scale_arr).unwrap();
         let w = mlx_rs::ops::softmax_axis(&scores, -1, None).unwrap();
         let ref_out = w.matmul(&vg).unwrap();
 

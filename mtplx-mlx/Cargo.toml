@@ -7,7 +7,6 @@ description = "Multi-Token Prediction (MTP) speculative decoding for MLX Rust"
 
 [dependencies]
 mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate"] }
-mlx-sys = { path = "../mlx-rs/mlx-sys" }
 mlx-rs-core = { path = "../mlx-rs-core" }
 qwen3-6-mlx = { path = "../qwen3.6-mlx" }
 gemma4-mlx = { path = "../gemma4-mlx" }

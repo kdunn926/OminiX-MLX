@@ -363,8 +363,12 @@ pub fn all_symbols() -> &'static [&'static str] {
 
 /// Convert symbol to ID
 pub fn symbol_to_id(symbol: &str) -> i32 {
-    SYMBOL_TO_ID.get(symbol).copied().unwrap_or(0)  // Return 0 (!) for unknown
+    // Unknown phonemes map to UNK (86), not "!" (0)
+    SYMBOL_TO_ID.get(symbol).copied().unwrap_or(UNK_ID)
 }
+
+/// ID of the UNK symbol (index 86 in GPT_SOVITS_SYMBOLS)
+const UNK_ID: i32 = 86;
 
 /// Convert ID to symbol
 pub fn id_to_symbol(id: i32) -> &'static str {
@@ -420,6 +424,12 @@ mod tests {
         assert_eq!(symbol_to_id("i3"), 168);
         assert_eq!(symbol_to_id("h"), 158);
         assert_eq!(symbol_to_id("ao3"), 119);
+    }
+
+    #[test]
+    fn test_unknown_symbol_maps_to_unk() {
+        assert_eq!(symbol_to_id(UNK), UNK_ID);
+        assert_eq!(symbol_to_id("nonexistent_phoneme"), UNK_ID);
     }
 
     #[test]

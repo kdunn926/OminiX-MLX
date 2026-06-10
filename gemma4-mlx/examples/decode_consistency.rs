@@ -10,6 +10,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use gemma4_mlx::mixed_cache::{init_layered_cache, MixedKvCache};
 use gemma4_mlx::{init_cache, load_model, ud_loader::load_ud_mlx_4bit, Generate, KVCache, ModelInput};
 use mlx_rs::{Array, Dtype};
 
@@ -89,14 +90,42 @@ fn main() -> Result<()> {
         seq.push(next);
     }
 
+    // ── C) Layered (sliding-trim) greedy decode via the same Generate loop.
+    //
+    // The sliding cache physically trims to `window`; for sequences shorter
+    // than the window this MUST be token-for-token identical to the
+    // unbounded baseline (mask-only sliding) — the core equivalence the
+    // layered-cache optimization claims. Catches RoPE logical/physical
+    // offset bugs and wrong-end compaction that the unit tests can't.
+    let mut layered: Vec<MixedKvCache> = init_layered_cache(&model);
+    let mut layered_ids: Vec<i32> = Vec::with_capacity(k);
+    {
+        let gen = Generate::new(&mut model, &mut layered, 0.0, &prompt_arr);
+        for tok in gen.take(k) {
+            let id = tok?.item::<u32>() as i32;
+            if EOS.contains(&id) {
+                break;
+            }
+            layered_ids.push(id);
+        }
+    }
+    drop(layered);
+
     println!("cache   greedy: {cache_ids:?}");
     println!("nocache greedy: {nocache_ids:?}");
+    println!("layered greedy: {layered_ids:?}");
     let matched = cache_ids == nocache_ids;
     println!("TOKEN-FOR-TOKEN MATCH (cache == no-cache): {matched}");
+    let layered_matched = layered_ids == cache_ids;
+    println!("TOKEN-FOR-TOKEN MATCH (layered == cache): {layered_matched}");
     if !matched {
         eprintln!("DECODE INCONSISTENT — KV-cache path diverges from no-cache re-forward");
         std::process::exit(1);
     }
-    println!("PASS — KV-cache decode is correct (matches no-cache re-forward).");
+    if !layered_matched {
+        eprintln!("DECODE INCONSISTENT — layered (sliding-trim) cache diverges from baseline");
+        std::process::exit(1);
+    }
+    println!("PASS — KV-cache decode is correct (matches no-cache re-forward; layered matches baseline).");
     Ok(())
 }

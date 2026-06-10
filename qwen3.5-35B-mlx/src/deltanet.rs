@@ -310,15 +310,20 @@ impl GatedDeltaNet {
     ) -> Result<Array, Exception> {
         let kernel_size = self.conv_kernel_size;
 
-        // Pad left with zeros: [B, conv_dim, kernel_size-1 + L]
-        let zero_pad = zeros_dtype(
-            &[B, self.conv_dim, kernel_size - 1],
-            qkv_cf.dtype(),
-        )?;
-        let padded = concatenate_axis(&[&zero_pad, qkv_cf], -1)?;
+        // Backported from qwen3.6: use the existing conv_state as left
+        // context when present — zero-padding unconditionally silently wiped
+        // the conv window of prior context on any warm-cache multi-token
+        // forward (multi-turn continuation through the public API).
+        let left_pad = match cache.conv_state.take() {
+            Some(state) => state,
+            None => zeros_dtype(&[B, self.conv_dim, kernel_size - 1], qkv_cf.dtype())?,
+        };
+        let padded = concatenate_axis(&[&left_pad, qkv_cf], -1)?;
 
-        // Save conv state: last kernel_size-1 elements of raw qkv
-        cache.conv_state = Some(qkv_cf.index((.., .., -(kernel_size - 1)..)));
+        // Save conv state from the PADDED sequence (not raw qkv_cf): for
+        // L < kernel_size-1 the raw slice clamps short and breaks the
+        // concat in conv1d_step on the next decode.
+        cache.conv_state = Some(padded.index((.., .., -(kernel_size - 1)..)));
 
         // Apply depthwise conv using kernel tap loop (kernel_size=4 iterations)
         let w = self.conv1d_weight.as_ref().reshape(&[self.conv_dim, kernel_size])?;

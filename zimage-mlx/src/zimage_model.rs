@@ -366,22 +366,15 @@ impl Attention {
             (k, v)
         };
 
-        // Scaled dot-product attention
-        // Q @ K^T / sqrt(d)
-        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
-        let attn = ops::matmul(&q, &k_t)?;
-        let attn = ops::multiply(&attn, &array!(self.scale))?;
-
-        // Apply mask if provided (additive mask: 0 = attend, -inf = mask)
-        let attn = if let Some(m) = mask {
-            ops::add(&attn, m)?
-        } else {
-            attn
-        };
-
-        // Softmax and apply to values
-        let attn = ops::softmax_axis(&attn, -1, None)?;
-        let out = ops::matmul(&attn, &v)?;
+        // Fused SDPA: never materializes the [B, H, L, L] score tensor the
+        // manual matmul→softmax→matmul chain did (~hundreds of MB per block).
+        let out = mlx_rs::fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            self.scale,
+            mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
+        )?;
 
         // Transpose back and reshape: [batch, heads, seq, dim] -> [batch, seq, heads*dim]
         let out = out.transpose_axes(&[0, 2, 1, 3])?;
@@ -962,9 +955,14 @@ mod tests {
     fn test_rope_3axis() {
         let positions = Array::zeros::<f32>(&[1, 10, 3]).unwrap();
         let (cos, sin) = compute_rope_3axis(&positions, &[32, 48, 48], 256.0).unwrap();
-        // Total dim = 32 + 48 + 48 = 128
-        assert_eq!(cos.shape(), &[1, 10, 1, 128]);
-        assert_eq!(sin.shape(), &[1, 10, 1, 128]);
+        // Each axis contributes dim/2 rotation angles (rotate-half pairs):
+        // (32 + 48 + 48) / 2 = 64 — the head_dim is 128 but cos/sin carry
+        // one angle per pair, matching `precompute_rope_inv_freqs`.
+        assert_eq!(cos.shape(), &[1, 10, 1, 64]);
+        assert_eq!(sin.shape(), &[1, 10, 1, 64]);
+        // Zero positions → cos 1, sin 0 everywhere.
+        assert!((cos.sum(None).unwrap().item::<f32>() - 640.0).abs() < 1e-3);
+        assert!(sin.abs().unwrap().sum(None).unwrap().item::<f32>() < 1e-6);
     }
 
     #[test]

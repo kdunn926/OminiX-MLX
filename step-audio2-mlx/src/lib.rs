@@ -99,20 +99,17 @@ pub use tts::{
 
 /// Model variant type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ModelVariant {
     /// Base model (pre-training only)
     Base,
     /// Standard model (pre-training + SFT + RL)
+    #[default]
     Standard,
     /// Think model (+ reasoning RL)
     Think,
 }
 
-impl Default for ModelVariant {
-    fn default() -> Self {
-        Self::Standard
-    }
-}
 
 /// Supported languages
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

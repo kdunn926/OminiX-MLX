@@ -1,10 +1,18 @@
-//! HiFT (HiFi-GAN with source modeling) Vocoder for Step-Audio 2
+//! Vocoder for Step-Audio 2 — an APPROXIMATION of the reference HiFT
+//! (HiFi-GAN with source modeling) generator.
 //!
 //! Weight-based implementation. Architecture:
 //! - conv_pre: 80 → 512 (kernel=7)
 //! - 3 upsample stages: 512→256 (8x), 256→128 (4x), 128→64 (8x) = 256x total
 //! - 9 resblocks: 3 per level, 3 layers each, with Snake activation
-//! - conv_post: 64 → 18 (kernel=7), then sum to mono
+//! - conv_post: 64 → 18 (kernel=7), then tanh → mean over the 18 channels
+//!
+//! KNOWN DEVIATIONS from the reference HiFT vocoder:
+//! - no source/F0 module (the "source modeling" half of HiFT is absent);
+//! - the 18-channel conv_post output corresponds to an ISTFT-style
+//!   magnitude/phase head in the reference; reducing it by tanh-then-mean
+//!   is an approximation, so output audio will deviate from the Python
+//!   reference until the ISTFT head + source module are ported.
 
 use std::collections::HashMap;
 use std::path::Path;

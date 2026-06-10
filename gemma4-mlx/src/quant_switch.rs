@@ -13,7 +13,7 @@
 use mlx_rs::{
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, Param},
+    module::Param,
     ops::indexing::take_axis,
     Array,
 };

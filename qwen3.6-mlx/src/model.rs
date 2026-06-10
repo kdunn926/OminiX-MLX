@@ -215,6 +215,26 @@ pub struct Qwen36TextModel {
     pub layer_types: Vec<String>,
 }
 
+impl Qwen36TextModel {
+    /// Lazily populate an empty cache vector with the per-layer default
+    /// (standard `KVCache` for full-attention layers, `RecurrentState` for
+    /// GDN layers). NOTE: this is the STANDARD (fp16) cache mode — callers
+    /// who want quantized/paged/TurboQuant KV must pre-build the vector via
+    /// `Model::new_cache(mode)`; passing an empty Vec silently selects
+    /// standard mode.
+    pub fn ensure_cache(&self, cache: &mut Vec<HybridCache>) {
+        if cache.is_empty() {
+            for layer_type in &self.layer_types {
+                if layer_type == "full_attention" {
+                    cache.push(HybridCache::KV(KVCache::new()));
+                } else {
+                    cache.push(HybridCache::Recurrent(RecurrentState::new()));
+                }
+            }
+        }
+    }
+}
+
 pub struct Model {
     pub args: ModelArgs,
     pub text_model: Qwen36TextModel,
@@ -342,22 +362,14 @@ impl Model {
         cache: &mut Vec<HybridCache>,
     ) -> Result<(Array, Vec<Option<GdnRollbackSnapshot>>), Exception> {
         let mut h = self.text_model.embed_tokens.forward(inputs)?;
-        let T = h.shape()[1];
-        let mask = if T > 1 {
+        let seq_len = h.shape()[1];
+        let mask = if seq_len > 1 {
             Some(mlx_rs_core::utils::AttentionMask::Causal)
         } else {
             None
         };
 
-        if cache.is_empty() {
-            for layer_type in &self.text_model.layer_types {
-                if layer_type == "full_attention" {
-                    cache.push(HybridCache::KV(KVCache::new()));
-                } else {
-                    cache.push(HybridCache::Recurrent(RecurrentState::new()));
-                }
-            }
-        }
+        self.text_model.ensure_cache(cache);
 
         let mut snapshots = Vec::with_capacity(self.text_model.layers.len());
         for (layer, c) in self.text_model.layers.iter_mut().zip(cache.iter_mut()) {
@@ -385,15 +397,7 @@ impl Model {
         } else {
             None
         };
-        if cache.is_empty() {
-            for layer_type in &self.text_model.layer_types {
-                if layer_type == "full_attention" {
-                    cache.push(HybridCache::KV(KVCache::new()));
-                } else {
-                    cache.push(HybridCache::Recurrent(RecurrentState::new()));
-                }
-            }
-        }
+        self.text_model.ensure_cache(cache);
         for (block, c) in self.text_model.layers.iter_mut().zip(cache.iter_mut()) {
             h = block.forward(&h, mask.as_ref(), c)?;
         }
@@ -440,15 +444,7 @@ impl Model {
             None
         };
 
-        if cache.is_empty() {
-            for layer_type in &self.text_model.layer_types {
-                if layer_type == "full_attention" {
-                    cache.push(HybridCache::KV(KVCache::new()));
-                } else {
-                    cache.push(HybridCache::Recurrent(RecurrentState::new()));
-                }
-            }
-        }
+        self.text_model.ensure_cache(cache);
 
         let mut captures = Vec::with_capacity(capture_layer_ids.len());
         for (layer_idx, (layer, c)) in self
@@ -534,22 +530,14 @@ impl Model {
     ) -> Result<Array, Exception> {
         let mut h = self.text_model.embed_tokens.forward(inputs)?;
 
-        let T = h.shape()[1];
-        let mask = if T > 1 {
+        let seq_len = h.shape()[1];
+        let mask = if seq_len > 1 {
             Some(mlx_rs_core::utils::AttentionMask::Causal)
         } else {
             None
         };
 
-        if cache.is_empty() {
-            for layer_type in &self.text_model.layer_types {
-                if layer_type == "full_attention" {
-                    cache.push(HybridCache::KV(KVCache::new()));
-                } else {
-                    cache.push(HybridCache::Recurrent(RecurrentState::new()));
-                }
-            }
-        }
+        self.text_model.ensure_cache(cache);
 
         for (layer, c) in self.text_model.layers.iter_mut().zip(cache.iter_mut()) {
             h = layer.forward(&h, mask.as_ref(), c)?;

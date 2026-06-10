@@ -374,9 +374,11 @@ pub fn compute_speaker_mel(samples: &[f32], config: &SpeakerMelConfig) -> Result
     }
 
     // Hann window
+    // Periodic Hann (denominator = N), matching `torch.hann_window`'s
+    // default — the symmetric form (N-1) perturbs every mel bin slightly.
     let window: Vec<f32> = (0..win_length)
         .map(|i| {
-            let t = i as f32 / (win_length - 1) as f32;
+            let t = i as f32 / win_length as f32;
             0.5 - 0.5 * (2.0 * std::f32::consts::PI * t).cos()
         })
         .collect();

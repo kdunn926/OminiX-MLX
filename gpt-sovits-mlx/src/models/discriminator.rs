@@ -19,6 +19,10 @@ use mlx_rs::{
 
 use crate::error::Error;
 
+/// Discriminator forward outputs:
+/// (real_outputs, fake_outputs, real_feature_maps, fake_feature_maps)
+pub type DiscriminatorOutputs = (Vec<Array>, Vec<Array>, Vec<Vec<Array>>, Vec<Vec<Array>>);
+
 /// Leaky ReLU slope (same as Python implementation)
 const LRELU_SLOPE: f32 = 0.1;
 
@@ -289,7 +293,7 @@ impl DiscriminatorP {
             let widths: &[(i32, i32)] = &[(0, 0), (0, 0), (0, n_pad)];
             x = ops::pad(&x, widths, None, None)
                 .map_err(|e| Error::Message(e.to_string()))?;
-            t = t + n_pad;
+            t += n_pad;
         }
 
         // Reshape 1D to 2D: [B, C, T] -> [B, C, T//period, period]
@@ -350,7 +354,7 @@ impl DiscriminatorP {
             let n_pad = self.period - (t % self.period);
             let widths: &[(i32, i32)] = &[(0, 0), (0, 0), (0, n_pad)];
             x = ops::pad(&x, widths, None, None)?;
-            t = t + n_pad;
+            t += n_pad;
         }
 
         // Reshape 1D to 2D: [B, C, T] -> [B, C, T//period, period]
@@ -421,18 +425,12 @@ pub struct MultiPeriodDiscriminator {
 
 /// Configuration for MultiPeriodDiscriminator
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct MPDConfig {
     /// Whether to use spectral norm (currently not implemented)
     pub use_spectral_norm: bool,
 }
 
-impl Default for MPDConfig {
-    fn default() -> Self {
-        Self {
-            use_spectral_norm: false,
-        }
-    }
-}
 
 impl MultiPeriodDiscriminator {
     /// Create a new MultiPeriodDiscriminator with standard periods [2, 3, 5, 7, 11]
@@ -455,7 +453,7 @@ impl MultiPeriodDiscriminator {
         &mut self,
         y_real: &Array,
         y_fake: &Array,
-    ) -> Result<(Vec<Array>, Vec<Array>, Vec<Vec<Array>>, Vec<Vec<Array>>), Error> {
+    ) -> Result<DiscriminatorOutputs, Error> {
         let mut y_d_rs = Vec::new();
         let mut y_d_gs = Vec::new();
         let mut fmap_rs = Vec::new();
@@ -549,7 +547,7 @@ impl MultiPeriodDiscriminator {
         &mut self,
         y_real: &Array,
         y_fake: &Array,
-    ) -> Result<(Vec<Array>, Vec<Array>, Vec<Vec<Array>>, Vec<Vec<Array>>), mlx_rs::error::Exception> {
+    ) -> Result<DiscriminatorOutputs, mlx_rs::error::Exception> {
         let mut y_d_rs = Vec::new();
         let mut y_d_gs = Vec::new();
         let mut fmap_rs = Vec::new();

@@ -6,7 +6,7 @@
 use mlx_rs::{
     array,
     error::Exception,
-    ops::{concatenate_axis, indexing::IndexOp, matmul, maximum, sqrt, zeros},
+    ops::{concatenate_axis, indexing::IndexOp, matmul, maximum, zeros},
     Array,
 };
 use std::f32::consts::PI;
@@ -45,11 +45,12 @@ impl Default for MelConfig {
 }
 
 /// Create Hann window for STFT
+///
+/// Periodic Hann (denominator = size), matching `torch.hann_window(size)`.
 fn hann_window(size: i32) -> Array {
-    let mut window = vec![0.0f32; size as usize];
-    for i in 0..size as usize {
-        window[i] = 0.5 * (1.0 - (2.0 * PI * i as f32 / (size as f32 - 1.0)).cos());
-    }
+    let window: Vec<f32> = (0..size as usize)
+        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / size as f32).cos()))
+        .collect();
     Array::from_slice(&window, &[size])
 }
 
@@ -68,10 +69,9 @@ pub fn create_mel_filterbank(config: &MelConfig) -> Array {
 
     // Create mel points (n_mels + 2 for edges)
     let n_points = config.n_mels as usize + 2;
-    let mut mel_points = vec![0.0f32; n_points];
-    for i in 0..n_points {
-        mel_points[i] = mel_min + (mel_max - mel_min) * i as f32 / (n_points - 1) as f32;
-    }
+    let mel_points: Vec<f32> = (0..n_points)
+        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_points - 1) as f32)
+        .collect();
 
     // Convert to Hz
     let hz_points: Vec<f32> = mel_points.iter().map(|&m| mel_to_hz(m)).collect();
@@ -107,10 +107,14 @@ pub fn create_mel_filterbank(config: &MelConfig) -> Array {
 /// Compute STFT magnitude using MLX
 ///
 /// Input: audio [batch, samples] or [samples]
-/// Output: magnitude [batch, n_fft/2+1, frames] or [n_fft/2+1, frames]
+/// Output: magnitude [batch, n_fft/2+1, frames]
 ///
-/// Note: This is a simplified STFT that uses real FFT approximation.
-/// For exact matching with torch.stft, you may need rfft support in MLX.
+/// Uses batched `fft::rfft` (O(N log N)) over windowed frames instead of a
+/// per-frame DFT-matrix multiply.
+///
+/// PERF/PARITY note: padding is zero padding of (n_fft - hop) / 2 per side;
+/// GPT-SoVITS's `spectrogram_torch` uses REFLECT padding of the same width
+/// (see `stft_gpu::stft_rfft` for the reflect-padded inference path).
 pub fn stft_mlx(
     audio: &Array,
     n_fft: i32,
@@ -120,13 +124,6 @@ pub fn stft_mlx(
     let shape = audio.shape();
     let is_batched = shape.len() == 2;
 
-    // Flatten to 1D for processing
-    let audio_1d = if is_batched {
-        audio.reshape(&[-1])?
-    } else {
-        audio.clone()
-    };
-
     let batch_size = if is_batched { shape[0] } else { 1 };
     let num_samples = if is_batched { shape[1] } else { shape[0] };
 
@@ -135,109 +132,54 @@ pub fn stft_mlx(
     let pad_right = (n_fft - hop_length) / 2;
     let padded_len = num_samples + pad_left + pad_right;
 
-    // Reflect padding (simplified: use zero padding for now)
-    let padded = if pad_left > 0 || pad_right > 0 {
-        let left_pad = zeros::<f32>(&[batch_size, pad_left])?;
-        let right_pad = zeros::<f32>(&[batch_size, pad_right])?;
-        let audio_2d = if is_batched {
-            audio.clone()
-        } else {
-            audio.reshape(&[1, num_samples])?
-        };
-        concatenate_axis(&[&left_pad, &audio_2d, &right_pad], 1)?
-    } else if is_batched {
-        audio.clone()
-    } else {
-        audio.reshape(&[1, num_samples])?
-    };
-
     // Number of frames
     let n_frames = (padded_len - n_fft) / hop_length + 1;
     let n_freqs = n_fft / 2 + 1;
-
-    // Create window
-    let window = hann_window(win_length);
-
-    // Compute magnitude spectrum using DFT matrix approach
-    // This is less efficient than FFT but works in MLX without rfft
-    // For production, consider using fft.rfft when available
-
-    // Create DFT basis (real part only for magnitude approximation)
-    // This is a simplified approach - for exact matching use proper FFT
-    let mut dft_real = vec![0.0f32; (n_freqs * win_length) as usize];
-    let mut dft_imag = vec![0.0f32; (n_freqs * win_length) as usize];
-
-    for k in 0..n_freqs as usize {
-        for n in 0..win_length as usize {
-            let angle = 2.0 * PI * k as f32 * n as f32 / n_fft as f32;
-            dft_real[k * win_length as usize + n] = angle.cos();
-            dft_imag[k * win_length as usize + n] = -angle.sin();
-        }
-    }
-
-    let dft_real = Array::from_slice(&dft_real, &[n_freqs, win_length]);
-    let dft_imag = Array::from_slice(&dft_imag, &[n_freqs, win_length]);
-
-    // Extract frames and compute STFT
-    let mut magnitudes = Vec::new();
-
-    // Get padded audio as slice for frame extraction
-    let padded_flat = padded.flatten(None, None)?;
-    let padded_data: Vec<f32> = padded_flat.as_slice().to_vec();
-
-    for b in 0..batch_size as usize {
-        let mut batch_mags = Vec::new();
-
-        for frame_idx in 0..n_frames as usize {
-            let start = b * padded_len as usize + frame_idx * hop_length as usize;
-            let end = start + win_length as usize;
-
-            if end <= padded_data.len() {
-                let frame_data: Vec<f32> = padded_data[start..end]
-                    .iter()
-                    .zip(hann_window(win_length).as_slice::<f32>().iter())
-                    .map(|(x, w)| x * w)
-                    .collect();
-
-                let frame = Array::from_slice(&frame_data, &[1, win_length]);
-
-                // DFT: X = frame @ dft^T
-                let real_part = matmul(&frame, &dft_real.transpose()?)?;
-                let imag_part = matmul(&frame, &dft_imag.transpose()?)?;
-
-                // Magnitude: sqrt(real^2 + imag^2)
-                let mag = sqrt(&real_part.square()?.add(&imag_part.square()?)?)?;
-                batch_mags.push(mag);
-            }
-        }
-
-        if !batch_mags.is_empty() {
-            // Stack frames and transpose to [n_freqs, n_frames]
-            // Each mag has shape [1, n_freqs], concatenating gives [n_frames, n_freqs]
-            let refs: Vec<&Array> = batch_mags.iter().collect();
-            let stacked = concatenate_axis(&refs, 0)?; // [n_frames, n_freqs]
-            let transposed = stacked.transpose()?; // [n_freqs, n_frames]
-            magnitudes.push(transposed);
-        }
-    }
-
-    if magnitudes.is_empty() {
+    if n_frames <= 0 {
         return Err(Exception::from("No frames computed in STFT"));
     }
 
-    // Stack batches - always return [batch, n_freqs, n_frames]
-    if batch_size == 1 {
-        // Add batch dimension: [n_freqs, n_frames] -> [1, n_freqs, n_frames]
-        let single = magnitudes.into_iter().next().unwrap();
-        let n_frames_actual = single.shape()[1];
-        single.reshape(&[1, n_freqs, n_frames_actual])
-    } else {
-        let refs: Vec<&Array> = magnitudes.iter().collect();
-        let stacked = concatenate_axis(&refs, 0)?;
-        // Reshape to [batch, n_freqs, n_frames]
-        let n_frames_actual = stacked.shape()[1];
-        stacked.reshape(&[batch_size, n_freqs, n_frames_actual])
+    // Create window once (hoisted out of the per-frame loop)
+    let window = hann_window(win_length);
+    let window_data: Vec<f32> = window.as_slice().to_vec();
+
+    // Get audio data for frame extraction (zero padding applied below)
+    let audio_flat = audio.flatten(None, None)?;
+    let audio_data: Vec<f32> = audio_flat.as_slice().to_vec();
+
+    // Build windowed frames: [batch * n_frames, n_fft]
+    let mut frames_data = vec![0.0f32; (batch_size * n_frames * n_fft) as usize];
+    for b in 0..batch_size as usize {
+        let sample_base = b * num_samples as usize;
+        for frame_idx in 0..n_frames as usize {
+            let frame_base = (b * n_frames as usize + frame_idx) * n_fft as usize;
+            // Position in the (virtually) padded signal
+            let padded_start = frame_idx * hop_length as usize;
+            for i in 0..win_length as usize {
+                let padded_pos = padded_start + i;
+                // Map back to the unpadded signal; outside = zero padding
+                if padded_pos >= pad_left as usize {
+                    let sample_pos = padded_pos - pad_left as usize;
+                    if sample_pos < num_samples as usize {
+                        frames_data[frame_base + i] =
+                            audio_data[sample_base + sample_pos] * window_data[i];
+                    }
+                }
+            }
+        }
     }
+
+    let frames = Array::from_slice(&frames_data, &[batch_size * n_frames, n_fft]);
+
+    // Batched real FFT: [batch * n_frames, n_fft] -> [batch * n_frames, n_freqs]
+    let fft_result = mlx_rs::fft::rfft(&frames, n_fft, -1)?;
+    // Magnitude: |complex|
+    let magnitude = mlx_rs::ops::abs(&fft_result)?;
+
+    // [batch * n_frames, n_freqs] -> [batch, n_frames, n_freqs] -> [batch, n_freqs, n_frames]
+    magnitude
+        .reshape(&[batch_size, n_frames, n_freqs])?
+        .transpose_axes(&[0, 2, 1])
 }
 
 /// Compute mel spectrogram from audio using MLX
@@ -347,17 +289,28 @@ pub fn slice_mel_segments(
     ids_slice: &Array,
     segment_frames: i32,
 ) -> Result<Array, Exception> {
-    let batch_size = mel.dim(0) as i32;
-    let n_mels = mel.dim(1) as i32;
-    let total_frames = mel.dim(2) as i32;
+    let batch_size = mel.dim(0);
+    let n_mels = mel.dim(1);
+    let total_frames = mel.dim(2);
 
     let mut slices = Vec::new();
     for b in 0..batch_size as usize {
         let start_frame: i32 = ids_slice.index(b as i32).item();
+        let start_frame = start_frame.clamp(0, total_frames);
         let end_frame = (start_frame + segment_frames).min(total_frames);
 
-        // Slice: [n_mels, segment_frames]
+        // Slice: [n_mels, available_frames]
         let slice = mel.index((b as i32, .., start_frame..end_frame));
+
+        // Pad short slices with zeros so every slice is exactly segment_frames
+        // (otherwise the reshape below panics on slices near the end of mel).
+        let available = end_frame - start_frame;
+        let slice = if available < segment_frames {
+            let pad = zeros::<f32>(&[n_mels, segment_frames - available])?;
+            concatenate_axis(&[&slice, &pad], 1)?
+        } else {
+            slice
+        };
         slices.push(slice);
     }
 
@@ -441,7 +394,8 @@ mod tests {
         assert!(result.is_ok());
 
         let stft_mag = result.unwrap();
-        // Should have shape [n_fft/2+1, frames]
-        assert_eq!(stft_mag.shape()[0], config.n_fft / 2 + 1);
+        // Should have shape [batch, n_fft/2+1, frames]
+        assert_eq!(stft_mag.shape()[0], 1);
+        assert_eq!(stft_mag.shape()[1], config.n_fft / 2 + 1);
     }
 }

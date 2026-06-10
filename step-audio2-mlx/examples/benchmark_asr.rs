@@ -22,6 +22,7 @@ use step_audio2_mlx::{StepAudio2, Result, Error};
 
 /// Benchmark statistics
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct BenchmarkStats {
     name: String,
     audio_duration: f64,
@@ -146,6 +147,7 @@ fn benchmark_step_audio2(
     ))
 }
 
+#[allow(dead_code)]
 fn print_comparison(results: &[BenchmarkStats]) {
     if results.is_empty() {
         println!("\nNo benchmark results to compare.");
@@ -194,18 +196,18 @@ fn main() -> Result<()> {
 
     if args.len() < 2 {
         eprintln!("Unified ASR Benchmark");
-        eprintln!("");
+        eprintln!();
         eprintln!("Usage: {} <audio.wav> [iterations]", args[0]);
-        eprintln!("");
+        eprintln!();
         eprintln!("Arguments:");
         eprintln!("  audio.wav   Path to audio file (WAV format)");
         eprintln!("  iterations  Number of benchmark iterations (default: 10)");
-        eprintln!("");
+        eprintln!();
         eprintln!("Model directories (must exist):");
         eprintln!("  ./Step-Audio-2-mini    - Step-Audio 2 model");
         eprintln!("  ./paraformer           - FunASR Paraformer model");
         eprintln!("  ./Fun-ASR-Nano-2512    - FunASR Nano model");
-        eprintln!("");
+        eprintln!();
         eprintln!("Example:");
         eprintln!("  {} ./speech.wav 20", args[0]);
         return Err(Error::Config("Invalid arguments".into()));
@@ -224,7 +226,7 @@ fn main() -> Result<()> {
     println!("╔══════════════════════════════════════════════════════════════════════╗");
     println!("║              UNIFIED ASR BENCHMARK - step-audio2-mlx                 ║");
     println!("╚══════════════════════════════════════════════════════════════════════╝");
-    println!("");
+    println!();
 
     // Load audio
     println!("Loading audio: {}", audio_path.display());

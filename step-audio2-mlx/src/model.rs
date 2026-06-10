@@ -26,7 +26,7 @@ use crate::adaptor::StepAudio2Adaptor;
 use crate::audio::{load_audio_mel, load_wav, samples_to_mel, resample, MAX_AUDIO_DURATION_SECS};
 use crate::config::{tokens, AudioConfig, StepAudio2Config};
 use crate::encoder::StepAudio2Encoder;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::llm::{apply_repetition_penalty, load_llm_weights, sample, StepAudio2LLM};
 use crate::think::{ThinkConfig, ThinkModeHandler, ThinkOutput};
 
@@ -44,6 +44,10 @@ pub struct StepAudio2 {
     cache: Vec<Option<KVCache>>,
     /// Tokenizer for text encoding/decoding
     tokenizer: Option<Arc<Tokenizer>>,
+    /// Directory the model was loaded from (used to locate the TTS decoder
+    /// weights on demand). `None` for models built via `new()` without
+    /// `load()`.
+    model_dir: Option<std::path::PathBuf>,
     /// Whether model has been warmed up (JIT compiled)
     warmed_up: bool,
 }
@@ -62,6 +66,7 @@ impl StepAudio2 {
             config,
             cache: Vec::new(),
             tokenizer: None,
+            model_dir: None,
             warmed_up: false,
         })
     }
@@ -125,6 +130,7 @@ impl StepAudio2 {
                 Err(e) => eprintln!("Warning: Failed to load tokenizer: {}", e),
             }
         }
+        model.model_dir = Some(model_dir.to_path_buf());
 
         Ok(model)
     }
@@ -261,6 +267,12 @@ impl StepAudio2 {
 
                 if let Some(param) = params.get_mut(&*rust_key) {
                     **param = value;
+                } else {
+                    eprintln!(
+                        "[step-audio2] WARNING: checkpoint tensor '{}' (mapped to '{}') \
+                         matched no parameter — naming drift leaves it at init",
+                        st_key, rust_key
+                    );
                 }
             }
         }
@@ -316,6 +328,12 @@ impl StepAudio2 {
 
                 if let Some(param) = params.get_mut(&*rust_key) {
                     **param = value;
+                } else {
+                    eprintln!(
+                        "[step-audio2] WARNING: checkpoint tensor '{}' (mapped to '{}') \
+                         matched no parameter — naming drift leaves it at init",
+                        st_key, rust_key
+                    );
                 }
             }
         }
@@ -368,11 +386,12 @@ impl StepAudio2 {
         // Position where audio features will be inserted (AFTER the audio_start marker)
         let audio_insert_pos = prompt.len();
 
-        // Add placeholder tokens for audio length (will be replaced with audio features)
-        // Using audio_start token as placeholder (common practice)
-        for _ in 0..audio_len {
-            prompt.push(tokens::AUDIO_START_TOKEN); // Placeholder
-        }
+        // Add placeholder tokens for audio length (will be replaced with
+        // audio features). Using audio_start token as placeholder.
+        prompt.extend(std::iter::repeat_n(
+            tokens::AUDIO_START_TOKEN,
+            audio_len as usize,
+        ));
 
         // Continue prompt after audio
         prompt.extend_from_slice(&[
@@ -409,7 +428,7 @@ impl StepAudio2 {
 
         // Get embeddings for prompt tokens
         let prompt_array = Array::from_slice(
-            &prompt_tokens.iter().map(|&t| t).collect::<Vec<i32>>(),
+            &prompt_tokens.to_vec(),
             &[1, prompt_tokens.len() as i32],
         );
         let embeddings = self.llm.get_token_embeddings(&prompt_array)?;
@@ -565,6 +584,7 @@ impl StepAudio2 {
     }
 
     /// Build prompt for TTS (text input → audio output)
+    #[cfg(feature = "tts")]
     fn build_tts_prompt(&self, text: &str) -> Vec<i32> {
         // TTS prompt format for Step-Audio 2:
         // <|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n
@@ -672,10 +692,15 @@ impl StepAudio2 {
             return Err(Error::Inference("No audio tokens generated".to_string()));
         }
 
-        // Load TTS decoder if not already loaded
-        // Note: In a real implementation, this would be cached
-        let model_dir = Path::new("./Step-Audio-2-mini");
-        let mut tts = TTSDecoder::load(model_dir)?;
+        // Load the TTS decoder from the directory this model was loaded
+        // from (it used to be hardcoded to ./Step-Audio-2-mini in the CWD).
+        let model_dir = self.model_dir.clone().ok_or_else(|| {
+            Error::Inference(
+                "synthesize requires a model loaded via StepAudio2::load (model dir unknown)"
+                    .to_string(),
+            )
+        })?;
+        let mut tts = TTSDecoder::load(&model_dir)?;
 
         // Synthesize audio from codes
         tts.synthesize(&audio_codes)
@@ -709,8 +734,14 @@ impl StepAudio2 {
 
         // Synthesize audio if we have audio codes
         let audio = if !audio_codes.is_empty() {
-            let model_dir = Path::new("./Step-Audio-2-mini");
-            let mut tts = TTSDecoder::load(model_dir)?;
+            let model_dir = self.model_dir.clone().ok_or_else(|| {
+                Error::Inference(
+                    "speech_to_speech requires a model loaded via StepAudio2::load \
+                     (model dir unknown)"
+                        .to_string(),
+                )
+            })?;
+            let mut tts = TTSDecoder::load(&model_dir)?;
             tts.synthesize(&audio_codes)?
         } else {
             vec![]
@@ -909,8 +940,27 @@ impl StepAudio2 {
         let mut handler = ThinkModeHandler::new(think_config);
         let max_total_tokens = handler.current_max_tokens() * 2; // thinking + response
 
-        // Run prefill with audio features
-        let logits = self.llm.forward_embeddings(audio_features, &mut self.cache)?;
+        // Wrap the audio in the same chat template the ASR path uses —
+        // prefilling on bare audio embeddings (the previous behavior) left
+        // the LLM with no chat structure at all, so generation was
+        // unconditioned on any instruction or role markers.
+        let audio_len = audio_features.shape()[1];
+        let (prompt_tokens, audio_insert_pos) = self.build_asr_prompt(audio_len);
+        let prompt_array =
+            Array::from_slice(&prompt_tokens.to_vec(), &[1, prompt_tokens.len() as i32]);
+        let embeddings = self.llm.get_token_embeddings(&prompt_array)?;
+        let total_len = embeddings.shape()[1];
+        let before_audio = embeddings.index((.., ..audio_insert_pos as i32, ..));
+        let after_audio_start = (audio_insert_pos + audio_len as usize) as i32;
+        let combined = if after_audio_start < total_len {
+            let after_audio = embeddings.index((.., after_audio_start.., ..));
+            mlx_rs::ops::concatenate_axis(&[&before_audio, audio_features, &after_audio], 1)?
+        } else {
+            mlx_rs::ops::concatenate_axis(&[&before_audio, audio_features], 1)?
+        };
+
+        // Run prefill with the templated prompt + spliced audio features
+        let logits = self.llm.forward_embeddings(&combined, &mut self.cache)?;
 
         // Get last token logits
         let seq_len = logits.shape()[1];
@@ -971,23 +1021,29 @@ impl StepAudio2 {
         Ok(output)
     }
 
-    /// Decode a single token to text
+    /// Decode a single token to text via the loaded tokenizer. Audio and
+    /// control tokens keep their symbolic forms; the previous placeholder
+    /// returned "[id]" strings for everything, which meant the think-mode
+    /// handler could never see "<think>" markers at runtime.
     fn decode_single_token(&self, token_id: i32) -> String {
-        // TODO: Implement proper tokenizer decoding
-        // For now, return a placeholder
-        // In a real implementation, this would use the Qwen tokenizer
         if tokens::is_audio_token(token_id) {
-            format!("[audio:{}]", tokens::token_to_code(token_id))
-        } else if token_id == tokens::EOS_TOKEN {
-            "<eos>".to_string()
-        } else if token_id == tokens::IM_START_TOKEN {
-            "<|im_start|>".to_string()
-        } else if token_id == tokens::IM_END_TOKEN {
-            "<|im_end|>".to_string()
-        } else {
-            // Placeholder - would need actual tokenizer
-            format!("[{}]", token_id)
+            return format!("[audio:{}]", tokens::token_to_code(token_id));
         }
+        if token_id == tokens::EOS_TOKEN {
+            return "<eos>".to_string();
+        }
+        if token_id == tokens::IM_START_TOKEN {
+            return "<|im_start|>".to_string();
+        }
+        if token_id == tokens::IM_END_TOKEN {
+            return "<|im_end|>".to_string();
+        }
+        if let Some(tok) = &self.tokenizer {
+            if let Ok(text) = tok.decode(&[token_id as u32], false) {
+                return text;
+            }
+        }
+        format!("[{}]", token_id)
     }
 }
 

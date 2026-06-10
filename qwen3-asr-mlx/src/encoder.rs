@@ -74,9 +74,30 @@ impl Default for AudioEncoderConfig {
 /// Compute output length after conv layers for a given input length.
 /// Accounts for 100-frame chunk processing (13 tokens per chunk).
 fn get_feat_extract_output_lengths(input_length: i32) -> i32 {
+    // Python floor division (`//`) differs from Rust truncating `/` on
+    // negative numerators: when `leave == 0`, `(leave - 1) // 2 + 1` must
+    // be 0, not 1 — otherwise every full 100-frame chunk reports 14 output
+    // tokens instead of 13 and the block-attention windows drift off the
+    // reference for all audio > 1 chunk.
     let leave = input_length % 100;
-    let feat_len = (leave - 1) / 2 + 1;
-    ((feat_len - 1) / 2 + 1 - 1) / 2 + 1 + (input_length / 100) * 13
+    let feat_len = (leave - 1).div_euclid(2) + 1;
+    ((feat_len - 1).div_euclid(2) + 1 - 1).div_euclid(2) + 1 + (input_length / 100) * 13
+}
+
+#[cfg(test)]
+mod conv_length_tests {
+    use super::get_feat_extract_output_lengths;
+
+    #[test]
+    fn matches_python_floor_division_reference() {
+        // Reference values from the HF Python implementation.
+        assert_eq!(get_feat_extract_output_lengths(0), 0);
+        assert_eq!(get_feat_extract_output_lengths(1), 1);
+        assert_eq!(get_feat_extract_output_lengths(99), 13);
+        assert_eq!(get_feat_extract_output_lengths(100), 13, "exact chunk multiple");
+        assert_eq!(get_feat_extract_output_lengths(200), 26, "exact chunk multiple");
+        assert_eq!(get_feat_extract_output_lengths(150), 13 + 7);
+    }
 }
 
 /// Pre-computed sinusoidal position embeddings.

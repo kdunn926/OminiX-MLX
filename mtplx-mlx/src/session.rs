@@ -42,6 +42,19 @@ pub struct SpeculativeConfig {
     pub acceptance: AcceptanceMode,
 }
 
+
+/// KV-cache mode selected via env: `TURBO_KV` → TurboQuant, `QUANTIZE_KV` →
+/// Quantized, otherwise Standard.
+fn env_cache_mode() -> qwen3_6_mlx::KVCacheMode {
+    if std::env::var("TURBO_KV").is_ok() {
+        qwen3_6_mlx::KVCacheMode::TurboQuant
+    } else if std::env::var("QUANTIZE_KV").is_ok() {
+        qwen3_6_mlx::KVCacheMode::Quantized
+    } else {
+        qwen3_6_mlx::KVCacheMode::Standard
+    }
+}
+
 impl Default for SpeculativeConfig {
     fn default() -> Self {
         Self {
@@ -143,15 +156,7 @@ impl MtplxSession {
         if let Some(mtp) = self.model.mtp_head() {
             mtp.reset_cache();
         }
-        let mut cache: Vec<HybridCache> = self
-            .model
-            .new_cache(if std::env::var("TURBO_KV").is_ok() {
-                qwen3_6_mlx::KVCacheMode::TurboQuant
-            } else if std::env::var("QUANTIZE_KV").is_ok() {
-                qwen3_6_mlx::KVCacheMode::Quantized
-            } else {
-                qwen3_6_mlx::KVCacheMode::Standard
-            });
+        let mut cache: Vec<HybridCache> = self.model.new_cache(env_cache_mode());
 
         // --- prefill ---
         let prefill_start = Instant::now();
@@ -441,13 +446,7 @@ impl MtplxSession {
                     if let Some(mtp) = self.model.mtp_head() {
                         mtp.reset_cache();
                     }
-                    let mut c = self.model.new_cache(if std::env::var("TURBO_KV").is_ok() {
-                qwen3_6_mlx::KVCacheMode::TurboQuant
-            } else if std::env::var("QUANTIZE_KV").is_ok() {
-                qwen3_6_mlx::KVCacheMode::Quantized
-            } else {
-                qwen3_6_mlx::KVCacheMode::Standard
-            });
+                    let mut c = self.model.new_cache(env_cache_mode());
                     let prompt_arr =
                         Array::from_slice(&prompt_ids, &[1, prompt_ids.len() as i32]);
                     let logits = match self.model.forward_last_logits(&prompt_arr, &mut c) {

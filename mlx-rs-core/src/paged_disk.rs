@@ -175,9 +175,9 @@ mod tests {
         cache.save(0xABCD, 0, &k, &v).unwrap();
         assert!(cache.has(0xABCD, 0));
         let (lk, lv) = cache.load(0xABCD, 0).unwrap().unwrap();
-        let mut close = lk.all_close(&k, None, None, None).unwrap();
+        let close = lk.all_close(&k, None, None, None).unwrap();
         assert!(close.as_slice::<bool>()[0], "k roundtrips");
-        let mut close = lv.all_close(&v, None, None, None).unwrap();
+        let close = lv.all_close(&v, None, None, None).unwrap();
         assert!(close.as_slice::<bool>()[0], "v roundtrips");
         assert!(cache.load(0x9999, 0).unwrap().is_none(), "miss → None");
     }

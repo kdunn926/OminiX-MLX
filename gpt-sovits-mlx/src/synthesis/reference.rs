@@ -178,7 +178,7 @@ fn parse_codes_file(data: &[u8], path: &Path) -> Result<Vec<i32>, Error> {
             .ok_or_else(|| Error::file_corrupted(path, "NPY header newline not found"))?;
 
         let data_len = data.len() - header_end;
-        if data_len % 4 != 0 {
+        if !data_len.is_multiple_of(4) {
             return Err(Error::file_corrupted(path,
                 format!("NPY data not aligned to 4 bytes (size={})", data_len)));
         }
@@ -189,7 +189,7 @@ fn parse_codes_file(data: &[u8], path: &Path) -> Result<Vec<i32>, Error> {
             .collect())
     } else {
         // Raw binary format
-        if data.len() % 4 != 0 {
+        if !data.len().is_multiple_of(4) {
             return Err(Error::file_corrupted(path,
                 format!("Binary data not aligned to 4 bytes (size={})", data.len())));
         }

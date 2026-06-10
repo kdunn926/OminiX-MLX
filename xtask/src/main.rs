@@ -8,51 +8,45 @@ fn get_repo_root() -> PathBuf {
     PathBuf::from(manifest_dir).parent().unwrap().to_path_buf()
 }
 
-fn get_current_tag(mlx_c_dir: &Path) -> String {
+fn run_git(mlx_c_dir: &Path, args: &[&str], what: &str) -> String {
     let output = Command::new("git")
-        .args(["describe", "--tags"])
+        .args(args)
         .current_dir(mlx_c_dir)
         .output()
-        .expect("Failed to get current tag");
-
+        .unwrap_or_else(|e| panic!("Failed to run git ({what}) in {}: {e}", mlx_c_dir.display()));
+    if !output.status.success() {
+        panic!(
+            "git {what} failed in {}: {}",
+            mlx_c_dir.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn get_current_tag(mlx_c_dir: &Path) -> String {
+    run_git(mlx_c_dir, &["describe", "--tags"], "describe")
 }
 
 fn get_latest_tag(mlx_c_dir: &Path) -> String {
-    // Fetch tags first
-    Command::new("git")
-        .args(["fetch", "--tags", "--quiet"])
-        .current_dir(mlx_c_dir)
-        .output()
-        .expect("Failed to fetch tags");
-
-    let output = Command::new("git")
-        .args(["rev-list", "--tags", "--max-count=1"])
-        .current_dir(mlx_c_dir)
-        .output()
-        .expect("Failed to get latest tag commit");
-
-    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    let output = Command::new("git")
-        .args(["describe", "--tags", &commit])
-        .current_dir(mlx_c_dir)
-        .output()
-        .expect("Failed to get tag name");
-
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    run_git(mlx_c_dir, &["fetch", "--tags", "--quiet"], "fetch --tags");
+    let commit = run_git(
+        mlx_c_dir,
+        &["rev-list", "--tags", "--max-count=1"],
+        "rev-list --tags",
+    );
+    if commit.is_empty() {
+        panic!("no tags found in {}", mlx_c_dir.display());
+    }
+    run_git(mlx_c_dir, &["describe", "--tags", &commit], "describe <commit>")
 }
 
 fn checkout_tag(mlx_c_dir: &Path, tag: &str) {
-    Command::new("git")
-        .args(["checkout", tag, "--quiet"])
-        .current_dir(mlx_c_dir)
-        .output()
-        .expect("Failed to checkout tag");
+    run_git(mlx_c_dir, &["checkout", tag, "--quiet"], "checkout");
 }
 
 fn generate_bindings(root_dir: &Path) -> String {
-    let mlx_c_dir = root_dir.join("mlx-sys/src/mlx-c");
+    let mlx_c_dir = root_dir.join("mlx-rs/mlx-sys/src/mlx-c");
 
     let bindings = bindgen::Builder::default()
         .header(mlx_c_dir.join("mlx/c/mlx.h").to_str().unwrap())
@@ -452,7 +446,7 @@ fn main() {
     let target_tag = args.get(1).cloned();
 
     let root_dir = get_repo_root();
-    let mlx_c_dir = root_dir.join("mlx-sys/src/mlx-c");
+    let mlx_c_dir = root_dir.join("mlx-rs/mlx-sys/src/mlx-c");
 
     println!("\x1b[33mChecking for mlx-c updates...\x1b[0m\n");
 
@@ -503,5 +497,5 @@ fn main() {
     }
 
     println!("\n\x1b[33mTo update, run:\x1b[0m");
-    println!("  cd mlx-sys/src/mlx-c && git checkout {}", target_tag);
+    println!("  cd mlx-rs/mlx-sys/src/mlx-c && git checkout {}", target_tag);
 }

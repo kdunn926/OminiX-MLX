@@ -186,18 +186,18 @@ fn apply_top_p_filter(logits: &mut [f32], top_p: f32) {
     let sorted_probs: Vec<f32> = indexed.iter().map(|(_, v)| (v - max_val).exp()).collect();
     let sum: f32 = sorted_probs.iter().sum();
 
+    // HF "shift-by-one" semantics: a token is removed only if the cumulative
+    // probability BEFORE it already exceeds top_p. This guarantees the first
+    // (highest-probability) token is always kept, even when its probability
+    // alone exceeds top_p — otherwise all logits would become -inf and the
+    // softmax would produce NaN.
     let mut cumsum = 0.0f32;
-    let mut remove_set = HashSet::new();
-
     for (i, &(orig_idx, _)) in indexed.iter().enumerate() {
+        let exceeded_before = cumsum > top_p;
         cumsum += sorted_probs[i] / sum;
-        if cumsum > top_p {
-            remove_set.insert(orig_idx);
+        if exceeded_before {
+            logits[orig_idx] = f32::NEG_INFINITY;
         }
-    }
-
-    for idx in remove_set {
-        logits[idx] = f32::NEG_INFINITY;
     }
 }
 
@@ -356,6 +356,24 @@ mod tests {
         assert_eq!(argmax(&[1.0, 3.0, 2.0]), 1);
         assert_eq!(argmax(&[5.0, 1.0, 2.0]), 0);
         assert_eq!(argmax(&[1.0, 2.0, 5.0]), 2);
+    }
+
+    #[test]
+    fn test_top_p_keeps_top_token_when_it_exceeds_top_p() {
+        // p(top) = 0.9 (> top_p = 0.5): the top token must survive the filter.
+        // exp(logits) = [18, 1, 1] -> probs = [0.9, 0.05, 0.05]
+        let mut logits = vec![18.0f32.ln(), 0.0, 0.0];
+        apply_top_p_filter(&mut logits, 0.5);
+        assert!(logits[0].is_finite(), "top token must never be removed");
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+
+        // Softmax must be well-defined (no NaN) and put all mass on the top
+        // token, so any sampler over these probabilities returns token 0.
+        let probs = softmax(&logits);
+        assert!(probs.iter().all(|p| p.is_finite()));
+        assert!((probs[0] - 1.0).abs() < 1e-6);
+        assert!(probs[1] == 0.0 && probs[2] == 0.0);
     }
 
     #[test]

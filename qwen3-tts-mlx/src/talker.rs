@@ -16,7 +16,6 @@ use mlx_rs::{
 
 use crate::config::{CodePredictorConfig, QuantizationConfig, TalkerConfig};
 use crate::error::{Error, Result};
-use crate::sampling::sample_logits;
 use mlx_rs_core::cache::{KVCache, KeyValueCache};
 use mlx_rs_core::utils::{scaled_dot_product_attention, SdpaMask};
 

@@ -258,14 +258,12 @@ pub fn resample(samples: &[f32], src_rate: u32, target_rate: u32) -> Vec<f32> {
 
     // Flush any remaining samples in the resampler (pass None to signal end of input)
     let empty_input: &[Vec<f32>] = &[];
-    match resampler.process_partial(Some(empty_input), None) {
-        Ok(out) => {
-            if !out.is_empty() && !out[0].is_empty() {
-                output.extend_from_slice(&out[0]);
-            }
+    if let Ok(out) = resampler.process_partial(Some(empty_input), None) {
+        if !out.is_empty() && !out[0].is_empty() {
+            output.extend_from_slice(&out[0]);
         }
-        Err(_) => {} // Ignore flush errors
-    }
+    } // Flush errors are ignored: the tail samples are best-effort.
+
 
     // Trim to expected length (librosa behavior)
     let expected_len = (samples.len() as f64 * ratio).round() as usize;
@@ -460,10 +458,10 @@ fn stft_magnitude(
             let mut real = 0.0f32;
             let mut imag = 0.0f32;
 
-            for n in 0..n_fft {
+            for (n, &w) in windowed.iter().enumerate().take(n_fft) {
                 let angle = 2.0 * PI * k as f32 * n as f32 / n_fft as f32;
-                real += windowed[n] * angle.cos();
-                imag -= windowed[n] * angle.sin();
+                real += w * angle.cos();
+                imag -= w * angle.sin();
             }
 
             magnitude[k * n_frames + frame] = (real * real + imag * imag).sqrt();

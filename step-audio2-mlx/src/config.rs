@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Main model configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct StepAudio2Config {
     /// Audio encoder configuration
     pub encoder: EncoderConfig,
@@ -16,16 +17,6 @@ pub struct StepAudio2Config {
     pub audio: AudioConfig,
 }
 
-impl Default for StepAudio2Config {
-    fn default() -> Self {
-        Self {
-            encoder: EncoderConfig::default(),
-            adaptor: AdaptorConfig::default(),
-            llm: LLMConfig::default(),
-            audio: AudioConfig::default(),
-        }
-    }
-}
 
 /// Whisper-style audio encoder configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +225,7 @@ pub mod tokens {
 
     /// Check if token is an audio token
     pub fn is_audio_token(token_id: i32) -> bool {
-        token_id >= AUDIO_TOKEN_START && token_id <= AUDIO_TOKEN_END
+        (AUDIO_TOKEN_START..=AUDIO_TOKEN_END).contains(&token_id)
     }
 
     /// Convert audio token ID to codebook index

@@ -120,7 +120,7 @@ impl Denoiser {
         let mut output = vec![0.0f32; n];
 
         // Reconstruct full spectrum (mirror for real signal)
-        for i in 0..n {
+        for (i, out) in output.iter_mut().enumerate() {
             let mut sum = 0.0f32;
 
             for k in 0..n_bins {
@@ -134,7 +134,7 @@ impl Denoiser {
                 sum += mag[k] * (angle - phase[k]).cos();
             }
 
-            output[i] = sum / n as f32;
+            *out = sum / n as f32;
         }
 
         output

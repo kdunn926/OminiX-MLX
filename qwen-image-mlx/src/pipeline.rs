@@ -32,8 +32,8 @@ impl FlowMatchEulerScheduler {
         let sigmas: Vec<f32> = timesteps
             .iter()
             .map(|&t| {
-                let shifted = shift * t / (1.0 + (shift - 1.0) * t);
-                shifted
+                
+                shift * t / (1.0 + (shift - 1.0) * t)
             })
             .collect();
 
@@ -141,8 +141,11 @@ impl QwenImagePipeline {
         let mut latents = self.scheduler.scale_noise(&latents)?;
 
         // Denoising loop
-        for (idx, &t) in self.scheduler.timesteps().iter().enumerate() {
-            let timestep = Array::from_slice(&[t], &[batch]);
+        for idx in 0..self.scheduler.timesteps().len() {
+            // The model must be conditioned on the shifted sigma (same value used
+            // by the Euler step), not the unshifted linear timestep.
+            let sigma = self.scheduler.sigmas()[idx];
+            let timestep = ops::broadcast_to(Array::from_f32(sigma), &[batch])?;
             let timestep = timestep.as_dtype(Dtype::Float32)?;
 
             // Predict velocity
@@ -199,8 +202,10 @@ impl QwenImagePipeline {
         let mut latents = self.scheduler.scale_noise(&latents)?;
 
         // Denoising loop with CFG
-        for (idx, &t) in self.scheduler.timesteps().iter().enumerate() {
-            let timestep = Array::from_slice(&[t], &[batch]);
+        for idx in 0..self.scheduler.timesteps().len() {
+            // Condition the model on the shifted sigma (matches the Euler step).
+            let sigma = self.scheduler.sigmas()[idx];
+            let timestep = ops::broadcast_to(Array::from_f32(sigma), &[batch])?;
             let timestep = timestep.as_dtype(Dtype::Float32)?;
 
             // Predict conditional velocity
@@ -230,19 +235,6 @@ impl QwenImagePipeline {
         // Decode latents to image
         self.vae.decode(&latents)
     }
-}
-
-/// Attention mask builder for variable-length sequences
-pub fn build_attention_mask(
-    image_seq_len: i32,
-    text_seq_len: i32,
-    batch_size: i32,
-) -> Result<Array, Exception> {
-    // For now, return None (full attention)
-    // Full mask would be [batch, 1, total_seq, total_seq]
-    let total_seq = image_seq_len + text_seq_len;
-    let zeros = Array::zeros::<f32>(&[batch_size, 1, total_seq, total_seq])?;
-    Ok(zeros)
 }
 
 #[cfg(test)]

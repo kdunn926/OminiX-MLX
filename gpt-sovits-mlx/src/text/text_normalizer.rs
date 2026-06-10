@@ -271,7 +271,7 @@ impl TextNormalizer {
             if let Some(sec) = second {
                 if sec > 0 {
                     time_str.push_str(&cn2an::an2cn(&sec.to_string()));
-                    time_str.push_str("秒");
+                    time_str.push('秒');
                 }
             }
 
@@ -434,10 +434,10 @@ pub fn mix_text_normalize(text: &str) -> String {
     }).collect();
 
     // Step 2: Normalize (strip symbols, handle numbers, replace punctuation)
-    let normalized = TextNormalizer::with_english().normalize(&uppercased);
+    
 
     // Keep spaces - needed for word-level English G2P tokenization
-    normalized
+    TextNormalizer::with_english().normalize(&uppercased)
 }
 
 /// Normalize pure Chinese text

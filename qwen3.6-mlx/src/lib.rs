@@ -116,6 +116,19 @@ pub struct Generate<'a> {
     state: GenerateState<'a>,
     prefetched: Option<Array>,
     token_count: usize,
+    /// `QWEN36_PROFILE_DECODE` / `QWEN36_CACHE_CLEAR_INTERVAL`, read once at
+    /// construction — env lookups per decoded token are measurable overhead.
+    profile: bool,
+    cache_clear_interval: usize,
+}
+
+fn decode_env_knobs() -> (bool, usize) {
+    let profile = std::env::var("QWEN36_PROFILE_DECODE").is_ok();
+    let interval = std::env::var("QWEN36_CACHE_CLEAR_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    (profile, interval)
 }
 
 enum GenerateState<'a> {
@@ -132,6 +145,8 @@ impl<'a> Generate<'a> {
             state: GenerateState::Prefill { prompt },
             prefetched: None,
             token_count: 0,
+            profile: decode_env_knobs().0,
+            cache_clear_interval: decode_env_knobs().1,
         }
     }
 
@@ -145,6 +160,8 @@ impl<'a> Generate<'a> {
             state: GenerateState::Prefill { prompt },
             prefetched: None,
             token_count: 0,
+            profile: decode_env_knobs().0,
+            cache_clear_interval: decode_env_knobs().1,
         }
     }
 
@@ -159,6 +176,8 @@ impl<'a> Generate<'a> {
             state: GenerateState::Prefill { prompt },
             prefetched: None,
             token_count: 0,
+            profile: decode_env_knobs().0,
+            cache_clear_interval: decode_env_knobs().1,
         }
     }
 
@@ -175,6 +194,8 @@ impl<'a> Generate<'a> {
             state: GenerateState::Prefill { prompt },
             prefetched: None,
             token_count: 0,
+            profile: decode_env_knobs().0,
+            cache_clear_interval: decode_env_knobs().1,
         }
     }
 
@@ -194,6 +215,8 @@ impl<'a> Generate<'a> {
             state: GenerateState::Prefill { prompt },
             prefetched: None,
             token_count: 0,
+            profile: decode_env_knobs().0,
+            cache_clear_interval: decode_env_knobs().1,
         }
     }
 
@@ -291,8 +314,7 @@ impl Iterator for Generate<'_> {
                 let current = self.prefetched.take()?;
                 // QWEN36_PROFILE_DECODE=1 logs per-step compute_next timing
                 // every 16 tokens.
-                let profile = std::env::var("QWEN36_PROFILE_DECODE").is_ok();
-                let t0 = profile.then(std::time::Instant::now);
+                let t0 = self.profile.then(std::time::Instant::now);
                 let next_y = tri!(self.compute_next(&current));
                 let _ = mlx_rs::transforms::async_eval([&next_y]);
                 if let Some(t0) = t0 {
@@ -308,10 +330,7 @@ impl Iterator for Generate<'_> {
                 self.prefetched = Some(next_y);
                 self.token_count += 1;
 
-                let cache_clear_interval: usize = std::env::var("QWEN36_CACHE_CLEAR_INTERVAL")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(256);
+                let cache_clear_interval = self.cache_clear_interval;
                 if cache_clear_interval > 0 && self.token_count % cache_clear_interval == 0 {
                     unsafe {
                         mlx_sys::mlx_clear_cache();

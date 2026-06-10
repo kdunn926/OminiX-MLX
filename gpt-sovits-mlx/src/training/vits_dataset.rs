@@ -305,6 +305,7 @@ impl VITSDataset {
 
 /// Raw sample data before batching
 struct VITSSampleData {
+    #[allow(dead_code)] // sample id kept for debugging/diagnostics
     id: String,
     ssl: Vec<f32>,
     ssl_shape: Vec<usize>,

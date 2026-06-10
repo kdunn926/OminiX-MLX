@@ -204,7 +204,7 @@ impl AudioSlicer {
                 }
                 clip_start = pos;
             } else if i - sil_start <= self.max_sil_kept * 2 {
-                let search_start = if i >= self.max_sil_kept { i - self.max_sil_kept } else { 0 };
+                let search_start = i.saturating_sub(self.max_sil_kept);
                 let search_end = (sil_start + self.max_sil_kept + 1).min(rms_list.len());
                 let pos = Self::argmin(&rms_list[search_start..search_end]) + search_start;
 
@@ -221,7 +221,7 @@ impl AudioSlicer {
                 }
             } else {
                 let pos_l = Self::argmin(&rms_list[sil_start..(sil_start + self.max_sil_kept + 1).min(rms_list.len())]) + sil_start;
-                let search_start = if i >= self.max_sil_kept { i - self.max_sil_kept } else { 0 };
+                let search_start = i.saturating_sub(self.max_sil_kept);
                 let pos_r_end = (i + 1).min(rms_list.len());
                 let pos_r = Self::argmin(&rms_list[search_start..pos_r_end]) + search_start;
 
@@ -340,7 +340,7 @@ impl AudioSlicer {
             .unwrap_or("audio");
 
         let mut chunks = Vec::new();
-        for (i, (mut chunk_samples, start_ms, end_ms)) in raw_chunks.into_iter().enumerate() {
+        for (mut chunk_samples, start_ms, end_ms) in raw_chunks.into_iter() {
             // Normalize
             self.normalize(&mut chunk_samples);
 

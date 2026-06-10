@@ -241,6 +241,13 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let token = try_unwrap!(self.token_generator.next()?);
+            // PERF: `try_item` is a blocking eval — step N+1's graph isn't
+            // built until step N's token has fully materialized, so GPU and
+            // graph-construction never overlap. An async_eval pipeline
+            // (build N+1, then force N) measured ~27% decode throughput on
+            // gemma4's hand-rolled loop; porting it here is tracked as part
+            // of the gemma4 → shared-Generate migration and is blocked on
+            // the HRTB/borrow conflict documented in that work.
             let id = try_unwrap!(token.try_item());
             self.ids.push(id);
 

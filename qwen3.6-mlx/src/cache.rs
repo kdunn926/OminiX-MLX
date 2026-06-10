@@ -207,6 +207,34 @@ impl HybridCache {
             };
             caches.push(cache);
         }
+        // The caller re-prefills `prompt_tokens[n..]`, so the loaded caches
+        // must hold exactly `n` positions. When the cached sequence equals
+        // the whole prompt, `n` was capped to len-1 above but the snapshot
+        // still holds all len positions — without trimming, the final token
+        // would enter the KV cache twice (RoPE offsets len-1 AND len) and
+        // run through the GDN recurrence a second time.
+        let excess = cached_tokens.len() - n;
+        if excess > 0 {
+            for cache in caches.iter_mut() {
+                match cache {
+                    HybridCache::Recurrent(rec) => {
+                        if rec.step > n as i32 {
+                            // Recurrent state can't be rolled back without a
+                            // tape — treat the snapshot as a miss.
+                            return Ok(None);
+                        }
+                    }
+                    other => {
+                        if other.offset() > n as i32 {
+                            let drop = other.offset() - n as i32;
+                            if other.trim(drop).is_err() {
+                                return Ok(None);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(Some((caches, n)))
     }
 }

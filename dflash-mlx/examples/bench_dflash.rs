@@ -726,7 +726,7 @@ fn render_fixture_as_prompt(fixture_path: &Path, model_dir: &Path) -> Result<Str
                                     .get("arguments")
                                     .cloned()
                                     .unwrap_or(Value::Null);
-                                Some(Gemma4ToolCall { name, arguments })
+                                Some(Gemma4ToolCall { name, arguments, id: None })
                             })
                             .collect()
                     })

@@ -59,7 +59,7 @@ pub struct T2STrainer {
 impl T2STrainer {
     /// Create a new trainer
     pub fn new(config: TrainingConfig) -> Result<Self, Error> {
-        config.validate().map_err(|e| Error::Message(e))?;
+        config.validate().map_err(Error::Message)?;
 
         // Create scheduler
         let scheduler = CosineScheduler::new(
@@ -190,7 +190,7 @@ impl T2STrainer {
             .map_err(|e| Error::Message(format!("Optimizer update failed: {}", e)))?;
 
         // Evaluate updated parameters
-        let params: Vec<_> = model.trainable_parameters().flatten().into_iter().map(|(_, v)| v.clone()).collect();
+        let params: Vec<_> = model.trainable_parameters().flatten().into_values().cloned().collect();
         eval(params.iter()).map_err(|e| Error::Message(e.to_string()))?;
 
         // Put model and optimizer back
@@ -241,7 +241,7 @@ impl T2STrainer {
                 loss_count += 1;
 
                 // Logging
-                if self.state.step % self.config.log_every_n_steps == 0 {
+                if self.state.step.is_multiple_of(self.config.log_every_n_steps) {
                     let avg_loss = running_loss / loss_count as f32;
                     let lr = self.scheduler.get_lr();
                     let elapsed = start_time.elapsed().as_secs_f64();
@@ -256,7 +256,7 @@ impl T2STrainer {
                 }
 
                 // Checkpointing
-                if self.state.step % self.config.save_every_n_steps == 0 {
+                if self.state.step.is_multiple_of(self.config.save_every_n_steps) {
                     let checkpoint_path = self.config.checkpoint_dir
                         .join(format!("checkpoint-{}.safetensors", self.state.step));
                     self.save(&checkpoint_path)?;
@@ -385,16 +385,6 @@ fn compute_cross_entropy_loss_inner(
     let loss = mean(&nll, false)?;
 
     Ok(loss)
-}
-
-/// Compute cross-entropy loss with padding mask (public version)
-fn compute_cross_entropy_loss(
-    logits: &Array,
-    targets: &Array,
-    target_lens: &Array,
-) -> Result<Array, Error> {
-    compute_cross_entropy_loss_inner(logits, targets, target_lens)
-        .map_err(|e| Error::Message(e.to_string()))
 }
 
 #[cfg(test)]

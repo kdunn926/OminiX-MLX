@@ -291,11 +291,14 @@ fn resample_linear(samples: &[f32], src_rate: u32, target_rate: u32) -> Vec<f32>
 // Mel Spectrogram
 // ============================================================================
 
-/// Create Hann window
+/// Create a periodic Hann window (denominator = N), matching
+/// `torch.hann_window`'s default used by the Whisper-style reference
+/// pipeline this mel frontend replicates. The symmetric form (N-1)
+/// introduced a small systematic STFT mismatch on every frame.
 fn hann_window(size: usize) -> Vec<f32> {
     let mut window = Vec::with_capacity(size);
     for i in 0..size {
-        let t = i as f32 / (size - 1) as f32;
+        let t = i as f32 / size as f32;
         window.push(0.5 - 0.5 * (2.0 * std::f32::consts::PI * t).cos());
     }
     window
@@ -315,7 +318,7 @@ use mlx_rs_core::audio::mel_filterbank;
 fn stft_power_spectrum_gpu(samples: &[f32], n_fft: i32, hop_length: i32) -> std::result::Result<Array, Exception> {
     let n_fft_usize = n_fft as usize;
     let hop_length_usize = hop_length as usize;
-    let n_freqs = n_fft / 2 + 1;
+    let _n_freqs = n_fft / 2 + 1;
 
     // Calculate number of frames (matching Python behavior: no center padding, drop last frame)
     let n_frames = if samples.len() >= n_fft_usize {
@@ -370,7 +373,11 @@ fn stft_power_spectrum_gpu(samples: &[f32], n_fft: i32, hop_length: i32) -> std:
 }
 
 /// Fallback CPU STFT for compatibility (used if GPU fails)
-fn stft_power_spectrum_cpu(samples: &[f32], n_fft: i32, hop_length: i32) -> Vec<f32> {
+fn stft_power_spectrum_cpu(
+    samples: &[f32],
+    n_fft: i32,
+    hop_length: i32,
+) -> std::result::Result<Vec<f32>, Exception> {
     use std::f32::consts::PI;
 
     let n_fft = n_fft as usize;
@@ -387,7 +394,13 @@ fn stft_power_spectrum_cpu(samples: &[f32], n_fft: i32, hop_length: i32) -> Vec<
     };
 
     if n_frames == 0 {
-        return vec![0.0f32; n_freqs];
+        // Propagate instead of silently yielding one zero frame: a mel of
+        // silence is indistinguishable from real (quiet) audio downstream.
+        return Err(Exception::custom(format!(
+            "audio too short for STFT: {} samples < n_fft {}",
+            samples.len(),
+            n_fft
+        )));
     }
 
     let effective_frames = n_frames.saturating_sub(1).max(1);
@@ -407,17 +420,17 @@ fn stft_power_spectrum_cpu(samples: &[f32], n_fft: i32, hop_length: i32) -> Vec<
             let mut real = 0.0f32;
             let mut imag = 0.0f32;
 
-            for n in 0..n_fft {
+            for (n, &w) in windowed.iter().enumerate().take(n_fft) {
                 let angle = 2.0 * PI * k as f32 * n as f32 / n_fft as f32;
-                real += windowed[n] * angle.cos();
-                imag -= windowed[n] * angle.sin();
+                real += w * angle.cos();
+                imag -= w * angle.sin();
             }
 
             power[k * effective_frames + frame] = real * real + imag * imag;
         }
     }
 
-    power
+    Ok(power)
 }
 
 // ============================================================================
@@ -460,7 +473,7 @@ pub fn compute_mel_spectrogram(samples: &[f32], config: &AudioConfig) -> std::re
         }
         Err(e) => {
             eprintln!("Warning: GPU STFT failed ({}), falling back to CPU", e);
-            let stft_power = stft_power_spectrum_cpu(&padded_samples, n_fft, hop_length);
+            let stft_power = stft_power_spectrum_cpu(&padded_samples, n_fft, hop_length)?;
             let n_frames = stft_power.len() / n_freqs;
             let arr = Array::from_slice(&stft_power, &[n_freqs as i32, n_frames as i32]);
             (arr, n_frames)
@@ -487,10 +500,10 @@ pub fn compute_mel_spectrogram(samples: &[f32], config: &AudioConfig) -> std::re
     let max_val = ops::max(&mel_spec, None)?;
 
     // GPU normalization: clamp to max-8, then (x + 4) / 4
-    let threshold = max_val.subtract(&Array::from_f32(8.0f32))?;
+    let threshold = max_val.subtract(Array::from_f32(8.0f32))?;
     let mel_spec = ops::maximum(&mel_spec, &threshold)?;
-    let mel_spec = mel_spec.add(&Array::from_f32(4.0f32))?;
-    let mel_spec = mel_spec.divide(&Array::from_f32(4.0f32))?;
+    let mel_spec = mel_spec.add(Array::from_f32(4.0f32))?;
+    let mel_spec = mel_spec.divide(Array::from_f32(4.0f32))?;
 
     // Reshape to [1, n_mels, n_frames] for batch dimension
     let mel_spec = mel_spec.reshape(&[1, n_mels, n_frames as i32])?;

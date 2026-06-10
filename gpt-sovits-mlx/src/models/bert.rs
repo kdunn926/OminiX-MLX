@@ -156,7 +156,7 @@ impl Module<BertEmbeddingInput<'_>> for BertEmbeddings {
 
     fn forward(&mut self, input: BertEmbeddingInput<'_>) -> Result<Self::Output, Self::Error> {
         let input_ids = input.input_ids;
-        let seq_len = input_ids.shape()[1] as i32;
+        let seq_len = input_ids.shape()[1];
 
         // Word embeddings
         let word_embeds = self.word_embeddings.forward(input_ids)?;
@@ -175,7 +175,7 @@ impl Module<BertEmbeddingInput<'_>> for BertEmbeddings {
         // Token type embeddings
         let token_type_ids = match input.token_type_ids {
             Some(ids) => ids.clone(),
-            None => Array::zeros::<i32>(&[input_ids.shape()[0] as i32, seq_len])?,
+            None => Array::zeros::<i32>(&[input_ids.shape()[0], seq_len])?,
         };
         let token_type_embeds = self.token_type_embeddings.forward(&token_type_ids)?;
 
@@ -247,8 +247,8 @@ impl Module<BertAttentionInput<'_>> for BertSelfAttention {
     fn forward(&mut self, input: BertAttentionInput<'_>) -> Result<Self::Output, Self::Error> {
         let x = input.hidden_states;
         let shape = x.shape();
-        let batch = shape[0] as i32;
-        let seq_len = shape[1] as i32;
+        let batch = shape[0];
+        let seq_len = shape[1];
 
         // Project Q, K, V
         let q = self.query.forward(x)?;
@@ -676,7 +676,7 @@ impl BertModel {
 
         // hidden shape: [batch, seq_len, hidden_dim]
         // Remove CLS (first) and SEP (last) tokens: [1:-1]
-        let seq_len = hidden.shape()[1] as i32;
+        let seq_len = hidden.shape()[1];
         // Use index with ranges: (.., 1..(seq_len-1), ..)
         let hidden_trimmed = hidden.index((.., 1..(seq_len - 1), ..));
 
@@ -684,7 +684,7 @@ impl BertModel {
         // hidden_trimmed: [batch, text_len, hidden_dim]
         // We need to repeat each position i by word2ph[i] times
         let bert_token_len = hidden_trimmed.shape()[1] as usize;
-        let hidden_dim = hidden_trimmed.shape()[2] as i32;
+        let hidden_dim = hidden_trimmed.shape()[2];
 
         // Handle mismatch between BERT tokens and word2ph length
         // This happens with mixed Chinese/English text where BERT uses subword tokenization
@@ -750,7 +750,7 @@ impl BertModel {
         let mask = mask.multiply(array!(-1e9f32))?;
         // Reshape to [batch, 1, 1, seq_len]
         let shape = mask.shape();
-        mask.reshape(&[shape[0] as i32, 1, 1, shape[1] as i32])
+        mask.reshape(&[shape[0], 1, 1, shape[1]])
     }
 }
 

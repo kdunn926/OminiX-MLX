@@ -116,6 +116,10 @@ where
         T::offset(self)
     }
 
+    fn physical_offset(&self) -> i32 {
+        T::physical_offset(self)
+    }
+
     fn max_size(&self) -> Option<i32> {
         T::max_size(self)
     }
@@ -128,12 +132,36 @@ where
         T::reset(self)
     }
 
+    fn try_fused_attention(
+        &mut self,
+        q: &Array,
+        k_new: Array,
+        v_new: Array,
+        scale: f32,
+        mask: Option<&Array>,
+        kv_repeat: i32,
+    ) -> Result<Option<Array>, Exception> {
+        T::try_fused_attention(self, q, k_new, v_new, scale, mask, kv_repeat)
+    }
+
     fn current_kv(&self) -> Option<(Array, Array)> {
         T::current_kv(self)
     }
 
     fn eval(&self) -> Result<(), Exception> {
         T::eval(self)
+    }
+
+    fn trim_kv(&mut self, n_drop: i32) -> Result<(), Exception> {
+        T::trim_kv(self, n_drop)
+    }
+
+    fn compact_to_last_n(&mut self, n: i32) -> Result<(), Exception> {
+        T::compact_to_last_n(self, n)
+    }
+
+    fn compact_kv(&mut self, past_length: i32, keep_indices: &Array) -> Result<(), Exception> {
+        T::compact_kv(self, past_length, keep_indices)
     }
 }
 
@@ -280,9 +308,20 @@ impl KVCache {
         }
         let current_length = self.offset - past_length;
         if keep_count == current_length {
-            // Fast path: nothing to compact iff indices == 0,1,...,n-1.
-            // We trust the caller here — DDTree's accepted path is
-            // generally a proper subset.
+            // Fast path: a full-length `keep_indices` is assumed to be the
+            // identity permutation 0,1,...,n-1 (DDTree's accepted path is
+            // generally a proper subset, so this case means "keep all").
+            // PRECONDITION: a full-length *non-identity* permutation would
+            // be silently ignored here; debug builds verify it.
+            #[cfg(debug_assertions)]
+            {
+                if let Ok(idx) = keep_indices.try_as_slice::<i32>() {
+                    debug_assert!(
+                        idx.iter().enumerate().all(|(i, &v)| v == i as i32),
+                        "KVCache::compact: full-length keep_indices must be the identity permutation"
+                    );
+                }
+            }
             return Ok(());
         }
         if let (Some(keys), Some(values)) = (self.keys.as_mut(), self.values.as_mut()) {
@@ -638,6 +677,17 @@ pub struct TurboQuantKVCache {
     /// K/V at the correct precision instead of guessing (the u32-packed bulk
     /// doesn't carry the original dtype).
     model_dtype: Option<mlx_rs::Dtype>,
+    /// Device-resident `[D]` sign tensor for this cache's seed, built lazily
+    /// on first use. Avoids cloning the host `Vec` out of the global signs
+    /// mutex and re-uploading it on every decode step.
+    signs_device: Option<Array>,
+    /// `TURBOQUANT_FUSED_KV_MIN` — read once at construction; env lookups
+    /// in the per-token fused-attention path are measurable overhead.
+    fused_kv_min: i32,
+    /// `TURBOQUANT_ONLINE` (default on) — read once at construction.
+    online_enabled: bool,
+    /// `TURBOQUANT_SIMD_MATMUL` (default off) — read once at construction.
+    simd_matmul: bool,
 }
 
 impl TurboQuantKVCache {
@@ -664,7 +714,142 @@ impl TurboQuantKVCache {
             offset: 0,
             seed: 0x5EED_5EED,
             model_dtype: None,
+            signs_device: None,
+            fused_kv_min: std::env::var("TURBOQUANT_FUSED_KV_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8192),
+            online_enabled: std::env::var("TURBOQUANT_ONLINE")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            simd_matmul: std::env::var("TURBOQUANT_SIMD_MATMUL")
+                .map(|v| v != "0")
+                .unwrap_or(false),
         }
+    }
+
+    /// Device-resident `[D]` sign tensor for this cache's seed, cached after
+    /// the first call.
+    fn signs(&mut self, d: i32) -> Array {
+        if self
+            .signs_device
+            .as_ref()
+            .is_none_or(|s| s.shape()[0] != d)
+        {
+            let signs_vec = crate::turboquant::cached_signs(d, self.seed);
+            self.signs_device = Some(Array::from_slice(&signs_vec, &[d]));
+        }
+        self.signs_device.as_ref().unwrap().clone()
+    }
+
+    /// Compress and append a new K/V block without reconstructing the full
+    /// cache. `update_and_fetch` layers reconstruction on top of this;
+    /// `try_fused_attention` calls it directly so the per-token decode path
+    /// never builds (and discards) the full-history reconstruct graph.
+    ///
+    /// Returns `(head_dim, dtype)` of the appended block for callers that
+    /// do want to reconstruct afterwards.
+    fn append_block(
+        &mut self,
+        keys: Array,
+        values: Array,
+    ) -> Result<(i32, mlx_rs::Dtype), Exception> {
+        use crate::turboquant::BOUNDARIES_4BIT;
+        let k_shape = keys.shape();
+        let b = k_shape[0];
+        let h = k_shape[1];
+        let t_new = k_shape[2];
+        let d = k_shape[3];
+        let dtype = keys.dtype();
+        // Remember the model dtype so current_kv can rebuild at the right
+        // precision (the compressed bulk is u32-packed and loses it).
+        if self.model_dtype.is_none() {
+            self.model_dtype = Some(dtype);
+        }
+
+        // Determine how many of the new tokens go into the sink (kept at
+        // native dtype) vs the compressed bulk. Sink positions are the
+        // first `sink_tokens` positions of the whole cache; once the
+        // sink is full all subsequent tokens go to the bulk.
+        let already_sinked = self
+            .sink_keys
+            .as_ref()
+            .map(|s| s.shape()[2])
+            .unwrap_or(0);
+        let sink_room = (self.sink_tokens - already_sinked).max(0);
+        let n_to_sink = sink_room.min(t_new);
+        let n_to_compress = t_new - n_to_sink;
+
+        if n_to_sink > 0 {
+            let k_sink = keys.index((Ellipsis, ..n_to_sink, ..));
+            let v_sink = values.index((Ellipsis, ..n_to_sink, ..));
+            self.sink_keys = Some(match self.sink_keys.take() {
+                Some(prev) => concatenate_axis(&[prev, k_sink], 2)?,
+                None => k_sink,
+            });
+            self.sink_values = Some(match self.sink_values.take() {
+                Some(prev) => concatenate_axis(&[prev, v_sink], 2)?,
+                None => v_sink,
+            });
+        }
+
+        if n_to_compress > 0 {
+            let k_bulk = keys.index((Ellipsis, n_to_sink.., ..));
+            let v_bulk = values.index((Ellipsis, n_to_sink.., ..));
+
+            // Compress K via TurboQuant Metal kernel.
+            let signs = self.signs(d);
+            let boundaries = Array::from_slice(&BOUNDARIES_4BIT, &[15]);
+            let (packed_new, sigma_new, mean_new) =
+                crate::metal_kernels::tq_compress_4bit(&k_bulk, &signs, &boundaries)?;
+            let packed_new = packed_new.reshape(&[b, h, n_to_compress, d / 8])?;
+            let sigma_new = sigma_new.reshape(&[b, h, n_to_compress])?;
+            let mean_new = mean_new.reshape(&[b, h, n_to_compress])?;
+
+            // Compress V via stock symmetric per-group quantize. Reshape
+            // [B, H, T, D] → [B*H*T, D] so quantize sees a 2D input and
+            // produces grouped scales along the last axis.
+            let v_flat = v_bulk.reshape(&[b * h * n_to_compress, d])?;
+            let (vq, vs, vbi) = mlx_rs::ops::quantize(
+                &v_flat,
+                self.v_group_size,
+                self.v_bits,
+                None::<&str>,
+            )?;
+            let n_groups = d / self.v_group_size;
+            let packed_v_cols = vq.shape()[1];
+            let vq = vq.reshape(&[b, h, n_to_compress, packed_v_cols])?;
+            let vs = vs.reshape(&[b, h, n_to_compress, n_groups])?;
+            let vbi = vbi.reshape(&[b, h, n_to_compress, n_groups])?;
+
+            self.packed_keys = Some(match self.packed_keys.take() {
+                Some(prev) => concatenate_axis(&[prev, packed_new], 2)?,
+                None => packed_new,
+            });
+            self.key_sigma = Some(match self.key_sigma.take() {
+                Some(prev) => concatenate_axis(&[prev, sigma_new], 2)?,
+                None => sigma_new,
+            });
+            self.key_mean = Some(match self.key_mean.take() {
+                Some(prev) => concatenate_axis(&[prev, mean_new], 2)?,
+                None => mean_new,
+            });
+            self.quant_v = Some(match self.quant_v.take() {
+                Some(prev) => concatenate_axis(&[prev, vq], 2)?,
+                None => vq,
+            });
+            self.v_scales = Some(match self.v_scales.take() {
+                Some(prev) => concatenate_axis(&[prev, vs], 2)?,
+                None => vs,
+            });
+            self.v_biases = Some(match self.v_biases.take() {
+                Some(prev) => concatenate_axis(&[prev, vbi], 2)?,
+                None => vbi,
+            });
+        }
+
+        self.offset += t_new;
+        Ok((d, dtype))
     }
 
     pub fn with_seed(seed: u64) -> Self {
@@ -895,103 +1080,7 @@ impl KeyValueCache for TurboQuantKVCache {
         keys: Array,
         values: Array,
     ) -> Result<(Array, Array), Exception> {
-        use crate::turboquant::{cached_signs, BOUNDARIES_4BIT};
-        let k_shape = keys.shape();
-        let b = k_shape[0];
-        let h = k_shape[1];
-        let t_new = k_shape[2];
-        let d = k_shape[3];
-        let dtype = keys.dtype();
-        // Remember the model dtype so current_kv can rebuild at the right
-        // precision (the compressed bulk is u32-packed and loses it).
-        if self.model_dtype.is_none() {
-            self.model_dtype = Some(dtype);
-        }
-
-        // Determine how many of the new tokens go into the sink (kept at
-        // native dtype) vs the compressed bulk. Sink positions are the
-        // first `sink_tokens` positions of the whole cache; once the
-        // sink is full all subsequent tokens go to the bulk.
-        let already_sinked = self
-            .sink_keys
-            .as_ref()
-            .map(|s| s.shape()[2])
-            .unwrap_or(0);
-        let sink_room = (self.sink_tokens - already_sinked).max(0);
-        let n_to_sink = sink_room.min(t_new);
-        let n_to_compress = t_new - n_to_sink;
-
-        if n_to_sink > 0 {
-            let k_sink = keys.index((Ellipsis, ..n_to_sink, ..));
-            let v_sink = values.index((Ellipsis, ..n_to_sink, ..));
-            self.sink_keys = Some(match self.sink_keys.take() {
-                Some(prev) => concatenate_axis(&[prev, k_sink], 2)?,
-                None => k_sink,
-            });
-            self.sink_values = Some(match self.sink_values.take() {
-                Some(prev) => concatenate_axis(&[prev, v_sink], 2)?,
-                None => v_sink,
-            });
-        }
-
-        if n_to_compress > 0 {
-            let k_bulk = keys.index((Ellipsis, n_to_sink.., ..));
-            let v_bulk = values.index((Ellipsis, n_to_sink.., ..));
-
-            // Compress K via TurboQuant Metal kernel.
-            let signs_vec = cached_signs(d, self.seed);
-            let signs = Array::from_slice(&signs_vec, &[d]);
-            let boundaries = Array::from_slice(&BOUNDARIES_4BIT, &[15]);
-            let (packed_new, sigma_new, mean_new) =
-                crate::metal_kernels::tq_compress_4bit(&k_bulk, &signs, &boundaries)?;
-            let packed_new = packed_new.reshape(&[b, h, n_to_compress, d / 8])?;
-            let sigma_new = sigma_new.reshape(&[b, h, n_to_compress])?;
-            let mean_new = mean_new.reshape(&[b, h, n_to_compress])?;
-
-            // Compress V via stock symmetric per-group quantize. Reshape
-            // [B, H, T, D] → [B*H*T, D] so quantize sees a 2D input and
-            // produces grouped scales along the last axis.
-            let v_flat = v_bulk.reshape(&[b * h * n_to_compress, d])?;
-            let (vq, vs, vbi) = mlx_rs::ops::quantize(
-                &v_flat,
-                self.v_group_size,
-                self.v_bits,
-                None::<&str>,
-            )?;
-            let n_groups = d / self.v_group_size;
-            let packed_v_cols = vq.shape()[1];
-            let vq = vq.reshape(&[b, h, n_to_compress, packed_v_cols])?;
-            let vs = vs.reshape(&[b, h, n_to_compress, n_groups])?;
-            let vbi = vbi.reshape(&[b, h, n_to_compress, n_groups])?;
-
-            self.packed_keys = Some(match self.packed_keys.take() {
-                Some(prev) => concatenate_axis(&[prev, packed_new], 2)?,
-                None => packed_new,
-            });
-            self.key_sigma = Some(match self.key_sigma.take() {
-                Some(prev) => concatenate_axis(&[prev, sigma_new], 2)?,
-                None => sigma_new,
-            });
-            self.key_mean = Some(match self.key_mean.take() {
-                Some(prev) => concatenate_axis(&[prev, mean_new], 2)?,
-                None => mean_new,
-            });
-            self.quant_v = Some(match self.quant_v.take() {
-                Some(prev) => concatenate_axis(&[prev, vq], 2)?,
-                None => vq,
-            });
-            self.v_scales = Some(match self.v_scales.take() {
-                Some(prev) => concatenate_axis(&[prev, vs], 2)?,
-                None => vs,
-            });
-            self.v_biases = Some(match self.v_biases.take() {
-                Some(prev) => concatenate_axis(&[prev, vbi], 2)?,
-                None => vbi,
-            });
-        }
-
-        self.offset += t_new;
-
+        let (d, dtype) = self.append_block(keys, values)?;
         let k_full = self.reconstruct_keys(dtype, d)?;
         let v_full = self.reconstruct_values(dtype)?;
         Ok((k_full, v_full))
@@ -1030,7 +1119,7 @@ impl KeyValueCache for TurboQuantKVCache {
         mask: Option<&Array>,
         kv_repeat: i32,
     ) -> Result<Option<Array>, Exception> {
-        use crate::turboquant::{cached_signs, CENTROIDS_4BIT};
+        use crate::turboquant::CENTROIDS_4BIT;
         // Spike scope: q_len=1 only. Prefill / multi-token verify
         // (q_len > 1) takes the standard update_and_fetch + SDPA path.
         let qs = q.shape();
@@ -1052,8 +1141,13 @@ impl KeyValueCache for TurboQuantKVCache {
         let dtype = q.dtype();
 
         // Append the new block first so subsequent reasoning sees the
-        // updated offset and the right sink/bulk split.
-        let _ = self.update_and_fetch(k_new, v_new)?;
+        // updated offset and the right sink/bulk split. Append-only: no
+        // full-cache reconstruct graph is built (that cost the old
+        // `update_and_fetch` call here paid on every decode token).
+        self.append_block(k_new, v_new)?;
+        // Materialize the signs array up front (single &mut borrow) so the
+        // fast paths below can hold shared borrows of the packed buffers.
+        let signs = self.signs(d);
 
         let n_sink = self
             .sink_keys
@@ -1073,24 +1167,26 @@ impl KeyValueCache for TurboQuantKVCache {
         // mlx SDPA which schedules thousands of threadgroups. The fused
         // kernel becomes a win only at long contexts where K-decompress
         // bytes dominate kernel-launch + V-matmul costs.
-        let fused_min: i32 = std::env::var("TURBOQUANT_FUSED_KV_MIN")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8192);
+        let fused_min = self.fused_kv_min;
+        // NOTE: with the default fused_min (8192) > TQ_SDPA_MAX_KV (2048)
+        // this path is intentionally unreachable — the bounded-kv kernel
+        // only wins when explicitly tuned. It activates when
+        // TURBOQUANT_FUSED_KV_MIN is lowered to ≤ TQ_SDPA_MAX_KV (e.g. for
+        // benchmarking); the online kernel below (path B) is the default
+        // long-context fast path.
         let bulk_ok = n_sink == 0
             && n_bulk >= fused_min
             && n_bulk <= crate::metal_kernels::TQ_SDPA_MAX_KV;
         if bulk_ok {
-            // FAST PATH A: bounded-kv (≤ TQ_SDPA_MAX_KV=1024) shared-mem-scores kernel.
-            // Lowest latency at short contexts.
+            // FAST PATH A: bounded-kv (≤ TQ_SDPA_MAX_KV) shared-mem-scores
+            // kernel. Lowest latency when kv fits the scratch buffer; unlike
+            // path B it has no `d % 64 == 0` requirement.
             let packed = self.packed_keys.as_ref().unwrap();
             let sigma = self.key_sigma.as_ref().unwrap();
             let mean = self.key_mean.as_ref().unwrap();
             let pv = self.quant_v.as_ref().unwrap();
             let vs = self.v_scales.as_ref().unwrap();
             let vb = self.v_biases.as_ref().unwrap();
-            let signs_vec = cached_signs(d, self.seed);
-            let signs = Array::from_slice(&signs_vec, &[d]);
             let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
             let out = crate::metal_kernels::tq_sdpa_4bit(
                 q, packed, sigma, mean, pv, vs, vb,
@@ -1106,23 +1202,16 @@ impl KeyValueCache for TurboQuantKVCache {
         // (5183 tok, Gemma4-26B-A4B) lands at 4.5 tok/s decode vs 3.1
         // partial-fuse and 1.8 BF16 baseline. Default ON; disable with
         // TURBOQUANT_ONLINE=0.
-        let online_enabled = std::env::var("TURBOQUANT_ONLINE")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-        if online_enabled
-            && n_sink == 0
-            && n_bulk >= fused_min
-            && d % 64 == 0
-            && self.packed_keys.is_some()
-        {
-            let packed = self.packed_keys.as_ref().unwrap();
+        let online_enabled = self.online_enabled;
+        if let (true, Some(packed)) = (
+            online_enabled && n_sink == 0 && n_bulk >= fused_min && d % 64 == 0,
+            self.packed_keys.as_ref(),
+        ) {
             let sigma = self.key_sigma.as_ref().unwrap();
             let mean = self.key_mean.as_ref().unwrap();
             let pv = self.quant_v.as_ref().unwrap();
             let vs = self.v_scales.as_ref().unwrap();
             let vb = self.v_biases.as_ref().unwrap();
-            let signs_vec = cached_signs(d, self.seed);
-            let signs = Array::from_slice(&signs_vec, &[d]);
             let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
             // TURBOQUANT_SIMD_MATMUL selects the wide 256-thread online kernel
             // (tq_sdpa_4bit_online_simd). It now passes
@@ -1130,10 +1219,7 @@ impl KeyValueCache for TurboQuantKVCache {
             // kernel are marginal (V matmul is a small fraction of decode), so
             // it stays opt-in. Gate on != "0" so `=0` disables it, matching the
             // TURBOQUANT_ONLINE convention (presence alone must not enable it).
-            let simd_matmul = std::env::var("TURBOQUANT_SIMD_MATMUL")
-                .map(|v| v != "0")
-                .unwrap_or(false);
-            let out = if simd_matmul {
+            let out = if self.simd_matmul {
                 crate::metal_kernels::tq_sdpa_4bit_online_simd(
                     q, packed, sigma, mean, pv, vs, vb,
                     &signs, &centroids, mask, scale, kv_repeat, self.v_group_size,
@@ -1189,8 +1275,6 @@ impl KeyValueCache for TurboQuantKVCache {
                 .ok_or_else(|| Exception::custom("bulk requested but packed_keys unset"))?;
             let sigma = self.key_sigma.as_ref().unwrap();
             let mean = self.key_mean.as_ref().unwrap();
-            let signs_vec = cached_signs(d, self.seed);
-            let signs = Array::from_slice(&signs_vec, &[d]);
             let centroids = Array::from_slice(&CENTROIDS_4BIT, &[16]);
             let scores = crate::metal_kernels::tq_qk_score(
                 q,
@@ -1666,35 +1750,37 @@ impl KeyValueCache for QuantizedKVCache {
         let (b, hq, d) = (qs[0], qs[1], qs[3]);
         let hkv = self.n_kv_heads;
 
-        // GQA: expand a [B, Hkv, A, C] tensor to [B, Hq, A, C].
-        let expand = |x: &Array| -> Result<Array, Exception> {
-            if kv_repeat == 1 {
-                return Ok(x.clone());
-            }
-            let s = x.shape();
-            let (a, c) = (s[2], s[3]);
-            let x5 = x.reshape(&[b, hkv, 1, a, c])?;
-            let xb = mlx_rs::ops::broadcast_to(&x5, &[b, hkv, kv_repeat, a, c])?;
-            xb.reshape(&[b, hq, a, c])
-        };
+        // GQA: fold the repeat factor into the q_len axis instead of
+        // expanding the quantized stores to Hq heads. The old
+        // broadcast_to + reshape expand materialized `kv_repeat` copies of
+        // the ENTIRE quantized K/V history per decode step per layer
+        // (reshaping a broadcast view forces the copy). Query head
+        // `hkv_idx * rep + r` maps to kv head `hkv_idx` in both layouts,
+        // so [B, Hq, 1, D] → [B, Hkv, rep, D] is the same pairing with the
+        // repeat sitting on the (batched-matmul) row axis.
+        let q_f = q.reshape(&[b, hkv, kv_repeat, d])?;
 
         let n_q = self.n_quantized;
         let n_res = self.k_residual.as_ref().map(|r| r.shape()[2]).unwrap_or(0);
 
-        // --- scores: [B, Hq, 1, n] = concat(Q·K_qᵀ, Q·K_resᵀ) ---
+        // --- scores: [B, Hkv, rep, n] = concat(Q·K_qᵀ, Q·K_resᵀ) ---
         let mut score_parts: Vec<Array> = Vec::new();
         if n_q > 0 {
-            let kq = expand(self.k_q.as_ref().unwrap())?;
-            let kqs = expand(self.k_scales.as_ref().unwrap())?;
-            let kqb = expand(self.k_biases.as_ref().unwrap())?;
             score_parts.push(mlx_rs::ops::quantized_matmul(
-                q, &kq, &kqs, &kqb, Some(true), Some(self.group_size), Some(self.k_bits), None,
+                &q_f,
+                self.k_q.as_ref().unwrap(),
+                self.k_scales.as_ref().unwrap(),
+                self.k_biases.as_ref().unwrap(),
+                Some(true),
+                Some(self.group_size),
+                Some(self.k_bits),
+                None,
             )?);
         }
         if n_res > 0 {
-            let kr = expand(self.k_residual.as_ref().unwrap())?;
-            let kr_t = kr.transpose_axes(&[0, 1, 3, 2])?; // [B, Hq, d, n_res]
-            score_parts.push(mlx_rs::ops::matmul(q, &kr_t)?);
+            let kr = self.k_residual.as_ref().unwrap();
+            let kr_t = kr.transpose_axes(&[0, 1, 3, 2])?; // [B, Hkv, d, n_res]
+            score_parts.push(mlx_rs::ops::matmul(&q_f, &kr_t)?);
         }
         let scores = if score_parts.len() == 1 {
             score_parts.pop().unwrap()
@@ -1703,34 +1789,38 @@ impl KeyValueCache for QuantizedKVCache {
         };
         let scale_arr = mlx_rs::array!(scale).as_dtype(scores.dtype())?;
         let scores = scores.multiply(&scale_arr)?;
-        let probs = mlx_rs::ops::softmax_axis(&scores, -1, true)?; // [B, Hq, 1, n]
+        let probs = mlx_rs::ops::softmax_axis(&scores, -1, true)?; // [B, Hkv, rep, n]
 
         // --- weighted V: P_q·V_q + P_res·V_res ---
         let mut out: Option<Array> = None;
         if n_q > 0 {
             let p_q = probs.index((Ellipsis, ..n_q));
-            let vq = expand(self.v_q.as_ref().unwrap())?;
-            let vqs = expand(self.v_scales.as_ref().unwrap())?;
-            let vqb = expand(self.v_biases.as_ref().unwrap())?;
             // P_q [.., n_q] · V[n_q, d]: contract n_q, V_q quantized along d →
             // transpose=false (x · dequant(w)).
             let o = mlx_rs::ops::quantized_matmul(
-                &p_q, &vq, &vqs, &vqb, Some(false), Some(self.group_size), Some(self.v_bits), None,
+                &p_q,
+                self.v_q.as_ref().unwrap(),
+                self.v_scales.as_ref().unwrap(),
+                self.v_biases.as_ref().unwrap(),
+                Some(false),
+                Some(self.group_size),
+                Some(self.v_bits),
+                None,
             )?;
             out = Some(o);
         }
         if n_res > 0 {
             let p_res = probs.index((Ellipsis, n_q..));
-            let vr = expand(self.v_residual.as_ref().unwrap())?; // [B, Hq, n_res, d]
-            let o = mlx_rs::ops::matmul(&p_res, &vr)?; // [B, Hq, 1, d]
+            let vr = self.v_residual.as_ref().unwrap(); // [B, Hkv, n_res, d]
+            let o = mlx_rs::ops::matmul(&p_res, vr)?; // [B, Hkv, rep, d]
             out = Some(match out {
                 Some(prev) => prev.add(&o)?,
                 None => o,
             });
         }
-        let _ = d;
-        Ok(out)
-    }
+        // [B, Hkv, rep, d] → [B, Hq, 1, d]
+        out.map(|o| o.reshape(&[b, hq, 1, d]))
+            .transpose()}
 
     fn current_kv(&self) -> Option<(Array, Array)> {
         if self.offset == 0 {
@@ -1796,7 +1886,7 @@ mod tests {
         for i in 0..4_i32 {
             let (k, v) = make_kv(1, 2, 4, 256, 0.01);
             let (k_out, v_out) = cache.update_and_fetch(k, v).unwrap();
-            let expected = ((i + 1) * 4) as i32;
+            let expected = (i + 1) * 4;
             assert_eq!(k_out.shape()[2], expected);
             assert_eq!(v_out.shape()[2], expected);
             assert_eq!(cache.offset(), expected);
@@ -1854,9 +1944,18 @@ mod tests {
             let (k, v) = make_kv(1, 4, 1, 256, 0.01 + i as f32 * 0.001);
             let (fp_k, fp_v) = fp16.update_and_fetch(k.clone(), v.clone()).unwrap();
             let (q_k, q_v) = qkv.update_and_fetch(k, v).unwrap();
-            // shapes must match
             assert_eq!(fp_k.shape(), q_k.shape(), "K shape mismatch at step {i}");
             assert_eq!(fp_v.shape(), q_v.shape(), "V shape mismatch at step {i}");
+            // Pre-quantization the residual path must be bit-exact with
+            // KVCache, not just shape-compatible.
+            let k_eq = mlx_rs::ops::all_close(&fp_k, &q_k, None, None, None)
+                .unwrap()
+                .item::<bool>();
+            let v_eq = mlx_rs::ops::all_close(&fp_v, &q_v, None, None, None)
+                .unwrap()
+                .item::<bool>();
+            assert!(k_eq, "K values diverge from KVCache at step {i}");
+            assert!(v_eq, "V values diverge from KVCache at step {i}");
         }
         // No quantization triggered yet
         assert_eq!(qkv.n_quantized, 0);
@@ -1934,7 +2033,7 @@ mod tests {
         };
         let kref = expand(&fk);
         let vref = expand(&fv);
-        let scores = mlx_rs::ops::matmul(&q, &kref.transpose_axes(&[0, 1, 3, 2]).unwrap())
+        let scores = mlx_rs::ops::matmul(&q, kref.transpose_axes(&[0, 1, 3, 2]).unwrap())
             .unwrap()
             .multiply(mlx_rs::array!(scale))
             .unwrap();
@@ -1982,7 +2081,7 @@ mod tests {
     fn turboquant_v_bits_4_falls_back_from_fused_path() {
         let mut cache = TurboQuantKVCache::new().with_v_quant(4, 32);
         let (k, v) = make_kv(1, 2, 1, 64, 0.01); // q_len == 1, eligible shape
-        let q = Array::from_slice(&vec![0f32; 1 * 2 * 1 * 64], &[1, 2, 1, 64]);
+        let q = Array::from_slice(&vec![0f32; 2 * 64], &[1, 2, 1, 64]);
         let out = cache
             .try_fused_attention(&q, k, v, 0.125, None, 1)
             .unwrap();

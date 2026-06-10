@@ -108,6 +108,16 @@ impl<C: KeyValueCache + Default> Gemma4TargetAdapter<C> {
         // unbounded retention (acceptance 0.265 in both). Larger caps
         // (32, 128) regressed slightly due to list-management overhead.
         // Default 8; `DFLASH_MAX_HIDDEN_SEGS=0` disables the cap.
+        //
+        // SEMANTICS: once the cap engages, `last_target_hidden()` is a
+        // *sliding window* over the most recent segments, no longer the
+        // full context from position 0. The drafter's delta computation
+        // and the ProjectedContextCache's cache-relative RoPE offsets
+        // then condition on window-relative positions rather than true
+        // absolute positions. The sweep above found no acceptance
+        // regression on the tested workload, but this is a semantic
+        // approximation that may be workload-dependent — disable the cap
+        // when debugging acceptance-rate anomalies.
         let cap_default: usize = 8;
         let cap_opt: Option<usize> = std::env::var("DFLASH_MAX_HIDDEN_SEGS")
             .ok()
@@ -296,11 +306,6 @@ impl Gemma4TargetAdapter<KVCache> {
         Ok(logits)
     }
 
-    fn drop_segments_after(&mut self, keep_segments: usize) {
-        self.target_hidden_segments.truncate(keep_segments);
-        self.target_hidden_positions.truncate(keep_segments);
-        self.target_hidden_full_cache = None;
-    }
 }
 
 impl<C: KeyValueCache + Default> TargetModel for Gemma4TargetAdapter<C> {
@@ -315,17 +320,17 @@ impl<C: KeyValueCache + Default> TargetModel for Gemma4TargetAdapter<C> {
         self.verify_step = 0;
         self.verify_segment_count_pre = 0;
 
-        // Same env knob as the AR path: GEMMA4_PREFILL_CHUNK tunes the
+        // Same env knob as the AR path: GEMMA4_prefill_chunk tunes the
         // per-chunk token count. Default 64 matches the AR path's
         // tested sweet spot (chunk=128 thrashes MoE expert gather).
-        let PREFILL_CHUNK: i32 = std::env::var("GEMMA4_PREFILL_CHUNK")
+        let prefill_chunk: i32 = std::env::var("GEMMA4_prefill_chunk")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n: &i32| n > 0)
             .unwrap_or(64);
         let seq_len = prompt.shape()[1];
 
-        if seq_len <= PREFILL_CHUNK {
+        if seq_len <= prefill_chunk {
             // Short prompt — single forward (matches the prior path).
             let (logits, captures) = self.model.forward_last_logits_with_hidden_capture(
                 prompt,
@@ -347,7 +352,7 @@ impl<C: KeyValueCache + Default> TargetModel for Gemma4TargetAdapter<C> {
         let mut last_logits: Option<Array> = None;
         let mut pos = 0;
         while pos < seq_len {
-            let end = (pos + PREFILL_CHUNK).min(seq_len);
+            let end = (pos + prefill_chunk).min(seq_len);
             let chunk = prompt.index((.., pos..end));
             let is_last = end == seq_len;
             let (logits, captures) = if is_last {
@@ -475,7 +480,15 @@ impl<C: KeyValueCache + Default> TargetModel for Gemma4TargetAdapter<C> {
         // 1-3 reads per cycle, each O(total_segments_size) — same asymptotic
         // as the old eager-concat path, but the append cost dropped from
         // O(total) to O(1), so the per-cycle work is roughly halved.
-        self.rebuild_full_hidden().ok().flatten()
+        match self.rebuild_full_hidden() {
+            Ok(h) => h,
+            Err(e) => {
+                // Don't collapse a real concat failure into the misleading
+                // "target_hidden not set before draft_block" downstream error.
+                eprintln!("[dflash] rebuild_full_hidden failed: {e}");
+                None
+            }
+        }
     }
 
     fn embed_token(&mut self, id: u32) -> Option<Array> {

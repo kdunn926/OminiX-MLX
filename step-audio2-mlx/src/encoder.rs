@@ -74,7 +74,7 @@ impl Module<&Array> for AvgPool1d {
 
         // Calculate output length
         let padded_len = length + 2 * self.padding;
-        let out_length = (padded_len - self.kernel_size) / self.stride + 1;
+        let _out_length = (padded_len - self.kernel_size) / self.stride + 1;
 
         // Apply padding if needed
         let x = if self.padding > 0 {

@@ -233,12 +233,9 @@ mod tests {
         //   v ^= 2; v *= 0x100000001b3
         //   v ^= 3; v *= 0x100000001b3
         let h = hash_tokens(&[1, 2, 3]);
-        // Compute the expected value the same way.
-        let mut expected: u64 = 0xcbf29ce484222325;
-        for t in [1u64, 2, 3] {
-            expected ^= t;
-            expected = expected.wrapping_mul(0x100000001b3);
-        }
-        assert_eq!(h, expected);
+        // Hardcoded literal (verified against an independent FNV-1a
+        // implementation) — recomputing it with the same loop here made
+        // the test tautological.
+        assert_eq!(h, 0xd0aa6218672cf5ab);
     }
 }

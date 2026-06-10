@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_possessive_voiceless() {
-        let g2p = EnhancedEnglishG2P::new();
+        let _g2p = EnhancedEnglishG2P::new();
         // cat's - ends in T (voiceless) → S
         // We need CMU dict for this to work properly
         // For now test the logic with a mock

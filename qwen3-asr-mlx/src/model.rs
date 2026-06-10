@@ -503,9 +503,16 @@ impl Qwen3ASR {
             .map_err(|e| Error::Tokenizer(e.to_string()))?;
         let mut tokenizer = tokenizers::Tokenizer::new(bpe);
 
-        // ByteLevel decoder for proper CJK/Unicode handling
-        let byte_level = tokenizers::pre_tokenizers::byte_level::ByteLevel::new(true, true, true);
-        tokenizer.with_decoder(Some(byte_level));
+        // ByteLevel pre-tokenizer AND decoder (matches the Qwen2 tokenizer;
+        // decoder-only meant encode() ran on raw unicode — spaces never
+        // mapped to the byte-level alphabet — mis-tokenizing every prompt,
+        // and the broken tokenizer then got cached to tokenizer.json).
+        tokenizer.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
+        ));
+        tokenizer.with_decoder(Some(
+            tokenizers::decoders::byte_level::ByteLevel::new(false, true, false),
+        ));
 
         // Load special tokens from tokenizer_config.json
         let config_path = model_dir.join("tokenizer_config.json");

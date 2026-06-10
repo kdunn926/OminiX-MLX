@@ -84,10 +84,12 @@ where
     // Track peak active memory across the whole run (prefill + decode).
     let mut peak = active_memory_bytes();
 
-    // Prefill — chunked through `GEMMA4_PREFILL_CHUNK` (default 256) by
-    // the model forward when L > chunk; we just hand the whole prompt and
-    // let the forward chunk. For huge prompts a manual chunk loop would
-    // bound the prefill transient — kept simple here.
+    // Prefill — single-shot: `model.forward` does NOT chunk internally
+    // (`GEMMA4_PREFILL_CHUNK` only applies to the `Generate` iterator's
+    // prefill), so the whole prompt runs as one forward. That inflates the
+    // peak-memory reading vs. a chunked production prefill and can OOM the
+    // quantized 26B MoE on very long prompts — acceptable for this
+    // microbench, where both cache variants see the same transient.
     let input = ModelInput {
         inputs: &prompt_arr,
         mask: None,

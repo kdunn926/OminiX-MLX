@@ -134,6 +134,10 @@ pub struct ThinkModeHandler {
     response_tokens: Vec<i32>,
     /// Buffer for detecting tags (accumulated text)
     text_buffer: String,
+    /// Token ids accumulated while still deciding whether think mode is
+    /// active — flushed into `response_tokens` when we conclude it isn't,
+    /// so the first tokens of the response are never silently dropped.
+    pending_ids: Vec<i32>,
     /// Whether we've seen the start tag
     seen_start: bool,
     /// Whether we've seen the end tag
@@ -155,6 +159,7 @@ impl ThinkModeHandler {
             think_tokens: Vec::new(),
             response_tokens: Vec::new(),
             text_buffer: String::new(),
+            pending_ids: Vec::new(),
             seen_start: false,
             seen_end: false,
         }
@@ -212,6 +217,7 @@ impl ThinkModeHandler {
                 if self.text_buffer.contains(&self.config.think_start) {
                     self.seen_start = true;
                     self.state = ThinkState::Thinking;
+                    self.pending_ids.clear();
                     // Clear buffer after finding start tag
                     if let Some(pos) = self.text_buffer.find(&self.config.think_start) {
                         let after = pos + self.config.think_start.len();
@@ -219,11 +225,14 @@ impl ThinkModeHandler {
                     }
                     return true; // Tag token consumed
                 }
+                self.pending_ids.push(token_id);
                 // If we get too many tokens without finding start tag,
-                // assume no think mode and switch to responding
+                // assume no think mode and switch to responding — flushing
+                // everything buffered so far (the old code pushed only the
+                // current token, dropping the first ~50 chars of output).
                 if self.text_buffer.len() > 50 {
                     self.state = ThinkState::Responding;
-                    self.response_tokens.push(token_id);
+                    self.response_tokens.append(&mut self.pending_ids);
                 }
                 false
             }

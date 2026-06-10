@@ -152,6 +152,14 @@ pub fn create_causal_mask(
     Ok(mask)
 }
 
+/// Build the (optional) causal attention mask for a prefill step.
+///
+/// NOTE: offset and window size are derived from `cache.first()` only
+/// (mirroring mlx-lm's assumption that all layers share one cache shape).
+/// For models with **mixed per-layer windows** — e.g. Gemma4 alternating
+/// sliding/global layers — this mask is only correct for layer 0's cache
+/// type; such models must build per-layer masks in their own attention
+/// forward instead of relying on this helper.
 #[allow(non_snake_case)]
 pub fn create_attention_mask<C>(
     h: &Array,
@@ -187,7 +195,13 @@ where
     }
 }
 
-/// Scaled dot-product attention
+/// Scaled dot-product attention.
+///
+/// `_cache` is unused — it exists for signature compatibility with mlx-lm's
+/// `scaled_dot_product_attention(…, cache, …)` and with the many model
+/// crates already calling this with a turbofish. Pass
+/// `None::<&KVCache>` (or any cache type) freely; removing the parameter
+/// would be a breaking API change for every model crate.
 pub fn scaled_dot_product_attention<'a, C>(
     queries: Array,
     keys: Array,

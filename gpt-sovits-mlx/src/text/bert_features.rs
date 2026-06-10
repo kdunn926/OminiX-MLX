@@ -168,7 +168,7 @@ impl BertFeatureExtractor {
 
         let result = if remove_cls_sep {
             // Remove CLS (first) and SEP (last) tokens using index
-            let seq_len = hidden.shape()[1] as i32;
+            let seq_len = hidden.shape()[1];
             hidden.index((.., 1..(seq_len - 1), ..))
         } else {
             hidden.clone()
@@ -208,17 +208,29 @@ pub fn extract_bert_features<P1: AsRef<Path>, P2: AsRef<Path>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Model directory for tests: `$OMINIX_MODELS_DIR/gpt-sovits-mlx` or
+    /// `$HOME/.OminiX/models/gpt-sovits-mlx`. A literal "~" is never expanded
+    /// by the OS, so the home directory must be resolved explicitly.
+    fn test_model_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("OMINIX_MODELS_DIR") {
+            return PathBuf::from(dir).join("gpt-sovits-mlx");
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        PathBuf::from(home).join(".OminiX/models/gpt-sovits-mlx")
+    }
 
     #[test]
     fn test_tokenize_chinese() {
         // This test requires the tokenizer file
-        let tokenizer_path = "~/.OminiX/models/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json";
-        if !Path::new(tokenizer_path).exists() {
-            println!("Skipping test: tokenizer not found at {}", tokenizer_path);
+        let tokenizer_path = test_model_dir().join("chinese-roberta-tokenizer/tokenizer.json");
+        if !tokenizer_path.exists() {
+            eprintln!("=== SKIPPING test: tokenizer not found at {} ===", tokenizer_path.display());
             return;
         }
 
-        let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
 
         let text = "你好";
         let encoding = tokenizer.encode(text, true).unwrap();
@@ -232,15 +244,16 @@ mod tests {
 
     #[test]
     fn test_word2ph_validation() {
-        let tokenizer_path = "~/.OminiX/models/gpt-sovits-mlx/chinese-roberta-tokenizer/tokenizer.json";
-        let model_path = "~/.OminiX/models/gpt-sovits-mlx/bert.safetensors";
+        let tokenizer_path = test_model_dir().join("chinese-roberta-tokenizer/tokenizer.json");
+        let model_path = test_model_dir().join("bert.safetensors");
 
-        if !Path::new(tokenizer_path).exists() || !Path::new(model_path).exists() {
-            println!("Skipping test: required files not found");
+        if !tokenizer_path.exists() || !model_path.exists() {
+            eprintln!("=== SKIPPING test: required files not found ({} / {}) ===",
+                      tokenizer_path.display(), model_path.display());
             return;
         }
 
-        let mut extractor = BertFeatureExtractor::new(tokenizer_path, model_path, -3).unwrap();
+        let mut extractor = BertFeatureExtractor::new(&tokenizer_path, &model_path, -3).unwrap();
 
         // Test with mismatched word2ph
         let text = "你好";  // 2 characters

@@ -51,8 +51,10 @@ struct VoiceConfig {
     #[serde(default)]
     speed_factor: Option<f32>,
     #[serde(default)]
+    #[allow(dead_code)] // accepted for config-file parity with PrimeSpeech
     text_lang: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)] // accepted for config-file parity with PrimeSpeech
     prompt_lang: Option<String>,
 }
 
@@ -114,13 +116,7 @@ impl VoicesConfig {
         }
 
         // Search aliases
-        for (_, voice) in &self.voices {
-            if voice.aliases.iter().any(|a| a.to_lowercase() == name_lower) {
-                return Some(voice);
-            }
-        }
-
-        None
+        self.voices.values().find(|&voice| voice.aliases.iter().any(|a| a.to_lowercase() == name_lower)).map(|v| v as _)
     }
 
     /// Resolve a relative path to absolute using base_path
@@ -465,14 +461,14 @@ fn interactive_mode(cloner: &mut VoiceCloner) -> Result<(), Box<dyn std::error::
             continue;
         }
 
-        if input.starts_with("/ref ") {
-            let path = &input[5..].trim();
+        if let Some(path) = input.strip_prefix("/ref ") {
+            let path = &path.trim();
             match cloner.set_reference_audio(path) {
                 Ok(()) => info!(path = path, "Reference audio changed"),
                 Err(e) => error!(error = %e, "Failed to set reference audio"),
             }
-        } else if input.starts_with("/save ") {
-            let path = &input[6..].trim();
+        } else if let Some(path) = input.strip_prefix("/save ") {
+            let path = &path.trim();
             if let Some(ref audio) = last_audio {
                 match cloner.save_wav(audio, path) {
                     Ok(()) => info!(path = path, "Saved audio"),

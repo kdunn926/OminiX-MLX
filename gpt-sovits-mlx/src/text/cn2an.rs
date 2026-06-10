@@ -108,7 +108,7 @@ fn integer_to_chinese(num_str: &str) -> String {
     let mut has_content = false;
 
     // Split into groups of 4 from the right
-    let padded_len = ((len + 3) / 4) * 4;
+    let padded_len = len.div_ceil(4) * 4;
     let padding = padded_len - len;
     let padded: String = "0".repeat(padding) + num_str;
 

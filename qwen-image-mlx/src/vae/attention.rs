@@ -85,7 +85,7 @@ impl Module<&Array> for QwenImageAttentionBlock3D {
         let scale = (channels as f32).sqrt();
         let k_t = k.transpose_axes(&[0, 2, 1])?; // [B*T, C, H*W]
         let attn_weights = ops::matmul(&q, &k_t)?; // [B*T, H*W, H*W]
-        let attn_weights = ops::divide(&attn_weights, &Array::from_f32(scale))?;
+        let attn_weights = ops::divide(&attn_weights, Array::from_f32(scale))?;
         let attn_weights = ops::softmax_axis(&attn_weights, -1, None)?;
 
         let attn_out = ops::matmul(&attn_weights, &v)?; // [B*T, H*W, C]

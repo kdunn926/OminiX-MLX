@@ -384,6 +384,12 @@ pub fn load_llm_weights(
         }
     }
 
+    // Honor tie_word_embeddings: tied checkpoints ship no lm_head.weight, so
+    // without this the output head silently kept its random init.
+    if model.config.tie_word_embeddings {
+        *model.lm_head.weight = (*model.embed_tokens.weight).clone();
+    }
+
     Ok(())
 }
 
@@ -391,11 +397,26 @@ fn load_weights_from_file(model: &mut StepAudio2LLM, path: &Path) -> Result<()> 
     let loaded = Array::load_safetensors(path)?;
     let mut params = model.parameters_mut().flatten();
 
+    let total = loaded.len();
+    let mut unmatched: Vec<String> = Vec::new();
     for (st_key, value) in loaded {
         let rust_key = map_weight_key(&st_key);
         if let Some(param) = params.get_mut(&*rust_key) {
             **param = value;
+        } else {
+            unmatched.push(st_key);
         }
+    }
+    if !unmatched.is_empty() {
+        unmatched.sort_unstable();
+        eprintln!(
+            "[step-audio2 llm] WARNING: {} of {} checkpoint tensors in {} were not \
+             mapped to any parameter (first few: {:?})",
+            unmatched.len(),
+            total,
+            path.display(),
+            &unmatched[..unmatched.len().min(5)]
+        );
     }
 
     Ok(())
@@ -405,10 +426,6 @@ fn map_weight_key(key: &str) -> std::rc::Rc<str> {
     // Map HuggingFace weight names to our parameter names
     let key = key
         .replace("model.layers.", "layers.")
-        .replace(".self_attn.", ".self_attn.")
-        .replace(".mlp.gate_proj.", ".mlp.gate_proj.")
-        .replace(".mlp.up_proj.", ".mlp.up_proj.")
-        .replace(".mlp.down_proj.", ".mlp.down_proj.")
         .replace("model.embed_tokens.", "embed_tokens.")
         .replace("model.norm.", "norm.");
 
@@ -443,11 +460,14 @@ pub fn apply_repetition_penalty(
     let unique_ids: std::collections::HashSet<i32> = generated.iter().copied().collect();
 
     // Get logits as flat slice — shape is [1, vocab] or [vocab]
+    // PERF: this is still a full-vocab GPU→CPU→GPU round trip per decode
+    // step; an on-device gather/scatter over the history indices would
+    // avoid serializing the pipeline. (The previous version additionally
+    // cloned the host vector for no reason.)
     let flat = logits.flatten(None, None)?;
     mlx_rs::transforms::eval([&flat])?;
-    let data: Vec<f32> = flat.as_slice::<f32>().to_vec();
+    let mut penalized: Vec<f32> = flat.as_slice::<f32>().to_vec();
 
-    let mut penalized = data.clone();
     for &id in &unique_ids {
         if (id as usize) < penalized.len() {
             let val = penalized[id as usize];

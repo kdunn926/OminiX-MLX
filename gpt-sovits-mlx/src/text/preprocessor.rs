@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use pinyin::ToPinyin;
 
@@ -134,11 +134,8 @@ fn must_neutral_tone_words() -> std::collections::HashSet<&'static str> {
 fn get_polyphonic_correction(prev_char: Option<char>, curr_char: char) -> Option<&'static str> {
     // 应 is ying4 when preceded by certain characters
     if curr_char == '应' {
-        if let Some(prev) = prev_char {
-            match prev {
-                '回' | '反' | '适' | '效' | '响' | '相' | '对' | '供' => return Some("ying4"),
-                _ => {}
-            }
+        if let Some('回' | '反' | '适' | '效' | '响' | '相' | '对' | '供') = prev_char {
+            return Some("ying4");
         }
     }
     None
@@ -280,12 +277,14 @@ pub fn normalize_chinese(text: &str) -> String {
     let text = replace_measure_units(&text);
 
     // CRITICAL: Remove ALL English letters (matching Python's re.sub("[a-zA-Z]+", ""))
-    let re_english = regex::Regex::new(r"[a-zA-Z]+").unwrap();
-    let text = re_english.replace_all(&text, "").to_string();
+    static RE_ENGLISH: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"[a-zA-Z]+").unwrap());
+    let text = RE_ENGLISH.replace_all(&text, "").to_string();
 
     // Clean up excess whitespace left after English removal
-    let re_spaces = regex::Regex::new(r"\s+").unwrap();
-    let text = re_spaces.replace_all(&text, "").to_string();
+    static RE_SPACES: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\s+").unwrap());
+    let text = RE_SPACES.replace_all(&text, "").to_string();
 
     // Convert numbers to Chinese BEFORE removing brackets/special chars
     // Python's TextNormalizer converts numbers while [brackets] and ％ are still present,
@@ -294,8 +293,9 @@ pub fn normalize_chinese(text: &str) -> String {
 
     // Now remove brackets (numbers inside already converted to Chinese)
     // e.g., [四十七] → 四十七
-    let re_bracket = regex::Regex::new(r"[\[\]]").unwrap();
-    let text = re_bracket.replace_all(&text, "").to_string();
+    static RE_BRACKET: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"[\[\]]").unwrap());
+    let text = RE_BRACKET.replace_all(&text, "").to_string();
 
     // Remove special characters (matching Python's replace_punctuation)
     let text: String = text.chars()
@@ -413,13 +413,13 @@ fn flush_number_buffer(result: &mut String, num_buffer: &mut String, is_negative
     if num_buffer.ends_with('.') {
         num_buffer.pop();
         if is_negative {
-            result.push_str("负");
+            result.push('负');
         }
         result.push_str(&number_to_chinese_with_decimal(num_buffer));
         result.push('.');
     } else {
         if is_negative {
-            result.push_str("负");
+            result.push('负');
         }
         let len = num_buffer.len();
         let is_year = len == 4 && next_char == Some('年');
@@ -511,8 +511,7 @@ pub fn get_initial_final(pinyin: &str) -> (Option<&'static str>, String) {
 
     // Check for multi-character initials first (zh, ch, sh)
     for &initial in MULTI_CHAR_INITIALS {
-        if pinyin_base.starts_with(initial) {
-            let final_part = &pinyin_base[initial.len()..];
+        if let Some(final_part) = pinyin_base.strip_prefix(initial) {
             return (Some(initial), format!("{}{}", final_part, tone));
         }
     }
@@ -766,21 +765,19 @@ fn get_pinyin_for_char(c: char) -> Option<String> {
     // ToPinyin trait works on &str slices
     let char_str = c.to_string();
     let char_slice: &str = &char_str;
-    for pinyin_result in char_slice.to_pinyin() {
-        if let Some(pinyin) = pinyin_result {
-            // Use with_tone_num_end() for format like "ni3"
-            let mut result = pinyin.with_tone_num_end().to_string();
+    if let Some(pinyin) = char_slice.to_pinyin().flatten().next() {
+        // Use with_tone_num_end() for format like "ni3"
+        let mut result = pinyin.with_tone_num_end().to_string();
 
-            // Convert 'ü' to 'v' for GPT-SoVITS symbol table compatibility
-            result = result.replace('ü', "v");
+        // Convert 'ü' to 'v' for GPT-SoVITS symbol table compatibility
+        result = result.replace('ü', "v");
 
-            // Ensure tone number is present (add neutral tone 5 if missing)
-            if !result.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                result.push('5');
-            }
-
-            return Some(result);
+        // Ensure tone number is present (add neutral tone 5 if missing)
+        if !result.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            result.push('5');
         }
+
+        return Some(result);
     }
     None
 }
@@ -921,8 +918,9 @@ fn number_to_chinese_with_decimal(num_str: &str) -> String {
 /// Convert percentages to Chinese
 /// e.g., "70%" → "百分之七十", "163.6%" → "百分之一百六十三点六"
 fn replace_percentage(text: &str) -> String {
-    let re = regex::Regex::new(r"(-?)(\d+(?:\.\d+)?)%").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
+    static RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(-?)(\d+(?:\.\d+)?)%").unwrap());
+    RE.replace_all(text, |caps: &regex::Captures| {
         let sign = &caps[1];
         let num = &caps[2];
         let prefix = if sign == "-" { "负" } else { "" };
@@ -934,8 +932,9 @@ fn replace_percentage(text: &str) -> String {
 /// Convert fractions to Chinese
 /// e.g., "1/2" → "二分之一", "-3/4" → "负四分之三"
 fn replace_fraction(text: &str) -> String {
-    let re = regex::Regex::new(r"(-?)(\d+)/(\d+)").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
+    static RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(-?)(\d+)/(\d+)").unwrap());
+    RE.replace_all(text, |caps: &regex::Captures| {
         let sign = &caps[1];
         let numerator = &caps[2];
         let denominator = &caps[3];
@@ -951,98 +950,9 @@ fn replace_fraction(text: &str) -> String {
     .to_string()
 }
 
-/// Convert date formats to Chinese
-/// e.g., "2024年1月15日" stays as-is (numbers converted)
-/// e.g., "2024-01-15" → "二零二四年一月十五日"
-#[allow(dead_code)]
-fn replace_date(text: &str) -> String {
-    // ISO format: 2024-01-15 or 2024/01/15
-    let re = regex::Regex::new(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
-        let year = &caps[1];
-        let month = &caps[2];
-        let day = &caps[3];
-        // Year: digit by digit, month/day: cardinal
-        let year_chinese: String = year
-            .chars()
-            .filter_map(|c| c.to_digit(10))
-            .map(|d| ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'][d as usize])
-            .collect();
-        let month_num: u32 = month.parse().unwrap_or(0);
-        let day_num: u32 = day.parse().unwrap_or(0);
-        format!(
-            "{}年{}月{}日",
-            year_chinese,
-            number_to_chinese(&month_num.to_string()),
-            number_to_chinese(&day_num.to_string())
-        )
-    })
-    .to_string()
-}
-
-/// Convert time formats to Chinese
-/// e.g., "14:30" → "十四点三十分", "14:30:00" → "十四点三十分"
-#[allow(dead_code)]
-fn replace_time(text: &str) -> String {
-    let re = regex::Regex::new(r"(\d{1,2}):(\d{2})(?::(\d{2}))?").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
-        let hour: u32 = caps[1].parse().unwrap_or(0);
-        let minute: u32 = caps[2].parse().unwrap_or(0);
-        let second: Option<u32> = caps.get(3).and_then(|m| m.as_str().parse().ok());
-
-        let mut result = format!("{}点", number_to_chinese(&hour.to_string()));
-
-        if minute == 30 {
-            result.push('半');
-        } else if minute > 0 {
-            result.push_str(&number_to_chinese(&minute.to_string()));
-            result.push('分');
-        }
-
-        if let Some(sec) = second {
-            if sec > 0 {
-                result.push_str(&number_to_chinese(&sec.to_string()));
-                result.push_str("秒");
-            }
-        }
-
-        result
-    })
-    .to_string()
-}
-
-/// Convert numeric ranges to Chinese
-/// e.g., "1-10" → "一到十", "0.5~1.5" → "零点五到一点五"
-#[allow(dead_code)]
-fn replace_range(text: &str) -> String {
-    let re = regex::Regex::new(r"(-?\d+(?:\.\d+)?)\s*[-~]\s*(-?\d+(?:\.\d+)?)").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
-        let start = &caps[1];
-        let end = &caps[2];
-        format!(
-            "{}到{}",
-            number_to_chinese_with_decimal(start),
-            number_to_chinese_with_decimal(end)
-        )
-    })
-    .to_string()
-}
-
-/// Convert temperature to Chinese
-/// e.g., "-3°C" → "零下三摄氏度", "25℃" → "二十五度"
-#[allow(dead_code)]
-fn replace_temperature(text: &str) -> String {
-    let re = regex::Regex::new(r"(-?)(\d+(?:\.\d+)?)\s*(°C|℃|度|摄氏度)").unwrap();
-    re.replace_all(text, |caps: &regex::Captures| {
-        let sign = &caps[1];
-        let num = &caps[2];
-        let unit = &caps[3];
-        let prefix = if sign == "-" { "零下" } else { "" };
-        let unit_text = if unit == "度" { "度" } else { "摄氏度" };
-        format!("{}{}{}", prefix, number_to_chinese_with_decimal(num), unit_text)
-    })
-    .to_string()
-}
+// NOTE: date/time/range/temperature normalization lives in
+// `text_normalizer.rs` (`TextNormalizer::replace_dates` etc.); the duplicate
+// implementations that used to live here were dead code and were removed.
 
 /// Convert measurement units to Chinese
 /// e.g., "10cm" → "10厘米", "5kg" → "5千克"
@@ -1449,12 +1359,10 @@ fn apply_tone_sandhi(chars: &[char], pinyins: &mut [Option<String>]) {
                 }
                 // If we found consecutive tone 3s, change all but the last to tone 2
                 if j > i + 1 {
-                    for k in i..j-1 {
-                        if let Some(ref mut p) = pinyins[k] {
-                            if p.ends_with('3') {
-                                p.pop();
-                                p.push('2');
-                            }
+                    for p in pinyins.iter_mut().take(j - 1).skip(i).flatten() {
+                        if p.ends_with('3') {
+                            p.pop();
+                            p.push('2');
                         }
                     }
                 }
@@ -1706,7 +1614,7 @@ fn number_to_english_phonemes(num_str: &str) -> Vec<(Vec<String>, i32)> {
         let words = num2en::u64_to_words(num);
         // Split into individual words and convert each to phonemes
         let mut result = Vec::new();
-        for word in words.split(|c: char| c == ' ' || c == '-') {
+        for word in words.split([' ', '-']) {
             if !word.is_empty() {
                 let ph = g2p_en::word_to_phonemes(word);
                 if !ph.is_empty() {
@@ -2268,48 +2176,6 @@ mod tests {
         assert_eq!(replace_fraction("1/2"), "二分之一");
         assert_eq!(replace_fraction("3/4"), "四分之三");
         assert_eq!(replace_fraction("-1/2"), "负二分之一");
-    }
-
-    #[test]
-    fn test_date_normalization() {
-        let result = replace_date("2024-01-15");
-        assert_eq!(result, "二零二四年一月十五日");
-
-        let result = replace_date("2024/12/31");
-        assert_eq!(result, "二零二四年十二月三十一日");
-    }
-
-    #[test]
-    fn test_time_normalization() {
-        let result = replace_time("14:30");
-        assert_eq!(result, "十四点半");
-
-        let result = replace_time("9:45");
-        assert_eq!(result, "九点四十五分");
-
-        let result = replace_time("18:05:30");
-        assert_eq!(result, "十八点五分三十秒");
-    }
-
-    #[test]
-    fn test_range_normalization() {
-        let result = replace_range("1-10");
-        assert_eq!(result, "一到十");
-
-        let result = replace_range("0.5~1.5");
-        assert_eq!(result, "零点五到一点五");
-    }
-
-    #[test]
-    fn test_temperature_normalization() {
-        let result = replace_temperature("-3°C");
-        assert_eq!(result, "零下三摄氏度");
-
-        let result = replace_temperature("25℃");
-        assert_eq!(result, "二十五摄氏度");
-
-        let result = replace_temperature("37度");
-        assert_eq!(result, "三十七度");
     }
 
     #[test]

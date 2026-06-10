@@ -205,7 +205,16 @@ pub fn init_mixed_paged_cache(model: &Model) -> Vec<MixedKvCache> {
 /// "full attention" if *any* layer using it is non-sliding. Such a slot
 /// uses the unbounded [`KVCache`] so shared KV stays consistent for the
 /// full-attention reader. Slots used exclusively by sliding layers (the
-/// vast majority on 12B/26B/e4b) get the [`SlidingKVCache`].
+/// vast majority on 12B/26B) get the [`SlidingKVCache`].
+///
+/// **Shared-KV rule**: any slot written by a `kv_store_layers` layer
+/// (e4b-style KV sharing) also stays on the unbounded [`KVCache`], even
+/// when all its layers are sliding. Shared readers derive their RoPE
+/// offset from the *physical* KV length of the snapshot
+/// (`shared_k.shape()[2] - L`) and take the snapshot after post-SDPA
+/// compaction — a compacted `SlidingKVCache` would pin that offset at
+/// `window - 1` while the stored keys keep their true positions,
+/// corrupting attention on every reader layer at long context.
 ///
 /// The window per sliding slot is the `sliding_window` of the first layer
 /// that uses that slot — Gemma4's config sets it uniformly per layer-type,
@@ -219,6 +228,12 @@ pub fn init_layered_cache(model: &Model) -> Vec<MixedKvCache> {
     let mut slot_window: Vec<Option<i32>> = vec![None; num_slots];
     for (i, layer) in inner.layers.iter().enumerate() {
         let slot = inner.kv_cache_map[i];
+        // Shared-KV store slots must stay unbounded: readers RoPE their
+        // queries from the snapshot's physical length, which a compacting
+        // SlidingKVCache caps at `window` (see doc comment above).
+        if inner.kv_store_layers.contains(&i) {
+            slot_full[slot] = true;
+        }
         match layer.self_attn.sliding_window {
             None => slot_full[slot] = true,
             Some(w) => {

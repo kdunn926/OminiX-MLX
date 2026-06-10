@@ -490,7 +490,7 @@ fn transcribe_chunk(
     let mask = match create_attention_mask(&embeddings, &cache, Some(true))
         .map_err(|e| funasr_qwen4b_mlx::error::Error::ModelLoad(format!("{:?}", e)))?
     {
-        Some(AttentionMask::Array(m)) => Some(m),
+        Some(m @ AttentionMask::Array(_)) | Some(m @ AttentionMask::Causal) => Some(m),
         _ => None,
     };
 

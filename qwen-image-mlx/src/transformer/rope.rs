@@ -29,7 +29,7 @@ impl QwenEmbedRope {
 
     pub fn new(theta: i32, axes_dimensions: [i32; 3], scale_rope: bool) -> Result<Self, Exception> {
         let positive_indices: Vec<i32> = (0..Self::MAX_INDEX).collect();
-        let negative_indices: Vec<i32> = positive_indices.iter().rev().map(|i| -(i + 1) as i32).collect();
+        let negative_indices: Vec<i32> = positive_indices.iter().rev().map(|i| -(i + 1)).collect();
 
         let mut positive_cos = Vec::with_capacity(3);
         let mut positive_sin = Vec::with_capacity(3);
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn test_rope_forward() {
         let rope = QwenEmbedRope::new(10000, [16, 56, 56], true).unwrap();
-        let ((img_cos, img_sin), (txt_cos, txt_sin)) = rope.forward(&[(1, 8, 8)], &[10]).unwrap();
+        let ((img_cos, _img_sin), (txt_cos, _txt_sin)) = rope.forward(&[(1, 8, 8)], &[10]).unwrap();
         assert_eq!(img_cos.dim(0), 64); // 1 * 8 * 8
         assert_eq!(txt_cos.dim(0), 10);
     }

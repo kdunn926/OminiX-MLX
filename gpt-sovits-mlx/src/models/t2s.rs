@@ -173,7 +173,7 @@ impl SinusoidalPositionEncoding {
     /// Returns:
     ///   x + alpha * PE
     pub fn apply(&self, x: &Array, offset: i32) -> Result<Array, Exception> {
-        let seq_len = x.shape()[1] as i32;
+        let seq_len = x.shape()[1];
         let pe = self.forward(seq_len, offset)?;
         // Broadcast PE [seq_len, hidden] to [batch, seq_len, hidden]
         x.add(&pe)
@@ -566,7 +566,7 @@ impl T2SModel {
     ) -> Result<Array, Exception> {
         // Embed phonemes: (B, text_len, hidden)
         let phoneme_emb = self.phoneme_embedding.forward(phoneme_ids)?;
-        let text_len = phoneme_emb.shape()[1] as i32;
+        let text_len = phoneme_emb.shape()[1];
 
         // BERT features come in as [batch, bert_dim, seq_len], transpose to [batch, seq_len, bert_dim]
         let bert_transposed = bert_features.transpose_axes(&[0, 2, 1])?;
@@ -579,7 +579,7 @@ impl T2SModel {
 
         // Embed semantic tokens: (B, semantic_len, hidden)
         let semantic_emb = self.semantic_embedding.forward(semantic_ids)?;
-        let semantic_len = semantic_emb.shape()[1] as i32;
+        let semantic_len = semantic_emb.shape()[1];
 
         // Apply audio position encoding
         let semantic_emb = self.audio_position.apply(&semantic_emb, 0)?;
@@ -680,7 +680,7 @@ where
 
         // Check if this is prefill (cache not yet initialized) or decode (cache populated)
         // Cache is Vec<Option<C>>: empty vec or first element is None = prefill
-        let is_prefill = cache.is_empty() || cache.first().map_or(true, |c| c.is_none());
+        let is_prefill = cache.is_empty() || cache.first().is_none_or(|c| c.is_none());
 
         let mut h;
         let mask;
@@ -696,7 +696,7 @@ where
 
             // Embed phonemes: (B, text_len, hidden)
             let phoneme_emb = self.phoneme_embedding.forward(phoneme_ids)?;
-            let text_len = phoneme_emb.shape()[1] as i32;
+            let text_len = phoneme_emb.shape()[1];
 
             // Project and ADD BERT features: (B, text_len, hidden)
             let bert_proj = self.bert_proj.forward(bert_features)?;
@@ -707,7 +707,7 @@ where
 
             // Embed semantic tokens: (B, semantic_len, hidden)
             let semantic_emb = self.semantic_embedding.forward(semantic_ids)?;
-            let semantic_len = semantic_emb.shape()[1] as i32;
+            let semantic_len = semantic_emb.shape()[1];
 
             // Apply audio position encoding starting at position 0
             let semantic_emb = self.audio_position.apply(&semantic_emb, 0)?;
@@ -736,7 +736,7 @@ where
                 .and_then(|c| c.as_ref())
                 .map(|c| c.offset())
                 .unwrap_or(0);
-            let text_len = phoneme_ids.shape()[1] as i32;
+            let text_len = phoneme_ids.shape()[1];
             let audio_offset = cache_len - text_len;
 
             // Apply audio position encoding at current position
@@ -774,24 +774,24 @@ where
 /// Sample from logits with temperature
 pub fn sample(logits: &Array, temp: f32) -> Result<Array, Exception> {
     match temp {
-        0.0 => argmax_axis!(logits, -1).map_err(Into::into),
+        0.0 => argmax_axis!(logits, -1),
         _ => {
             let logits = logits.multiply(array!(1.0 / temp))?;
-            categorical!(logits).map_err(Into::into)
+            categorical!(logits)
         }
     }
 }
 
 /// Sample with top-k filtering
 pub fn sample_top_k(logits: &Array, temp: f32, top_k: i32) -> Result<Array, Exception> {
-    if top_k <= 0 || top_k >= logits.shape().last().copied().unwrap_or(0) as i32 {
+    if top_k <= 0 || top_k >= logits.shape().last().copied().unwrap_or(0) {
         return sample(logits, temp);
     }
 
     // For top-k, we want the k largest values
     // argpartition with negative k gives us indices such that smallest k are partitioned
     // So we need vocab_size - top_k as kth to get top_k largest at the end
-    let vocab_size = logits.shape().last().copied().unwrap_or(0) as i32;
+    let vocab_size = logits.shape().last().copied().unwrap_or(0);
     let kth = vocab_size - top_k;
 
     let all_indices = argpartition_axis(logits, kth, -1)?;
@@ -804,7 +804,7 @@ pub fn sample_top_k(logits: &Array, temp: f32, top_k: i32) -> Result<Array, Exce
 
     // Map back to original vocabulary indices
     // take_along_axis returns (batch, 1), we want (batch,)
-    top_k_indices.take_along_axis(&idx.index((.., NewAxis)), -1)?
+    top_k_indices.take_along_axis(idx.index((.., NewAxis)), -1)?
         .squeeze()
 }
 
@@ -999,12 +999,12 @@ pub fn load_t2s_model(checkpoint_path: impl AsRef<Path>) -> Result<T2SModel, Err
     let mut model = T2SModel::new(config)?;
 
     // Load weights from .ckpt or .safetensors
-    if path.extension().map_or(false, |e| e == "ckpt") {
+    if path.extension().is_some_and(|e| e == "ckpt") {
         // PyTorch checkpoint - need to convert first
         return Err(Error::Message(
             "Direct .ckpt loading not supported. Convert to safetensors first.".to_string(),
         ));
-    } else if path.extension().map_or(false, |e| e == "safetensors") {
+    } else if path.extension().is_some_and(|e| e == "safetensors") {
         let weights = Array::load_safetensors(path)?;
         load_t2s_weights(&mut model, &weights)?;
     } else {
@@ -1015,118 +1015,6 @@ pub fn load_t2s_model(checkpoint_path: impl AsRef<Path>) -> Result<T2SModel, Err
     }
 
     Ok(model)
-}
-
-/// Generator for T2S model
-pub struct T2SGenerate<'a, C> {
-    model: &'a mut T2SModel,
-    phoneme_ids: &'a Array,
-    bert_features: &'a Array,
-    cache: &'a mut Vec<Option<C>>,
-    current_token: Array,
-    temp: f32,
-    top_k: i32,
-    max_tokens: usize,
-    generated: usize,
-    finished: bool,
-}
-
-impl<'a, C> T2SGenerate<'a, C>
-where
-    C: KeyValueCache + Default,
-{
-    pub fn new(
-        model: &'a mut T2SModel,
-        phoneme_ids: &'a Array,
-        bert_features: &'a Array,
-        cache: &'a mut Vec<Option<C>>,
-        start_token: i32,
-        temp: f32,
-        top_k: i32,
-        max_tokens: usize,
-    ) -> Result<Self, Exception> {
-        let batch_size = phoneme_ids.shape()[0] as i32;
-        let current_token = Array::full::<i32>(&[batch_size, 1], array!(start_token))?;
-
-        Ok(Self {
-            model,
-            phoneme_ids,
-            bert_features,
-            cache,
-            current_token,
-            temp,
-            top_k,
-            max_tokens,
-            generated: 0,
-            finished: false,
-        })
-    }
-}
-
-impl<'a, C> Iterator for T2SGenerate<'a, C>
-where
-    C: KeyValueCache + Default,
-{
-    type Item = Result<Array, Exception>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        use mlx_rs::transforms::async_eval;
-
-        if self.finished || self.generated >= self.max_tokens {
-            return None;
-        }
-
-        // Forward pass
-        let input = T2SInput {
-            phoneme_ids: self.phoneme_ids,
-            semantic_ids: &self.current_token,
-            bert_features: self.bert_features,
-            cache: self.cache,
-        };
-
-        let logits = match self.model.forward(input) {
-            Ok(l) => l,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // Get logits for last position
-        let last_logits = logits.index((.., -1, ..));
-
-        // Sample next token
-        let next_token = match sample_top_k(&last_logits, self.temp, self.top_k) {
-            Ok(t) => t,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // Queue async eval for pipelining
-        let _ = async_eval([&next_token]);
-
-        // Check for EOS
-        let eos = self.model.config.eos_token;
-        // Simple check - in production would check all batch elements
-        let first_token = next_token.index(0).item::<i32>();
-        if first_token == eos {
-            self.finished = true;
-        }
-
-        // Update for next iteration - add new axis to make it (batch, 1) shape
-        self.current_token = next_token.index((.., NewAxis));
-        self.generated += 1;
-
-        // Periodic cache clearing to prevent memory accumulation during long sequences
-        if self.generated % 256 == 0 {
-            // SAFETY: mlx_clear_cache() is safe to call at any point. It clears the MLX
-            // computation graph cache, releasing memory from completed operations.
-            // This is called during single-threaded inference with no concurrent MLX
-            // operations, so there's no race condition risk. The function is idempotent
-            // and documented as safe to call from the MLX C API.
-            unsafe {
-                mlx_sys::mlx_clear_cache();
-            }
-        }
-
-        Some(Ok(next_token))
-    }
 }
 
 #[cfg(test)]
@@ -1185,8 +1073,9 @@ mod tests {
         let logits = model.forward(input).unwrap();
         eval([&logits]).unwrap();
 
-        // Output should be (batch, full_seq_len, vocab_size) during prefill
-        // full_seq_len = phoneme (5) + bert (5) + semantic (1) = 11
-        assert_eq!(logits.shape(), &[1, 11, 1025]);
+        // Output should be (batch, full_seq_len, vocab_size) during prefill.
+        // BERT features are ADDED to the phoneme embeddings (not concatenated),
+        // so full_seq_len = phoneme (5) + semantic (1) = 6.
+        assert_eq!(logits.shape(), &[1, 6, 1025]);
     }
 }

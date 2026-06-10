@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("models/GLM-OCR"));
     eprintln!("Loading GLM-OCR scaffold from {}...", model_dir.display());
-    let model = glm_ocr_mlx::load_model(&model_dir)?;
+    let model = glm_ocr_mlx::load_from_path(&model_dir)?;
     println!(
         "model_type        : {}",
         model.config.model_type

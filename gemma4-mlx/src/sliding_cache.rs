@@ -201,27 +201,52 @@ impl KeyValueCache for SlidingKVCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::zeros;
-    use mlx_rs::Dtype;
 
-    fn fake_kv(num_tokens: i32) -> (Array, Array) {
-        // Shape: [B=1, n_kv=2, T, head_dim=4]
-        let shape = [1i32, 2, num_tokens, 4];
-        let k = zeros::<f32>(&shape).unwrap();
-        let v = zeros::<f32>(&shape).unwrap();
+    /// K/V pair of shape `[B=1, n_kv=2, T, head_dim=4]` where every element
+    /// of token `t`'s row holds the token's absolute position `start + t`.
+    /// Tests assert *which* positions survive compaction, not just how many
+    /// — a `compact_to_last_n` that kept the head instead of the tail (or
+    /// sliced the wrong axis) fails on content, not only on length.
+    fn pos_kv(start: i32, num_tokens: i32) -> (Array, Array) {
+        let mut data = Vec::with_capacity((2 * num_tokens * 4) as usize);
+        for _ in 0..2 {
+            for t in 0..num_tokens {
+                for _ in 0..4 {
+                    data.push((start + t) as f32);
+                }
+            }
+        }
+        let k = Array::from_slice(&data, &[1, 2, num_tokens, 4]);
+        let v = k.clone();
         (k, v)
+    }
+
+    /// Position stamps along the token axis of a `[1, 2, T, 4]` tensor.
+    fn stamped_positions(k: &Array) -> Vec<f32> {
+        let row = k.index((0, 0, .., 0));
+        row.try_as_slice::<f32>().unwrap().to_vec()
+    }
+
+    /// Feed `total` single-token steps into `cache`, compacting to `window`
+    /// after each (the per-decode-step pattern of the attention forward).
+    fn run_decode_steps(cache: &mut SlidingKVCache, total: i32, window: i32) {
+        for pos in 0..total {
+            let (k, v) = pos_kv(pos, 1);
+            cache.update_and_fetch(k, v).unwrap();
+            cache.compact_to_last_n(window).unwrap();
+        }
     }
 
     #[test]
     fn offset_is_logical_not_physical_after_compact() {
         let mut cache = SlidingKVCache::new(4);
-        for _ in 0..10 {
-            let (k, v) = fake_kv(1);
-            cache.update_and_fetch(k, v).unwrap();
-            cache.compact_to_last_n(4).unwrap();
-        }
+        run_decode_steps(&mut cache, 10, 4);
         assert_eq!(cache.offset(), 10, "logical offset must reflect all tokens");
         assert_eq!(cache.physical_offset(), 4, "physical capped at window post-compact");
+        // The surviving entries must be the *last* window positions, in order.
+        let (k, v) = cache.current_kv().unwrap();
+        assert_eq!(stamped_positions(&k), vec![6.0, 7.0, 8.0, 9.0]);
+        assert_eq!(stamped_positions(&v), vec![6.0, 7.0, 8.0, 9.0]);
     }
 
     #[test]
@@ -230,34 +255,45 @@ mod tests {
         // return the full buffer so the current SDPA sees prior context
         // (critical for chunked prefill correctness — see method docs).
         let mut cache = SlidingKVCache::new(4);
-        for _ in 0..3 {
-            let (k, v) = fake_kv(1);
+        for pos in 0..3 {
+            let (k, v) = pos_kv(pos, 1);
             cache.update_and_fetch(k, v).unwrap();
         }
         assert_eq!(cache.physical_offset(), 3);
         // 4th update — still <= window, no truncation.
-        let (k, v) = fake_kv(1);
+        let (k, v) = pos_kv(3, 1);
         let (out, _) = cache.update_and_fetch(k, v).unwrap();
         assert_eq!(out.shape()[2], 4);
         // 5th update — past window; without an explicit compact call the
         // buffer keeps growing (this is the intended hand-off to the caller).
-        let (k, v) = fake_kv(1);
+        let (k, v) = pos_kv(4, 1);
         let (out, _) = cache.update_and_fetch(k, v).unwrap();
         assert_eq!(out.shape()[2], 5, "no in-line truncation");
         assert_eq!(cache.physical_offset(), 5);
+        assert_eq!(
+            stamped_positions(&out),
+            vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            "appends preserve order with no dropped positions"
+        );
     }
 
     #[test]
     fn compact_to_last_n_keeps_tail_of_correct_length() {
         let mut cache = SlidingKVCache::new(4);
-        for _ in 0..7 {
-            let (k, v) = fake_kv(1);
+        for pos in 0..7 {
+            let (k, v) = pos_kv(pos, 1);
             cache.update_and_fetch(k, v).unwrap();
         }
         assert_eq!(cache.physical_offset(), 7);
         cache.compact_to_last_n(4).unwrap();
         assert_eq!(cache.physical_offset(), 4);
         assert_eq!(cache.offset(), 7, "logical offset preserved across compact");
+        let (k, _) = cache.current_kv().unwrap();
+        assert_eq!(
+            stamped_positions(&k),
+            vec![3.0, 4.0, 5.0, 6.0],
+            "compaction keeps the most recent positions, not the oldest"
+        );
     }
 
     #[test]
@@ -267,40 +303,53 @@ mod tests {
         // This sequence preserves the early-query window for L > 1.
         let mut cache = SlidingKVCache::new(8);
         // Chunk 1 (5 tokens) — under window.
-        let (k1, v1) = fake_kv(5);
+        let (k1, v1) = pos_kv(0, 5);
         cache.update_and_fetch(k1, v1).unwrap();
         cache.compact_to_last_n(8).unwrap();
         assert_eq!(cache.physical_offset(), 5);
         // Chunk 2 (6 tokens) — buffer grows to 11 (5 + 6); SDPA sees all
         // 11 so the first query of chunk 2 can attend to chunk 1.
-        let (k2, v2) = fake_kv(6);
+        let (k2, v2) = pos_kv(5, 6);
         let (out, _) = cache.update_and_fetch(k2, v2).unwrap();
         assert_eq!(
             out.shape()[2],
             11,
             "buffer must include both chunks for SDPA correctness"
         );
+        assert_eq!(
+            stamped_positions(&out),
+            (0..11).map(|p| p as f32).collect::<Vec<_>>(),
+            "SDPA sees both chunks contiguously, oldest first"
+        );
         // Caller compacts AFTER SDPA — buffer bounded for next forward.
         cache.compact_to_last_n(8).unwrap();
         assert_eq!(cache.physical_offset(), 8);
         assert_eq!(cache.offset(), 11);
+        let (k, _) = cache.current_kv().unwrap();
+        assert_eq!(
+            stamped_positions(&k),
+            (3..11).map(|p| p as f32).collect::<Vec<_>>(),
+            "post-SDPA compaction drops exactly the oldest positions"
+        );
     }
 
     #[test]
     fn compact_with_n_geq_buffer_is_noop() {
         let mut cache = SlidingKVCache::new(8);
-        let (k, v) = fake_kv(3);
+        let (k, v) = pos_kv(0, 3);
         cache.update_and_fetch(k, v).unwrap();
         cache.compact_to_last_n(8).unwrap();
         assert_eq!(cache.physical_offset(), 3);
         cache.compact_to_last_n(100).unwrap();
         assert_eq!(cache.physical_offset(), 3);
+        let (k, _) = cache.current_kv().unwrap();
+        assert_eq!(stamped_positions(&k), vec![0.0, 1.0, 2.0], "contents untouched");
     }
 
     #[test]
     fn single_chunk_larger_than_window_returns_full_chunk_until_compact() {
         let mut cache = SlidingKVCache::new(4);
-        let (k, v) = fake_kv(10);
+        let (k, v) = pos_kv(0, 10);
         let (out, _) = cache.update_and_fetch(k, v).unwrap();
         assert_eq!(
             out.shape()[2],
@@ -310,12 +359,18 @@ mod tests {
         cache.compact_to_last_n(4).unwrap();
         assert_eq!(cache.physical_offset(), 4);
         assert_eq!(cache.offset(), 10);
+        let (k, _) = cache.current_kv().unwrap();
+        assert_eq!(
+            stamped_positions(&k),
+            vec![6.0, 7.0, 8.0, 9.0],
+            "oversized first chunk compacts to its tail"
+        );
     }
 
     #[test]
     fn reset_clears_offsets_and_buffer() {
         let mut cache = SlidingKVCache::new(4);
-        let (k, v) = fake_kv(3);
+        let (k, v) = pos_kv(0, 3);
         cache.update_and_fetch(k, v).unwrap();
         cache.reset();
         assert_eq!(cache.offset(), 0);
@@ -325,9 +380,8 @@ mod tests {
 
     #[test]
     fn dtype_preserved_across_updates() {
-        let _ = Dtype::Float32; // touch import to suppress unused-import warnings on some builds
         let mut cache = SlidingKVCache::new(4);
-        let (k, v) = fake_kv(2);
+        let (k, v) = pos_kv(0, 2);
         let dtype = k.dtype();
         cache.update_and_fetch(k, v).unwrap();
         let (k2, _) = cache.current_kv().unwrap();

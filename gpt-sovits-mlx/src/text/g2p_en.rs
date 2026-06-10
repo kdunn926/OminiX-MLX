@@ -172,7 +172,7 @@ impl G2pEnConverter {
             "grapheme_ids" => grapheme_tensor
         ])?;
         let (_, hidden_data) = encoder_outputs["hidden"].try_extract_tensor::<f32>()?;
-        let mut hidden: Vec<f32> = hidden_data.iter().copied().collect();
+        let mut hidden: Vec<f32> = hidden_data.to_vec();
 
         // Run decoder autoregressively
         let mut prev_token = 2i64; // <s> token
@@ -208,7 +208,7 @@ impl G2pEnConverter {
 
             phoneme_indices.push(pred_idx);
             prev_token = pred_idx as i64;
-            hidden = new_hidden_data.iter().copied().collect();
+            hidden = new_hidden_data.to_vec();
         }
 
         // Convert indices to phoneme strings

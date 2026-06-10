@@ -422,11 +422,29 @@ impl DFlashDraftAttention {
         let noise_keys_t = self.rope.forward(&noise_keys, ctx_offset as i32)?;
 
         // K = [context_keys || noise_keys], V = [context_values || noise_values].
-        // No causal mask: draft positions attend bidirectionally to all keys.
+        // Draft positions attend bidirectionally within the block; sliding
+        // layers additionally need the same SWA mask the cached path
+        // (`forward_with_cache`) applies — without it this uncached forward
+        // silently ran full attention and diverged from the runtime path
+        // (including the parity harnesses built on it).
         let keys = concatenate_axis(&[&ctx_keys_t, &noise_keys_t], 2)?;
         let values = concatenate_axis(&[&ctx_values, &noise_values], 2)?;
 
-        let attn = grouped_gqa_sdpa(&q_t, &keys, &values, self.scale, None)?;
+        let mask_arr = if self.sliding_window.is_some() {
+            // `build_swa_mask` lays keys out as [0..offset) ++ block — that
+            // matches only when the draft block directly follows the context.
+            if ctx_offset as i32 != ctx_len {
+                return Err(Exception::custom(format!(
+                    "DFlashDraftAttention::forward: SWA layer requires \
+                     ctx_offset ({ctx_offset}) == ctx_len ({ctx_len})"
+                )));
+            }
+            self.build_swa_mask(q_len, ctx_len)?
+        } else {
+            None
+        };
+        let mask = mask_arr.as_ref().map(mlx_rs_core::SdpaMask::Array);
+        let attn = grouped_gqa_sdpa(&q_t, &keys, &values, self.scale, mask)?;
         let attn = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, q_len, self.n_heads * self.head_dim])?;

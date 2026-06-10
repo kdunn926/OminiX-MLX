@@ -1,6 +1,6 @@
 // Compare pretrained vs finetuned weight_g values (magnitude in weight normalization)
 use gpt_sovits_mlx::models::vits::load_vits_model;
-use mlx_rs::{Array, transforms::eval, module::ModuleParameters};
+use mlx_rs::{Array, transforms::eval};
 
 fn main() {
     println!("Testing VITS weight normalization statistics...\n");

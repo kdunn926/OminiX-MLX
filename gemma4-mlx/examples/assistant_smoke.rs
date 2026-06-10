@@ -26,11 +26,11 @@
 use std::env;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use mlx_rs::{random, transforms::eval, Array, Dtype};
 
 use gemma4_mlx::assistant::{
-    argmax_last, build_inputs_embeds, load_assistant_model, AssistantModel, LayerKind,
+    argmax_last, build_inputs_embeds, load_assistant_model, AssistantModel,
     SharedKvStates,
 };
 

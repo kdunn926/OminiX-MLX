@@ -30,7 +30,6 @@
 //! the fully-fused implementation; an above-baseline result is a lower
 //! bound on the algorithm's real-world benefit.
 
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use mlx_rs::{

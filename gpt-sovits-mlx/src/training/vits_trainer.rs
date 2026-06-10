@@ -17,7 +17,7 @@ use mlx_rs::{
     array,
     builder::Builder,
     error::Exception,
-    module::{Module, ModuleParameters},
+    module::ModuleParameters,
     nn,
     ops::indexing::IndexOp,
     optimizers::{AdamW, AdamWBuilder, Optimizer, clip_grad_norm},
@@ -30,20 +30,18 @@ fn has_invalid_values(arr: &Array) -> bool {
     // Use MLX ops to check for NaN/Inf efficiently
     if let Ok(has_nan) = mlx_rs::ops::is_nan(arr) {
         if let Ok(any_nan) = mlx_rs::ops::any(&has_nan, None) {
-            if let Ok(_) = eval([&any_nan]) {
-                if any_nan.item::<bool>() {
+            if eval([&any_nan]).is_ok()
+                && any_nan.item::<bool>() {
                     return true;
                 }
-            }
         }
     }
     if let Ok(has_inf) = mlx_rs::ops::is_inf(arr) {
         if let Ok(any_inf) = mlx_rs::ops::any(&has_inf, None) {
-            if let Ok(_) = eval([&any_inf]) {
-                if any_inf.item::<bool>() {
+            if eval([&any_inf]).is_ok()
+                && any_inf.item::<bool>() {
                     return true;
                 }
-            }
         }
     }
     false
@@ -62,7 +60,7 @@ fn has_invalid_gradients_cow(gradients: &std::collections::HashMap<std::rc::Rc<s
 use crate::{
     error::Error,
     models::{
-        discriminator::{MultiPeriodDiscriminator, MPDConfig, losses as disc_losses},
+        discriminator::{MultiPeriodDiscriminator, MPDConfig},
         vits::{SynthesizerTrn, VITSConfig, load_vits_model},
     },
     audio::{MelConfig, mel_spectrogram_mlx, spec_to_mel, slice_mel_segments},
@@ -84,8 +82,8 @@ fn slice_segments_by_ids(
     hop_length: i32,
     segment_size: i32,
 ) -> Result<Array, Error> {
-    let batch = audio.dim(0) as i32;
-    let audio_len = audio.dim(2) as i32;
+    let batch = audio.dim(0);
+    let audio_len = audio.dim(2);
 
     let mut slices = Vec::with_capacity(batch as usize);
     for b in 0..batch {
@@ -397,7 +395,7 @@ impl VITSTrainer {
     /// - flow: flow transformations
     /// - quantizer: VQ codebook (pretrained)
     pub fn freeze_non_decoder_layers(&mut self) {
-        use mlx_rs::module::Module;
+        
 
         // Freeze the entire generator first (recursive = true)
         self.generator.freeze_parameters(true);
@@ -590,8 +588,7 @@ impl VITSTrainer {
             .map_err(|e| Error::Message(format!("D optimizer update failed: {}", e)))?;
 
         // Evaluate updated parameters
-        let params: Vec<_> = discriminator.trainable_parameters().flatten()
-            .into_iter().map(|(_, v)| v.clone()).collect();
+        let params: Vec<_> = discriminator.trainable_parameters().flatten().into_values().cloned().collect();
         eval(params.iter()).map_err(|e| Error::Message(e.to_string()))?;
 
         // Put discriminator and optimizer back
@@ -675,8 +672,8 @@ impl VITSTrainer {
 
                 // Python: y = slice_segments(y, ids_slice * hop_length, segment_size)
                 // Slice FULL audio at the SAME position as the generated segment
-                let batch = audio_f.dim(0) as i32;
-                let audio_len = audio_f.dim(2) as i32;
+                let batch = audio_f.dim(0);
+                let audio_len = audio_f.dim(2);
                 let mut slices = Vec::with_capacity(batch as usize);
                 for b in 0..batch {
                     let start_frame: i32 = ids_slice.index(b).item();
@@ -810,8 +807,7 @@ impl VITSTrainer {
         }
 
         // Evaluate updated parameters
-        let params: Vec<_> = generator.trainable_parameters().flatten()
-            .into_iter().map(|(_, v)| v.clone()).collect();
+        let params: Vec<_> = generator.trainable_parameters().flatten().into_values().cloned().collect();
         eval(params.iter()).map_err(|e| Error::Message(e.to_string()))?;
 
         // Put generator, discriminator, and optimizer back
@@ -954,12 +950,12 @@ impl VITSTrainer {
             let key = key.replace("ref_enc.slf_attn_v", "ref_enc.slf_attn.w_vs");
             let key = key.replace("ref_enc.slf_attn_fc", "ref_enc.slf_attn.fc");
             // Handle ref_enc.fc carefully - don't match ref_enc.slf_attn.fc
-            let key = if key == "ref_enc.fc.weight" || key == "ref_enc.fc.bias" {
+            
+            if key == "ref_enc.fc.weight" || key == "ref_enc.fc.bias" {
                 key.replace("ref_enc.fc", "ref_enc.fc.fc")
             } else {
                 key
-            };
-            key
+            }
         };
 
         // Get generator trainable parameters and convert conv weights
@@ -1023,7 +1019,7 @@ impl VITSTrainer {
 
             let losses = self.train_step(&batch)?;
 
-            if self.step % self.config.log_every == 0 {
+            if self.step.is_multiple_of(self.config.log_every) {
                 println!(
                     "Step {}: D={:.4}, G={:.4}, FM={:.4}, Mel={:.4}, KL={:.4}, Commit={:.4}, Reg={:.4}, Total={:.4}",
                     self.step,
@@ -1038,7 +1034,7 @@ impl VITSTrainer {
                 );
             }
 
-            if self.step % self.config.save_every == 0 && self.step > 0 {
+            if self.step.is_multiple_of(self.config.save_every) && self.step > 0 {
                 let ckpt_path = format!("checkpoint_{}.safetensors", self.step);
                 self.save_checkpoint(&ckpt_path)?;
                 println!("Saved checkpoint to {}", ckpt_path);

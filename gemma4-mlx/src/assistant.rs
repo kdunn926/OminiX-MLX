@@ -187,8 +187,7 @@ impl AssistantAttention {
                 .map(|v| v != "1")
                 .unwrap_or(true)
         {
-            use mlx_rs::ops::indexing::{Ellipsis, IndexOp, NewAxis};
-            let _ = NewAxis;
+            use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
             let w = self.sliding_window;
             (
                 shared_k.index((Ellipsis, -w.., ..)),

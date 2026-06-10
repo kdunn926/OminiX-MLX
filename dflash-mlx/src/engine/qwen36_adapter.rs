@@ -347,7 +347,7 @@ impl Qwen36TargetAdapter {
 
 impl TargetModel for Qwen36TargetAdapter {
     fn prefill(&mut self, prompt: &Array) -> Result<Array, Exception> {
-        let PREFILL_CHUNK: i32 = std::env::var("QWEN36_PREFILL_CHUNK")
+        let prefill_chunk: i32 = std::env::var("QWEN36_prefill_chunk")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n: &i32| n > 0)
@@ -363,7 +363,7 @@ impl TargetModel for Qwen36TargetAdapter {
         self.gdn_snapshots.clear();
 
         let seq_len = prompt.shape()[1];
-        let logits = if seq_len > PREFILL_CHUNK {
+        let logits = if seq_len > prefill_chunk {
             if !self.target_layer_ids.is_empty() {
                 let (logits, captures) = self.model.forward_last_logits_with_hidden_capture(
                     prompt,
@@ -376,7 +376,7 @@ impl TargetModel for Qwen36TargetAdapter {
                 let mut pos = 0;
                 let mut last_logits = None;
                 while pos < seq_len {
-                    let end = (pos + PREFILL_CHUNK).min(seq_len);
+                    let end = (pos + prefill_chunk).min(seq_len);
                     let chunk = prompt.index((.., pos..end));
                     let logits = self.model.forward_last_logits(&chunk, &mut self.cache)?;
                     // Same chunk-eval gating as qwen3.6 AR path:

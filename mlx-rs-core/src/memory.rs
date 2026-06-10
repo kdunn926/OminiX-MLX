@@ -35,6 +35,7 @@ impl MemoryStats {
 
 /// Key Metal/MLX device limits for Apple Silicon.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct DeviceInfo {
     /// Total physical RAM (= unified GPU memory on Apple Silicon).
     pub memory_size: usize,
@@ -114,15 +115,6 @@ unsafe fn read_size_key(info: mlx_sys::mlx_device_info, key: &core::ffi::CStr) -
     value
 }
 
-impl Default for DeviceInfo {
-    fn default() -> Self {
-        Self {
-            memory_size: 0,
-            max_recommended_working_set_size: 0,
-            max_buffer_length: 0,
-        }
-    }
-}
 
 /// Free MLX's reclaimable tensor cache.
 ///

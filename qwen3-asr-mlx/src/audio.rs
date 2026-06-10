@@ -85,6 +85,22 @@ impl MelFrontend {
             ));
         }
 
+        // WhisperFeatureExtractor uses center=True: reflect-pad n_fft/2 on
+        // both sides so frame k is centered on sample k*hop. Without it the
+        // mel was time-shifted by n_fft/2 (12.5 ms) and ~2 frames short of
+        // the reference.
+        let pad = n_fft / 2;
+        let mut padded: Vec<f32> = Vec::with_capacity(samples.len() + 2 * pad);
+        for i in (1..=pad).rev() {
+            padded.push(samples[i.min(samples.len() - 1)]);
+        }
+        padded.extend_from_slice(samples);
+        for i in 1..=pad {
+            let idx = samples.len().saturating_sub(1).saturating_sub(i.min(samples.len() - 1));
+            padded.push(samples[idx]);
+        }
+        let samples: &[f32] = &padded;
+
         let n_frames = 1 + (samples.len() - n_fft) / hop_length;
 
         let mut fft_buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); n_fft];
@@ -161,7 +177,9 @@ pub fn load_wav(path: impl AsRef<std::path::Path>) -> Result<(Vec<f32>, u32)> {
 
     let samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
-            let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
+            // i64: `1i32 << 31` overflows to i32::MIN for 32-bit PCM,
+            // flipping the sign of every sample.
+            let max_val = (1_i64 << (spec.bits_per_sample - 1)) as f32;
             reader
                 .samples::<i32>()
                 .map(|s| s.unwrap_or(0) as f32 / max_val)
@@ -170,11 +188,14 @@ pub fn load_wav(path: impl AsRef<std::path::Path>) -> Result<(Vec<f32>, u32)> {
         hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
     };
 
-    // Stereo to mono
-    let samples = if spec.channels == 2 {
+    // Downmix to mono by averaging across however many channels the file
+    // has (treating >2-channel audio as mono would interleave channels
+    // into garbage features).
+    let samples = if spec.channels > 1 {
+        let n = spec.channels as usize;
         samples
-            .chunks(2)
-            .map(|chunk| (chunk[0] + chunk.get(1).copied().unwrap_or(0.0)) / 2.0)
+            .chunks(n)
+            .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
             .collect()
     } else {
         samples

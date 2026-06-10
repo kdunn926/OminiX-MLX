@@ -249,6 +249,12 @@ fn create_residual_rmsnorm_kernel() -> MetalKernel {
 /// * `x` - Attention/MLP output [B, T, D]
 /// * `residual` - Residual connection input [B, T, D]
 /// * `weight` - RmsNorm weight [D]
+/// Fused residual-add + RMSNorm.
+///
+/// NOTE: the kernel hardcodes eps = 1e-6 (Metal custom kernels can't take
+/// f32 template args). All shipped Qwen3-TTS configs use rms_norm_eps =
+/// 1e-6; if a future checkpoint differs, callers must fall back to the
+/// unfused norm path.
 pub fn fused_residual_rmsnorm(
     x: &Array,
     residual: &Array,

@@ -5,22 +5,61 @@
 
 use gpt_sovits_mlx::voice_clone::{VoiceCloner, VoiceClonerConfig, SynthesisOptions};
 use gpt_sovits_mlx::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Test helper: check if default model paths exist
-fn models_available() -> bool {
-    let config = VoiceClonerConfig::default();
-    Path::new(&config.t2s_weights).exists()
-        && Path::new(&config.bert_weights).exists()
-        && Path::new(&config.vits_weights).exists()
+/// Root directory for test models.
+///
+/// Reads `OMINIX_MODELS_DIR`, falling back to `~/.OminiX/models`.
+fn model_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("OMINIX_MODELS_DIR") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".OminiX/models")
 }
 
-/// Test helper: check if reference audio exists
+/// Path to the reference audio used by the model-gated tests
+fn reference_audio_path() -> PathBuf {
+    model_root().join("moyoyo/ref_audios/doubao_ref_mix_new.wav")
+}
+
+/// Test helper: check if default model paths exist; prints a loud skip
+/// message (with the missing paths) when they don't.
+fn models_available() -> bool {
+    let config = VoiceClonerConfig::default();
+    let missing: Vec<&String> = [&config.t2s_weights, &config.bert_weights, &config.vits_weights]
+        .into_iter()
+        .filter(|p| !Path::new(p.as_str()).exists())
+        .collect();
+    if missing.is_empty() {
+        true
+    } else {
+        eprintln!(
+            "=== SKIPPING test: model files not available: {:?} \
+             (set GPT_SOVITS_MODEL_DIR or place models under ~/.OminiX/models/gpt-sovits-mlx) ===",
+            missing
+        );
+        false
+    }
+}
+
+/// Test helper: check if reference audio exists; prints a loud skip message
+/// when it doesn't.
 fn reference_audio_available() -> bool {
-    Path::new("/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav").exists()
+    let path = reference_audio_path();
+    if path.exists() {
+        true
+    } else {
+        eprintln!(
+            "=== SKIPPING test: reference audio not found at {} \
+             (set OMINIX_MODELS_DIR to override the model root) ===",
+            path.display()
+        );
+        false
+    }
 }
 
 // ============================================================================
@@ -48,7 +87,6 @@ fn test_config_default() {
 #[test]
 fn test_error_empty_input() {
     if !models_available() {
-        eprintln!("Skipping test: models not available");
         return;
     }
 
@@ -69,7 +107,6 @@ fn test_error_empty_input() {
 #[test]
 fn test_error_reference_not_set() {
     if !models_available() {
-        eprintln!("Skipping test: models not available");
         return;
     }
 
@@ -84,7 +121,6 @@ fn test_error_reference_not_set() {
 #[test]
 fn test_error_text_too_long() {
     if !models_available() {
-        eprintln!("Skipping test: models not available");
         return;
     }
 
@@ -135,16 +171,14 @@ fn test_synthesis_options_with_cancel_token() {
 #[ignore = "Requires model files and reference audio"]
 fn test_synthesize_chinese() {
     if !models_available() || !reference_audio_available() {
-        eprintln!("Skipping test: models or reference audio not available");
         return;
     }
 
     let config = VoiceClonerConfig::default();
     let mut cloner = VoiceCloner::new(config).expect("Failed to create VoiceCloner");
 
-    cloner.set_reference_audio(
-        "/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav"
-    ).expect("Failed to set reference audio");
+    cloner.set_reference_audio(reference_audio_path())
+        .expect("Failed to set reference audio");
 
     let audio = cloner.synthesize("你好世界").expect("Synthesis failed");
 
@@ -168,16 +202,14 @@ fn test_synthesize_chinese() {
 #[ignore = "Requires model files and reference audio"]
 fn test_synthesize_mixed_language() {
     if !models_available() || !reference_audio_available() {
-        eprintln!("Skipping test: models or reference audio not available");
         return;
     }
 
     let config = VoiceClonerConfig::default();
     let mut cloner = VoiceCloner::new(config).expect("Failed to create VoiceCloner");
 
-    cloner.set_reference_audio(
-        "/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav"
-    ).expect("Failed to set reference audio");
+    cloner.set_reference_audio(reference_audio_path())
+        .expect("Failed to set reference audio");
 
     // Mixed Chinese and English
     let audio = cloner.synthesize("Hello世界，这是一个test。").expect("Synthesis failed");
@@ -190,16 +222,14 @@ fn test_synthesize_mixed_language() {
 #[ignore = "Requires model files and reference audio"]
 fn test_synthesize_with_cancellation() {
     if !models_available() || !reference_audio_available() {
-        eprintln!("Skipping test: models or reference audio not available");
         return;
     }
 
     let config = VoiceClonerConfig::default();
     let mut cloner = VoiceCloner::new(config).expect("Failed to create VoiceCloner");
 
-    cloner.set_reference_audio(
-        "/Users/yuechen/.OminiX/models/moyoyo/ref_audios/doubao_ref_mix_new.wav"
-    ).expect("Failed to set reference audio");
+    cloner.set_reference_audio(reference_audio_path())
+        .expect("Failed to set reference audio");
 
     // Create a pre-cancelled token
     let cancel_token = Arc::new(AtomicBool::new(true));

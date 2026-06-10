@@ -1294,6 +1294,7 @@ fn create_tq_sdpa_4bit_online_kernel() -> MetalKernel {
 /// contract as `tq_sdpa_4bit` but uses online softmax to handle
 /// arbitrary kv_len (no shared-mem scores buffer). D_CHUNK is fixed at
 /// 64 so one thread owns one output dim.
+#[allow(clippy::too_many_arguments)] // mirrors the kernel ABI
 pub fn tq_sdpa_4bit_online(
     q: &Array,
     packed_k: &Array,
@@ -1412,6 +1413,7 @@ pub fn tq_sdpa_4bit_online(
 /// Variant of `tq_sdpa_4bit_online` that uses `simdgroup_matrix<float, 8, 8>`
 /// intrinsics for the V matmul phase. Same input/output contract; only the
 /// FMA loop differs. Selected when `TURBOQUANT_SIMD_MATMUL=1`.
+#[allow(clippy::too_many_arguments)] // mirrors the kernel ABI
 pub fn tq_sdpa_4bit_online_simd(
     q: &Array,
     packed_k: &Array,
@@ -1589,6 +1591,7 @@ pub const TQ_SDPA_MAX_KV: i32 = 2048;
 /// `mask` is optional; pass `None` for no mask, or a `[KV]` f32 tensor
 /// of additive log-prob mask values that broadcasts over all query
 /// heads / batches.
+#[allow(clippy::too_many_arguments)] // mirrors the kernel ABI
 pub fn tq_sdpa_4bit(
     q: &Array,
     packed_k: &Array,
@@ -1671,9 +1674,6 @@ pub fn tq_sdpa_4bit(
                 config, cname.as_ptr(), value,
             );
         }
-        // Pre-scale Q on the host (kernels don't accept f32 template args).
-        // Done after the dtype conversion above using mlx ops.
-        let _ = scale;
         // 2-D grid: x picks (b, h_q), y picks d_chunk_id.
         // Total threadgroups = B * Hq * n_d_chunks (e.g. 1*32*8 = 256
         // for Gemma4-26B sliding heads — proper GPU saturation vs the
@@ -2928,22 +2928,24 @@ const MODULATE_KERNEL_SOURCE: &str = r#"
     uint tid = thread_position_in_threadgroup.x;
     constexpr uint THREADS = 256;
 
-    // Shared memory for parallel reduction
-    threadgroup T shared_sum[256];
-    threadgroup T shared_sum_sq[256];
+    // Shared memory for parallel reduction. Accumulate in float regardless
+    // of T: a bf16 sum over thousands of elements loses essentially all
+    // mantissa, and an f16 sum-of-squares can overflow to inf → NaN.
+    threadgroup float shared_sum[256];
+    threadgroup float shared_sum_sq[256];
 
     // Initialize shared memory to 0 (all threads do this)
-    shared_sum[tid] = T(0);
-    shared_sum_sq[tid] = T(0);
+    shared_sum[tid] = 0.0f;
+    shared_sum_sq[tid] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Each thread accumulates partial sums over its portion of the row
-    T local_sum = T(0);
-    T local_sum_sq = T(0);
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
 
     uint base = row * dim;
     for (uint i = tid; i < dim; i += THREADS) {
-        T val = x[base + i];
+        float val = float(x[base + i]);
         local_sum += val;
         local_sum_sq += val * val;
     }
@@ -2973,20 +2975,22 @@ const MODULATE_KERNEL_SOURCE: &str = r#"
 
     // ALL threads read the final sums and compute mean/inv_std locally
     // (avoids issues with scalar threadgroup variable broadcast)
-    T sum_val = shared_sum[0];
-    T sum_sq_val = shared_sum_sq[0];
-    T mean = sum_val / T(dim);
-    T var = sum_sq_val / T(dim) - mean * mean;
-    // Clamp variance to avoid NaN from numerical precision issues
-    var = max(var, T(0));
-    T inv_std = rsqrt(var + T(1e-6));
+    float sum_val = shared_sum[0];
+    float sum_sq_val = shared_sum_sq[0];
+    float mean = sum_val / float(dim);
+    float var = sum_sq_val / float(dim) - mean * mean;
+    // Clamp variance: E[x^2] - mean^2 can go slightly negative from
+    // floating-point cancellation when var << mean^2.
+    var = max(var, 0.0f);
+    float inv_std = rsqrt(var + 1e-6f);
 
-    // Apply normalization and modulation: (1 + scale) * normalized + shift
+    // Apply normalization and modulation: (1 + scale) * normalized + shift.
+    // Math in float, single cast back to T on store.
     for (uint i = tid; i < dim; i += THREADS) {
-        T normalized = (x[base + i] - mean) * inv_std;
-        T scale_val = scale[i];
-        T shift_val = shift[i];
-        out[base + i] = (T(1) + scale_val) * normalized + shift_val;
+        float normalized = (float(x[base + i]) - mean) * inv_std;
+        float scale_val = float(scale[i]);
+        float shift_val = float(shift[i]);
+        out[base + i] = T((1.0f + scale_val) * normalized + shift_val);
     }
 "#;
 
@@ -3380,6 +3384,17 @@ pub fn fused_swiglu(x: &Array, gate: &Array) -> Result<Array, Exception> {
     let kernel = SWIGLU_KERNEL.get_or_init(create_swiglu_kernel);
 
     let shape = x.shape();
+    // The kernel indexes `gate[elem]` for every element of `x` with no
+    // bounds check — a smaller `gate` would be a silent OOB GPU read.
+    if gate.shape() != shape || gate.dtype() != x.dtype() {
+        return Err(Exception::custom(format!(
+            "fused_swiglu: x (shape {:?}, {:?}) and gate (shape {:?}, {:?}) must match",
+            shape,
+            x.dtype(),
+            gate.shape(),
+            gate.dtype()
+        )));
+    }
     let total_elements: usize = shape.iter().map(|&s| s as usize).product();
     let dtype: u32 = x.dtype().into();
 
@@ -3394,7 +3409,7 @@ pub fn fused_swiglu(x: &Array, gate: &Array) -> Result<Array, Exception> {
         mlx_sys::mlx_fast_metal_kernel_config_set_grid(config, total_elements as i32, 1, 1);
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1);
 
-        let shape_i32: Vec<i32> = shape.iter().map(|&s| s as i32).collect();
+        let shape_i32: Vec<i32> = shape.to_vec();
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config, shape_i32.as_ptr(), shape.len(), dtype);
 
@@ -3456,8 +3471,8 @@ pub fn fused_modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array, 
         return Err(Exception::custom("fused_modulate requires at least 2D input"));
     }
 
-    let dim = shape[shape.len() - 1] as i32;
-    let num_rows: i32 = shape.iter().take(shape.len() - 1).map(|&s| s as i32).product();
+    let dim = shape[shape.len() - 1];
+    let num_rows: i32 = shape.iter().take(shape.len() - 1).copied().product();
     let dtype: u32 = x.dtype().into();
 
     // Ensure shift and scale are contiguous [dim] arrays
@@ -3470,6 +3485,16 @@ pub fn fused_modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array, 
         return Err(Exception::custom(format!(
             "fused_modulate: shift/scale dim {} doesn't match x dim {}",
             shift_flat.shape()[0], dim
+        )));
+    }
+    // The kernel reads shift/scale as the same element type T as x; a dtype
+    // mismatch would reinterpret (or over-read) the buffers.
+    if shift_flat.dtype() != x.dtype() || scale_flat.dtype() != x.dtype() {
+        return Err(Exception::custom(format!(
+            "fused_modulate: shift ({:?}) and scale ({:?}) must match x dtype ({:?})",
+            shift_flat.dtype(),
+            scale_flat.dtype(),
+            x.dtype()
         )));
     }
 
@@ -3495,7 +3520,7 @@ pub fn fused_modulate(x: &Array, shift: &Array, scale: &Array) -> Result<Array, 
         mlx_sys::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1);
 
         // Output shape same as input
-        let shape_i32: Vec<i32> = shape.iter().map(|&s| s as i32).collect();
+        let shape_i32: Vec<i32> = shape.to_vec();
         mlx_sys::mlx_fast_metal_kernel_config_add_output_arg(
             config, shape_i32.as_ptr(), shape.len(), dtype);
 
@@ -3564,11 +3589,11 @@ pub fn deltanet_recurrence(
             q_shape, v_shape
         )));
     }
-    let b = q_shape[0] as i32;
-    let h = q_shape[1] as i32;
-    let l = q_shape[2] as i32;
-    let kdim = q_shape[3] as i32;
-    let vdim = v_shape[3] as i32;
+    let b = q_shape[0];
+    let h = q_shape[1];
+    let l = q_shape[2];
+    let kdim = q_shape[3];
+    let vdim = v_shape[3];
     if kdim % 32 != 0 || vdim == 0 {
         return Err(Exception::custom(format!(
             "deltanet_recurrence: K must be a multiple of 32 (got K={kdim}, V={vdim})"
@@ -3762,11 +3787,11 @@ pub fn deltanet_with_tape(
             q_shape, v_shape
         )));
     }
-    let b = q_shape[0] as i32;
-    let h = q_shape[1] as i32;
-    let l = q_shape[2] as i32;
-    let kdim = q_shape[3] as i32;
-    let vdim = v_shape[3] as i32;
+    let b = q_shape[0];
+    let h = q_shape[1];
+    let l = q_shape[2];
+    let kdim = q_shape[3];
+    let vdim = v_shape[3];
     if kdim % 32 != 0 || vdim == 0 {
         return Err(Exception::custom(format!(
             "deltanet_with_tape: K must be a multiple of 32 (got K={kdim}, V={vdim})"
@@ -3875,11 +3900,11 @@ pub fn deltanet_tape_replay(
             tape_shape, k_shape
         )));
     }
-    let b = tape_shape[0] as i32;
-    let h = tape_shape[1] as i32;
-    let l = tape_shape[2] as i32;
-    let vdim = tape_shape[3] as i32;
-    let kdim = k_shape[3] as i32;
+    let b = tape_shape[0];
+    let h = tape_shape[1];
+    let l = tape_shape[2];
+    let vdim = tape_shape[3];
+    let kdim = k_shape[3];
     if k_shape[0] != b || k_shape[1] != h || k_shape[2] != l {
         return Err(Exception::custom(format!(
             "deltanet_tape_replay: tape/k mismatch tape={:?} k={:?}",
@@ -4713,7 +4738,7 @@ pub fn fused_norm_add_norm(
             residual.shape()
         )));
     }
-    if weight_post_attn.shape() != &[h] || weight_pre_ff.shape() != &[h] {
+    if weight_post_attn.shape() != [h] || weight_pre_ff.shape() != [h] {
         return Err(Exception::custom(format!(
             "fused_norm_add_norm: weights must be [H={h}]; got {:?} / {:?}",
             weight_post_attn.shape(),
@@ -5027,6 +5052,164 @@ mod tests {
     use super::*;
     use mlx_rs::ops::indexing::IndexOp;
     use mlx_rs::Array;
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        let a = a.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        let b = b.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+        a.as_slice::<f32>()
+            .iter()
+            .zip(b.as_slice::<f32>().iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// fused_swiglu parity vs the silu(gate) · x op chain, f32 and bf16.
+    #[test]
+    fn fused_swiglu_matches_reference() {
+        for dtype in [mlx_rs::Dtype::Float32, mlx_rs::Dtype::Bfloat16] {
+            let n = 8 * 512;
+            let x_data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0137).sin() * 2.0).collect();
+            let g_data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.0091).cos() * 3.0).collect();
+            let x = Array::from_slice(&x_data, &[8, 512]).as_dtype(dtype).unwrap();
+            let g = Array::from_slice(&g_data, &[8, 512]).as_dtype(dtype).unwrap();
+
+            let sig = mlx_rs::ops::sigmoid(&g).unwrap();
+            let reference = g.multiply(&sig).unwrap().multiply(&x).unwrap();
+            let fused = fused_swiglu(&x, &g).unwrap();
+            mlx_rs::transforms::eval([&reference, &fused]).unwrap();
+
+            let diff = max_abs_diff(&reference, &fused);
+            let tol = if dtype == mlx_rs::Dtype::Float32 { 1e-5 } else { 5e-2 };
+            assert!(diff < tol, "{dtype:?}: max_abs {diff} >= {tol}");
+        }
+    }
+
+    #[test]
+    fn fused_swiglu_rejects_mismatched_inputs() {
+        let x = mlx_rs::ops::zeros::<f32>(&[8, 512]).unwrap();
+        let g_short = mlx_rs::ops::zeros::<f32>(&[8, 256]).unwrap();
+        assert!(
+            fused_swiglu(&x, &g_short).is_err(),
+            "smaller gate must error, not read out of bounds"
+        );
+        let g_f16 = mlx_rs::ops::zeros::<f32>(&[8, 512])
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+        assert!(fused_swiglu(&x, &g_f16).is_err(), "dtype mismatch must error");
+    }
+
+    /// fused_modulate parity vs LayerNorm(no affine) → (1+scale)·x + shift.
+    /// The bf16 case exercises the float-accumulation path: with a T-typed
+    /// accumulator, summing dim=2816 values centered at 3.0 in bf16 loses
+    /// the mean entirely (this is a regression test for that bug).
+    #[test]
+    fn fused_modulate_matches_reference() {
+        for dtype in [mlx_rs::Dtype::Float32, mlx_rs::Dtype::Bfloat16] {
+            let (n, h) = (4_i32, 2816_i32);
+            // Offset well away from zero so naive low-precision accumulation
+            // visibly corrupts the mean.
+            let x_data: Vec<f32> = (0..n * h)
+                .map(|i| 3.0 + ((i as f32) * 0.013).sin() * 0.5)
+                .collect();
+            let shift_data: Vec<f32> = (0..h).map(|i| ((i as f32) * 0.01).cos() * 0.2).collect();
+            let scale_data: Vec<f32> = (0..h).map(|i| ((i as f32) * 0.02).sin() * 0.3).collect();
+            let x = Array::from_slice(&x_data, &[n, h]).as_dtype(dtype).unwrap();
+            let shift = Array::from_slice(&shift_data, &[h]).as_dtype(dtype).unwrap();
+            let scale = Array::from_slice(&scale_data, &[h]).as_dtype(dtype).unwrap();
+
+            // f32 reference computed from the SAME (dtype-rounded) inputs.
+            let x_f = x.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            let shift_f = shift.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            let scale_f = scale.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+            let mean = mlx_rs::ops::mean_axis(&x_f, -1, true).unwrap();
+            let xc = x_f.subtract(&mean).unwrap();
+            let var = mlx_rs::ops::mean_axis(mlx_rs::ops::square(&xc).unwrap(), -1, true).unwrap();
+            let denom = mlx_rs::ops::sqrt(var.add(mlx_rs::array!(1e-6_f32)).unwrap()).unwrap();
+            let normalized = xc.divide(&denom).unwrap();
+            let one_plus_scale = scale_f.add(mlx_rs::array!(1.0_f32)).unwrap();
+            let reference = normalized
+                .multiply(&one_plus_scale)
+                .unwrap()
+                .add(&shift_f)
+                .unwrap();
+
+            let fused = fused_modulate(&x, &shift, &scale).unwrap();
+            mlx_rs::transforms::eval([&reference, &fused]).unwrap();
+
+            let diff = max_abs_diff(&reference, &fused);
+            let tol = if dtype == mlx_rs::Dtype::Float32 { 1e-4 } else { 5e-2 };
+            assert!(diff < tol, "{dtype:?}: max_abs {diff} >= {tol}");
+        }
+    }
+
+    /// per_position_rope vs an op-chain rotate-half reference, with
+    /// deliberately non-monotonic positions (DDTree siblings share one).
+    #[test]
+    fn per_position_rope_matches_reference() {
+        let (b, h, l, d) = (2_i32, 3_i32, 5_i32, 64_i32);
+        let half = d / 2;
+        let x_data: Vec<f32> = (0..b * h * l * d)
+            .map(|i| ((i as f32) * 0.0173).sin())
+            .collect();
+        let x = Array::from_slice(&x_data, &[b, h, l, d]);
+        let positions = Array::from_slice(&[7.0_f32, 3.0, 3.0, 12.0, 0.0], &[l]);
+        let inv_freq_data: Vec<f32> = (0..half)
+            .map(|i| 1.0 / 10000_f32.powf(2.0 * i as f32 / d as f32))
+            .collect();
+        let inv_freq = Array::from_slice(&inv_freq_data, &[half]);
+
+        // Reference: angles[l, half] = positions ⊗ inv_freq; rotate-half.
+        let angles = positions
+            .reshape(&[l, 1])
+            .unwrap()
+            .multiply(inv_freq.reshape(&[1, half]).unwrap())
+            .unwrap();
+        let cos = mlx_rs::ops::cos(&angles).unwrap().reshape(&[1, 1, l, half]).unwrap();
+        let sin = mlx_rs::ops::sin(&angles).unwrap().reshape(&[1, 1, l, half]).unwrap();
+        let x_lo = x.index((.., .., .., ..half));
+        let x_hi = x.index((.., .., .., half..));
+        let out_lo = x_lo
+            .multiply(&cos)
+            .unwrap()
+            .subtract(x_hi.multiply(&sin).unwrap())
+            .unwrap();
+        let out_hi = x_hi
+            .multiply(&cos)
+            .unwrap()
+            .add(x_lo.multiply(&sin).unwrap())
+            .unwrap();
+        let reference = mlx_rs::ops::concatenate_axis(&[&out_lo, &out_hi], -1).unwrap();
+
+        let fused = per_position_rope(&x, &positions, &inv_freq).unwrap();
+        mlx_rs::transforms::eval([&reference, &fused]).unwrap();
+
+        let diff = max_abs_diff(&reference, &fused);
+        assert!(diff < 1e-5, "max_abs {diff}");
+    }
+
+    /// kv_compact vs concat(prefix, take(window, idx)) — exact equality
+    /// (pure gather, no arithmetic).
+    #[test]
+    fn kv_compact_matches_reference() {
+        let (b, h, s, d) = (2_i32, 2_i32, 7_i32, 4_i32);
+        let data: Vec<f32> = (0..b * h * s * d).map(|i| i as f32).collect();
+        let in_buf = Array::from_slice(&data, &[b, h, s, d]);
+        let past = 3_i32;
+        let keep = Array::from_slice(&[1_i32, 3], &[2]);
+
+        let prefix = in_buf.index((.., .., ..past, ..));
+        let window = in_buf.index((.., .., past.., ..));
+        let kept = mlx_rs::ops::indexing::take_axis(&window, &keep, 2).unwrap();
+        let reference = mlx_rs::ops::concatenate_axis(&[&prefix, &kept], 2).unwrap();
+
+        let compacted = kv_compact(&in_buf, past, &keep).unwrap();
+        mlx_rs::transforms::eval([&reference, &compacted]).unwrap();
+
+        assert_eq!(compacted.shape(), reference.shape());
+        let diff = max_abs_diff(&reference, &compacted);
+        assert_eq!(diff, 0.0, "gather must be exact");
+    }
 
     /// T4 fused_norm_add_norm parity vs MLX op chain (rms_norm → add → rms_norm).
     #[test]

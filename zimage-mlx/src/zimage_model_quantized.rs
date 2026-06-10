@@ -164,21 +164,15 @@ impl QuantizedAttention {
             (k, v)
         };
 
-        // Scaled dot-product attention
-        let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
-        let attn = ops::matmul(&q, &k_t)?;
-        let attn = ops::multiply(&attn, &array!(self.scale))?;
-
-        // Apply mask if provided
-        let attn = if let Some(m) = mask {
-            ops::add(&attn, m)?
-        } else {
-            attn
-        };
-
-        // Softmax and apply to values
-        let attn = ops::softmax_axis(&attn, -1, None)?;
-        let out = ops::matmul(&attn, &v)?;
+        // Fused SDPA: avoids materializing the full [B, H, L, L] score
+        // tensor of the manual matmul→softmax→matmul chain.
+        let out = mlx_rs::fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            self.scale,
+            mask.map(mlx_rs::fast::ScaledDotProductAttentionMask::Array),
+        )?;
 
         // Transpose back and reshape
         let out = out.transpose_axes(&[0, 2, 1, 3])?;

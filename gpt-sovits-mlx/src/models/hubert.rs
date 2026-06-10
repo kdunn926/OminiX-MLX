@@ -382,7 +382,7 @@ impl Module<&Array> for PosConvEmbed {
         // With kernel_size=128 and padding=64, output has input_len+1 frames
         // Slice to match input length: h[:, :-1, :]
         let seq_len = x.shape()[1];
-        let h = h.index((.., ..seq_len as i32, ..));
+        let h = h.index((.., ..seq_len, ..));
 
         nn::gelu(&h)
     }
@@ -436,8 +436,8 @@ impl Module<&Array> for EncoderAttention {
 
     fn forward(&mut self, x: &Array) -> Result<Self::Output, Self::Error> {
         let shape = x.shape();
-        let batch = shape[0] as i32;
-        let seq_len = shape[1] as i32;
+        let batch = shape[0];
+        let seq_len = shape[1];
 
         // Project Q, K, V
         let q = self.q_proj.forward(x)?;
@@ -928,8 +928,8 @@ mod tests {
         // Output should be approximately 49 frames for 1 second
         assert_eq!(output.shape()[0], 1);
         assert_eq!(output.shape()[2], config.conv_dim);
-        let time_dim = output.shape()[1] as i32;
-        assert!(time_dim >= 40 && time_dim <= 60, "Expected ~49 frames, got {}", time_dim);
+        let time_dim = output.shape()[1];
+        assert!((40..=60).contains(&time_dim), "Expected ~49 frames, got {}", time_dim);
     }
 
     #[test]
@@ -973,7 +973,7 @@ mod tests {
         assert_eq!(output.shape()[0], 1);
         assert_eq!(output.shape()[2], 768);
         // Time dimension should be ~49 for 1 second
-        let time_dim = output.shape()[1] as i32;
-        assert!(time_dim >= 40 && time_dim <= 60, "Expected ~49 frames, got {}", time_dim);
+        let time_dim = output.shape()[1];
+        assert!((40..=60).contains(&time_dim), "Expected ~49 frames, got {}", time_dim);
     }
 }
