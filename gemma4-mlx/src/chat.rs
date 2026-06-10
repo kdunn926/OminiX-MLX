@@ -806,6 +806,12 @@ impl Gemma4ChatTemplate {
         while let Some(start_idx) = remaining.find(&self.tokens.tool_call_start) {
             let payload_start = start_idx + self.tokens.tool_call_start.len();
             let Some(end_rel) = remaining[payload_start..].find(&self.tokens.tool_call_end) else {
+                // No matching end marker — tokenizer stripped only `<tool_call|>`
+                // (asymmetric special-token stripping) or generation was truncated.
+                // Strip the orphaned start token here so it doesn't leak into
+                // content; the bare-form scanner below will still extract the
+                // `call:name{...}` payload that follows it.
+                remaining.replace_range(start_idx..payload_start, "");
                 break;
             };
             let payload_end = payload_start + end_rel;
@@ -827,6 +833,18 @@ impl Gemma4ChatTemplate {
         // into `parsed.content` (observed: gemma-4-12B via Hermes-gateway
         // emitting `call:terminal{...}` as visible text).
         tool_calls.extend(extract_bare_call_payloads(remaining, &self.tokens.escape));
+
+        // Safety: strip any surviving control-token stubs that neither the
+        // wrapped-form nor the bare-form path consumed. These are always
+        // parser artefacts — never user-visible content. Handles the
+        // complementary case: tokenizer stripped `<|tool_call>` but kept
+        // `<tool_call|>` (or vice versa, handled above), leaving an orphaned
+        // end marker after bare-form spliced out the call payload.
+        for marker in [&self.tokens.tool_call_start, &self.tokens.tool_call_end] {
+            while let Some(idx) = remaining.find(marker.as_str()) {
+                remaining.replace_range(idx..idx + marker.len(), "");
+            }
+        }
 
         Ok(tool_calls)
     }
@@ -968,10 +986,13 @@ fn serialize_tool_response(tool_name: &str, content: Value) -> Result<String> {
 /// `content` doesn't double-report the call as visible text.
 ///
 /// Validation:
+///   - `call:` must start at a word boundary (start of text or after a
+///     non-identifier char), so prose like `Recall: budget {2024}` is
+///     never treated as a tool call.
 ///   - The character run after `call:` and before `{` must be a valid tool
-///     name (`[A-Za-z0-9_.\-]+`). `callback:foo`, `call: see also`, and
-///     `call: alone` are not picked up — we splice out just the `call:`
-///     prefix in that case so scanning can continue past it.
+///     name (`[A-Za-z0-9_.\-]+`). `call: see also` and `call: alone` are
+///     not picked up — the scan cursor advances past the prefix without
+///     touching the text, so non-matches stay verbatim in `content`.
 ///   - The arguments object is bracket-matched with a string-aware
 ///     depth counter (handles nested objects, arrays, and escaped quotes).
 ///   - If generation truncated mid-args (no matching close brace before
@@ -987,10 +1008,20 @@ fn serialize_tool_response(tool_name: &str, content: Value) -> Result<String> {
 fn extract_bare_call_payloads(remaining: &mut String, escape_token: &str) -> Vec<Gemma4ToolCall> {
     const PREFIX: &str = "call:";
     let mut out = Vec::new();
-    loop {
-        let Some(start) = remaining.find(PREFIX) else {
-            break;
-        };
+    // Scan cursor: non-matches advance the cursor instead of mutating
+    // `remaining`, so prose containing `call:` is never altered.
+    let mut cursor = 0;
+    while let Some(rel_start) = remaining[cursor..].find(PREFIX) {
+        let start = cursor + rel_start;
+        // Word-boundary check: `Recall:`/`recall:` etc. are prose.
+        let at_boundary = remaining[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if !at_boundary {
+            cursor = start + PREFIX.len();
+            continue;
+        }
         let name_start = start + PREFIX.len();
         let Some(brace_offset) = remaining[name_start..].find('{') else {
             // No `{` anywhere after this `call:` — nothing to parse.
@@ -1002,10 +1033,9 @@ fn extract_bare_call_payloads(remaining: &mut String, escape_token: &str) -> Vec
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
         if !valid_name {
-            // Not a real tool call (`callback:foo`, `call: see notes`, …).
-            // Splice out just the `call:` prefix so the next iteration
-            // scans past it rather than re-matching forever.
-            remaining.replace_range(start..start + PREFIX.len(), "");
+            // Not a real tool call (`call: see notes`, …). Scan past the
+            // prefix and leave the text untouched.
+            cursor = start + PREFIX.len();
             continue;
         }
         let name = name.to_string();
@@ -1070,6 +1100,8 @@ fn extract_bare_call_payloads(remaining: &mut String, escape_token: &str) -> Vec
             end_cut += 1;
         }
         remaining.replace_range(start..end_cut, "");
+        // Text after the splice shifted left to `start`; rescan from there.
+        cursor = start;
     }
     out
 }
@@ -1621,10 +1653,14 @@ mod tests {
             ("gemma-4-e4b-it-4bit", false), // e4b's Jinja omits the pre-fill
             ("gemma4-26B-a4b-it-UD-MLX-4bit", true),
         ];
-        // Hard-coded; the test no-ops if neither parent exists, so this
-        // stays harmless on machines without these dirs.
+        // Model roots, most specific first: explicit override, the
+        // workspace-local ./models dir, then the shared ~/.OminiX cache.
+        // The test skips (loudly, see below) when none contain a candidate.
         let parents = [
-            std::path::PathBuf::from("/Users/kyle/repos/OminiX-MLX/models"),
+            std::env::var_os("OMINIX_MODELS_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default(),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../models"),
             std::env::var_os("HOME")
                 .map(|h| std::path::PathBuf::from(h).join(".OminiX/models"))
                 .unwrap_or_default(),
@@ -1668,7 +1704,7 @@ mod tests {
         if !any_seen {
             eprintln!(
                 "skipping real-template smoke test: no local Gemma4 model dirs found \
-                 under /Users/kyle/repos/OminiX-MLX/models or ~/.OminiX/models"
+                 under $OMINIX_MODELS_DIR, <workspace>/models, or ~/.OminiX/models"
             );
         }
     }
@@ -1885,6 +1921,48 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "terminal");
         assert_eq!(parsed.tool_calls[0].arguments, json!({}));
+        assert_eq!(parsed.content, "");
+    }
+
+    /// Bug: hermes-gateway saw `<|tool_call>` leaking into content. Cause:
+    /// tokenizer stripped `<tool_call|>` (end) but kept `<|tool_call>` (start),
+    /// or generation was truncated before the close. The wrapped-form scan
+    /// previously just `break`ed when no end marker was found, leaving the
+    /// orphaned start in `remaining`. Bare-form then spliced `call:name{...}`
+    /// out of that, leaving only `<|tool_call>` which is neither `turn_end`
+    /// nor `eos` and fell through to `content`.
+    #[test]
+    fn parse_assistant_response_no_leak_when_tool_call_end_absent() {
+        let template = Gemma4ChatTemplate::default();
+        // `<tool_call|>` end marker absent — asymmetric strip or truncation.
+        let raw = "<|tool_call>call:terminal{\"cmd\":\"ls -la\"}";
+        let parsed = template.parse_assistant_response(raw).unwrap();
+        assert_eq!(parsed.tool_calls.len(), 1, "call must still be extracted");
+        assert_eq!(parsed.tool_calls[0].name, "terminal");
+        assert!(
+            !parsed.content.contains("<|tool_call>"),
+            "<|tool_call> must not leak into content; got {:?}",
+            parsed.content,
+        );
+        assert_eq!(parsed.content, "", "no visible text should remain");
+    }
+
+    /// Complementary: tokenizer stripped `<|tool_call>` (start) but kept
+    /// `<tool_call|>` (end). Bare-form extracts `call:name{...}`, leaving the
+    /// orphaned end marker. It must not leak.
+    #[test]
+    fn parse_assistant_response_no_leak_when_tool_call_start_absent() {
+        let template = Gemma4ChatTemplate::default();
+        // `<|tool_call>` start absent — only end marker survives decode.
+        let raw = "call:pwd{}<tool_call|>";
+        let parsed = template.parse_assistant_response(raw).unwrap();
+        assert_eq!(parsed.tool_calls.len(), 1, "call must still be extracted");
+        assert_eq!(parsed.tool_calls[0].name, "pwd");
+        assert!(
+            !parsed.content.contains("<tool_call|>"),
+            "<tool_call|> must not leak into content; got {:?}",
+            parsed.content,
+        );
         assert_eq!(parsed.content, "");
     }
 
