@@ -217,7 +217,7 @@ prompt_text_for() { [[ "$1" == "long" ]] && printf '%s' "${LONG_PROMPT}" || prin
 # Per-sweep parameter sets.
 if [[ "${SWEEP}" == "quick" ]]; then
   CELL_A_MODELS=("Qwen3.6-27B-4bit" "Qwen3.6-27B-UD-MLX-4bit")
-  CELL_D_MODELS=("gemma-4-e4b-it-4bit")
+  CELL_D_MODELS=("gemma-4-e4b-it-4bit" "gemma-4-12B-it-4bit")
   PROMPTS=("short")
   MAXTOKS=(64)
   # Include QUANTIZE_KV so the quick sweep measures the F9 fused-quantized-
@@ -230,9 +230,14 @@ if [[ "${SWEEP}" == "quick" ]]; then
   MTPLX_ACCEPTS=("greedy@0.0")
   DFLASH_TEMPS=(0.0)
   DFLASH_DDTREE=("off")
+  # Fused Metal kernel gates (individual, not combinatorial).
+  FUSED_GATES=("FUSED_T4" "FUSED_ROUTER" "FUSED_QKV")
+  # Sliding-bench prompt lengths and gen tokens for cell_e.
+  SLIDING_PROMPT_LENS="1024,4096"
+  SLIDING_GEN_TOKENS=64
 elif [[ "${SWEEP}" == "full" ]]; then
   CELL_A_MODELS=("Qwen3.6-27B-4bit" "Qwen3.6-27B-UD-MLX-4bit" "Qwen3.6-35B-A3B-4bit")
-  CELL_D_MODELS=("gemma-4-e4b-it-4bit" "gemma-4-26B-A4B-it")
+  CELL_D_MODELS=("gemma-4-e4b-it-4bit" "gemma-4-12B-it-4bit" "gemma4-26B-a4b-it-UD-MLX-4bit")
   PROMPTS=("short" "long")
   MAXTOKS=(64 256)
   KV_MODES=("unset" "QUANTIZE_KV" "PAGED" "TURBO_KV")
@@ -243,6 +248,9 @@ elif [[ "${SWEEP}" == "full" ]]; then
   MTPLX_ACCEPTS=("greedy@0.0" "speculative@0.7")
   DFLASH_TEMPS=(0.0 0.7)
   DFLASH_DDTREE=("off" "on")
+  FUSED_GATES=("FUSED_T4" "FUSED_ROUTER" "FUSED_QKV")
+  SLIDING_PROMPT_LENS="1024,4096,16384,32768"
+  SLIDING_GEN_TOKENS=128
 else
   die "unknown SWEEP='${SWEEP}' (expected quick|full)"
 fi
@@ -314,7 +322,7 @@ cell_c() {
   local BIN="${BIN_DIR}/bench_dflash"
   local pairs=(
     "Qwen3.6-35B-A3B-4bit:Qwen3.6-35B-A3B-DFlash"
-    "gemma-4-26B-A4B-it:gemma-4-26B-A4B-it-DFlash"
+    "gemma4-26B-a4b-it-UD-MLX-4bit:gemma-4-26B-A4B-it-DFlash"
   )
   for pair in "${pairs[@]}"; do
     local target="${pair%%:*}" draft="${pair##*:}"
@@ -322,7 +330,7 @@ cell_c() {
     local tp; tp="$(model_path "${target}")"
     local draft_args=()
     if model_present "${draft}"; then draft_args=(--draft "$(model_path "${draft}")"); else log "note: draft ${draft} missing — AR/Missing path"; fi
-    local is_gemma="no"; [[ "${target}" == gemma-4* ]] && is_gemma="yes"
+    local is_gemma="no"; [[ "${target}" == gemma* ]] && is_gemma="yes"
     for prompt in "${PROMPTS[@]}"; do
       local ptext; ptext="$(prompt_text_for "${prompt}")"
       for mt in "${MAXTOKS[@]}"; do
@@ -346,19 +354,16 @@ cell_c() {
 }
 
 # --- Cell D: Gemma4 AR throughput (ar_bench) --------------------------------
-# Standalone harness for Gemma4 variants — paged-vs-standard comparison on the
-# mask-only sliding-window architecture. Covers gemma-4-e4b-it-4bit (the new
-# 4-bit checkpoint) and the original gemma-4-26B-A4B-it baseline. ar_bench
-# emits `prefill_s=` / `decode_tok_s=` in the same format bench_dflash does,
-# so the existing parser captures it as-is.
+# Covers gemma-4-e4b-it-4bit, gemma-4-12B-it-4bit, and gemma4-26B-a4b-it-UD-MLX-4bit.
+# ar_bench emits `prefill_s=` / `decode_tok_s=` in the same format bench_dflash
+# does, so the existing parser captures it as-is.
 cell_d() {
   local BIN="${BIN_DIR}/ar_bench"
   for model in "${CELL_D_MODELS[@]}"; do
     if ! model_present "${model}"; then log "skip missing model ${model}"; continue; fi
     local mp; mp="$(model_path "${model}")"
-    # UD-MLX-4bit checkpoints (e.g. gemma-4-e4b-it-4bit) ship with the
-    # `language_model.model.*` weight prefix — route ar_bench through the
-    # UD loader to avoid `Weight not found: model.language_model.…`.
+    # UD-MLX-4bit checkpoints ship with the `language_model.model.*` weight
+    # prefix — route ar_bench through the UD loader.
     local loader_env=""; [[ "${model}" == *4bit ]] && loader_env="LOADER=ud"
     for prompt in "${PROMPTS[@]}"; do
       local ptext; ptext="$(prompt_text_for "${prompt}")"
@@ -377,16 +382,121 @@ cell_d() {
   done
 }
 
+# --- Cell F: Gemma4 fused Metal kernel gates (ar_bench) ---------------------
+# Tests GEMMA4_FUSED_T4, GEMMA4_FUSED_ROUTER, GEMMA4_FUSED_QKV individually
+# against the baseline. Each gate is off by default ("default off until benched
+# in the full forward path" per model.rs comments) — this cell provides that
+# benchmark. Uses kv_mode column to record which gate is active.
+cell_f() {
+  local BIN="${BIN_DIR}/ar_bench"
+  for model in "${CELL_D_MODELS[@]}"; do
+    if ! model_present "${model}"; then log "skip missing model ${model}"; continue; fi
+    local mp; mp="$(model_path "${model}")"
+    local loader_env=""; [[ "${model}" == *4bit ]] && loader_env="LOADER=ud"
+    for prompt in "${PROMPTS[@]}"; do
+      local ptext; ptext="$(prompt_text_for "${prompt}")"
+      for mt in "${MAXTOKS[@]}"; do
+        for gate in "${FUSED_GATES[@]}"; do
+          local gate_env=""
+          case "${gate}" in
+            FUSED_T4)     gate_env="GEMMA4_FUSED_T4=1" ;;
+            FUSED_ROUTER) gate_env="GEMMA4_FUSED_ROUTER=1" ;;
+            FUSED_QKV)    gate_env="GEMMA4_FUSED_QKV=1" ;;
+          esac
+          local env_str="${loader_env}${loader_env:+ }${gate_env}"
+          run_cell "${env_str}" "${model}" "ar_bench" "${prompt}" "${mt}" \
+            "${gate}" "-" "-" "-" "-" "greedy" "0.0" "off" \
+            -- "${BIN}" "${mp}" "${mt}" "${ptext}"
+        done
+      done
+    done
+  done
+}
+
+# --- Cell E: physical sliding-window KV cache (sliding_bench) ---------------
+# Compares baseline Vec<KVCache> vs layered Vec<MixedKvCache> (SlidingKVCache
+# on sliding-attn layers, KVCache on full-attn layers). Results go to a
+# dedicated CSV (different schema: mode + peak_mb columns instead of accept_rate).
+SLIDING_CSV="${OUT_DIR}/sliding_bench.csv"
+SLIDING_HEADER="timestamp,sweep,model,mode,prompt_len,gen_tokens,tok_per_s,peak_mb,delta_mb"
+
+parse_sliding_metrics() {
+  local logfile="$1"
+  python3 - "$logfile" <<'PY'
+import re, sys
+txt = open(sys.argv[1], errors="replace").read()
+# Match table rows: "baseline  1024  17.27  12960.0  2519.0"
+#                   "layered   1024  17.25  12171.2  1730.3"
+for line in txt.splitlines():
+    m = re.match(r'\s*(baseline|layered)\s+(\d+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)', line)
+    if m:
+        mode, prompt, tps, peak, delta = m.groups()
+        print(f"{mode}\t{prompt}\t{tps}\t{peak}\t{delta}")
+PY
+}
+
+run_sliding_cell() {
+  local model="$1" prompt_lens="$2" gen_tokens="$3"
+  local loader_env=""; [[ "${model}" == *4bit ]] && loader_env="LOADER=ud"
+  local mp; mp="$(model_path "${model}")"
+
+  local key="sliding|${model}|${prompt_lens}|${gen_tokens}"
+  if [[ -f "${SLIDING_CSV}" ]] && grep -qF "${model}" "${SLIDING_CSV}" 2>/dev/null; then
+    log "skip sliding (already in CSV): ${model} prompts=${prompt_lens}"
+    return
+  fi
+
+  local cmd=("${BIN_DIR}/sliding_bench" "${mp}")
+  local full_env="BENCH_PROMPT_LENS=${prompt_lens} BENCH_GEN_TOKENS=${gen_tokens}${loader_env:+ ${loader_env}}"
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    printf 'DRY-RUN: %s %s\n' "${full_env}" "${cmd[*]}"
+    return
+  fi
+
+  log "RUN sliding: ${full_env} ${cmd[*]}"
+  local tmplog; tmplog="$(mktemp)"
+  eval "${full_env} \"\${cmd[@]}\"" >"${tmplog}" 2>&1
+  local rc=$?
+  [[ $rc -ne 0 ]] && log "  sliding_bench exited rc=${rc}"
+
+  local ts; ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  while IFS=$'\t' read -r mode prompt tps peak delta; do
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "${ts}" "${SWEEP}" "${model}" "${mode}" "${prompt}" "${gen_tokens}" \
+      "${tps}" "${peak}" "${delta}" >> "${SLIDING_CSV}"
+    log "  sliding ${model} mode=${mode} prompt=${prompt} tok/s=${tps} peak=${peak}MB Δ=${delta}MB"
+  done < <(parse_sliding_metrics "${tmplog}")
+  rm -f "${tmplog}"
+}
+
+cell_e() {
+  if [[ ! -f "${SLIDING_CSV}" ]]; then
+    echo "${SLIDING_HEADER}" > "${SLIDING_CSV}"
+  fi
+  # Build sliding_bench if not already present.
+  if [[ "${SKIP_BUILD}" != "1" && ! -f "${BIN_DIR}/sliding_bench" ]]; then
+    log "building sliding_bench..."
+    [[ "${DRY_RUN}" == "0" ]] && cargo build --release -p gemma4-mlx --example sliding_bench
+  fi
+  for model in "${CELL_D_MODELS[@]}"; do
+    if ! model_present "${model}"; then log "skip missing model ${model}"; continue; fi
+    run_sliding_cell "${model}" "${SLIDING_PROMPT_LENS}" "${SLIDING_GEN_TOKENS}"
+  done
+}
+
 # ============================================================================
 main() {
   log "SWEEP=${SWEEP} DRY_RUN=${DRY_RUN} REPS=${REPS} MODELS_DIR=${MODELS_DIR}"
-  log "CSV=${CSV} JSONL=${JSONL}"
+  log "CSV=${CSV} JSONL=${JSONL} SLIDING_CSV=${SLIDING_CSV}"
   build_examples
   cell_a
   cell_b
   cell_c
   cell_d
-  log "done. results in ${CSV}"
+  cell_e
+  cell_f
+  log "done. results in ${CSV} and ${SLIDING_CSV}"
 }
 
 main "$@"
