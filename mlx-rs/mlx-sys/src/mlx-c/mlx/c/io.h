@@ -34,8 +34,6 @@ int mlx_load_reader(
     const mlx_stream s);
 int mlx_load(mlx_array* res, const char* file, const mlx_stream s);
 
-int mlx_load_gguf(mlx_io_gguf* gguf, const char* file, const mlx_stream s);
-
 int mlx_load_safetensors_reader(
     mlx_map_string_to_array* res_0,
     mlx_map_string_to_string* res_1,

@@ -30,18 +30,6 @@ extern "C" int mlx_load(mlx_array* res, const char* file, const mlx_stream s) {
   }
   return 0;
 }
-extern "C" int
-mlx_load_gguf(mlx_io_gguf* gguf, const char* file, const mlx_stream s) {
-  try {
-    auto cpp_gguf = mlx::core::load_gguf(file, mlx_stream_get_(s));
-    mlx_io_gguf_set_(*gguf, std::move(cpp_gguf));
-    return 0;
-  } catch (std::exception& e) {
-    mlx_error(e.what());
-    return 1;
-  }
-}
-
 extern "C" int mlx_load_safetensors_reader(
     mlx_map_string_to_array* res_0,
     mlx_map_string_to_string* res_1,
