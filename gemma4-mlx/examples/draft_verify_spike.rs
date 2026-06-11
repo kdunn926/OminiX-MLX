@@ -24,30 +24,31 @@
 //! often enough to make up for it. Expect modest gains at temp=0.
 //!
 //! ============================================================
-//! RESULTS (on 27B Q4 native, prompt = sky-blue question, chat
-//! template, max_new=64, block=8, temp=0):
+//! RESULTS (2026-06-11, on 27B Q4 native, prompt = sky-blue question,
+//! CHAT=1, max_new=96, block=8, temp=0), after fixing TWO compounding
+//! drafter bugs (see assistant.rs):
+//!   1. attention scale: 1/sqrt(head_dim) → 1.0 (HF Gemma4Attention
+//!      uses scaling=1.0; the assistant attends over the TARGET's K/V)
+//!   2. concat order: [hidden, embed] → [embed, hidden] (matches HF
+//!      Gemma4AssistantCandidateGenerator)
 //!
 //!   Plain AR (no drafter)   : 11.7 tok/s   (mtplx_chat baseline)
-//!   LINEAR drafter+verify   :  0.55 tok/s  — 21× SLOWER than AR
-//!   TREE2 drafter+verify    :  0.30 tok/s  — 35× SLOWER than AR
-//!   Tree/Lin ratio          :  0.54×       — tree is WORSE here
+//!   LINEAR drafter+verify   : 10.2 tok/s   acceptance 79/176 = 0.45
+//!   TREE2 drafter+verify    :  5.7 tok/s   acceptance 81/160 = 0.51
 //!
-//!   Linear acceptance       :  9 / 304 drafted tokens  = 3.0%
-//!   Tree2  acceptance       : 10 / 296 drafted tokens  = 3.4%
+//! 2x2 sweep (scale x concat order, 64 tok): only the both-fixed cell
+//! works — every other cell sits at 0.00-0.03 acceptance / ~2.5 tok/s.
+//! The historical "3%" baseline was rsqrt-scale + embed-first; commit
+//! 8b30953's flip to recurrent-first was measured under the scale bug
+//! and picked the wrong order. Frozen draft position confirmed correct
+//! against HF (position_ids locked for the whole block); layer_scalar
+//! whole-stream placement confirmed correct (hidden_states *= scalar).
 //!
-//! The drafter agrees with the target ~3% of the time on chat-formatted
-//! prompts; Python reference (`mtplx_pair.json::benchmark`) claims 98%
-//! on its `flappy` long-form code suite. Difference suggests either a
-//! subtle drafter-implementation bug, or that drafter quality depends
-//! heavily on prompt regime (long predictable code-completion vs short
-//! reasoning-mode answers).
-//!
-//! Conclusion for the tree-drafting hypothesis: with this drafter, tree
-//! offers NO benefit — it costs 2× verify work for nearly the same
-//! acceptance rate. The bottleneck is drafter quality (drafter agreement
-//! with target), not the drafting topology. Tree drafting only helps
-//! when drafter top-2 frequently captures the target's pick — that's
-//! not the case here.
+//! Remaining gap to Python's 0.981: eval regime (greedy chat prompts
+//! here vs T=1.0/top-k 64/top-p 0.95 Leviathan-Chen on long-form code)
+//! plus this harness spends an extra full 1-token target forward per
+//! cycle to install the bonus token (HF folds it into the next verify).
+//! Linear already ~matches AR despite that overhead.
 //! ============================================================
 //!
 //! Usage:

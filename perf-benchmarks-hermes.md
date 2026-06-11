@@ -81,7 +81,17 @@ argmax level.
 | Sliding-window mask ON (b1d4e82, default) | 2.06 | 0.98 | 0/576 | 46.6s + 98.0s |
 | Sliding-window mask OFF (`MTPLX_PAIR_NO_SLIDING_MASK=1`) | 2.05 | 0.97 | 0/576 | 46.9s + 99.4s |
 
-Sliding-window mask is **neutral on acceptance** for this prompt (no regression, no win). Greedy-vs-greedy on out-of-distribution hermes-style prompts produces 0% acceptance for *distributional* reasons — the drafter's argmax never aligns with the target's. Real acceptance lift requires stochastic draft sampling + spec-decode rejection math (see `docs/35-expert-major-moe-design.md`-adjacent #36 follow-up).
+Sliding-window mask is **neutral on acceptance** for this prompt (no regression, no win).
+
+**CORRECTION (2026-06-11):** the 0/576 acceptance was NOT distributional — it
+was two compounding drafter bugs (attention scale `1/sqrt(d)` instead of the
+target's `1.0`, and concat order flipped vs HF's
+`cat([embed, hidden])`). Both fixed in `gemma4-mlx/src/assistant.rs`; the pair
+now measures **0.45 acceptance / 10.2 tok/s** on the sky prompt (CHAT=1,
+96 tok, block 8, temp 0) vs 11.7 tok/s AR. The sliding-mask A/B above was
+neutral because *both* variants were uniform-attending under the scale bug —
+re-measure if the mask question matters again. See
+`gemma4-pair-adapter-wip.md` § Update 2026-06-11.
 
 ⭐ = headline winner for that model.
 

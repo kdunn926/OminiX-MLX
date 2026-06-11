@@ -1,5 +1,55 @@
 # Gemma4 target+assistant pair adapter — WIP
 
+## Update 2026-06-11 — acceptance root-caused and fixed (0.01 → 0.45)
+
+The near-zero acceptance was **not distributional** — it was two compounding
+implementation bugs in `gemma4-mlx/src/assistant.rs`, both verified against
+the locally-installed HF reference
+(`transformers/models/gemma4_assistant/modeling_gemma4_assistant.py` +
+`generation/candidate_generator.py::Gemma4AssistantCandidateGenerator`):
+
+1. **Attention softmax scale.** The assistant used `1/sqrt(head_dim)` while
+   attending over the *target's* borrowed K/V. HF `Gemma4Attention` uses
+   `self.scaling = 1.0` (QK-norm family). Dividing logits by 16 (sliding,
+   d=256) / 22.6 (full, d=512) flattens softmax toward a uniform average
+   over the KV — and the damage grows with context length, which is why
+   short prompts showed ~15% but the hermes 5K run showed 0/576.
+2. **Concat order.** HF builds
+   `inputs_embeds = cat([last_token_embedding, last_hidden_state])` —
+   embed FIRST. Commit 8b30953 flipped the Rust port to recurrent-first
+   based on an A/B that was run *under bug #1*, where both orders score
+   ~1% and the comparison was noise.
+
+2×2×2 sweep (scale × order × draft position; sky prompt, CHAT=1, 64 tok,
+block 8, temp 0): only `scale=1.0 + embed_first` works — **0.43
+acceptance, 10.5 tok/s** vs 0.00–0.03 / ~2.5 tok/s in every other cell.
+Confirmation at 96 tokens: **0.45 acceptance, 10.2 tok/s linear** (AR
+baseline 11.7), tree2 0.51 / 5.7 tok/s. The fixed defaults are in
+`assistant.rs`; `MTPLX_PAIR_RSQRT_SCALE=1` /
+`MTPLX_PAIR_CONCAT_ORDER=recurrent_first` reproduce the old behaviour.
+
+Also settled against the HF source (previously open questions below):
+
+- **Draft position is frozen** for the whole block — HF computes
+  `position_ids = [[len-1]]` once, never advances it ("effectively locks
+  the assistant into a constant position_ids value"). The spike's default
+  was already correct; `MTPLX_PAIR_POS=advance` measures slightly worse.
+- **`layer_scalar` placement**: HF applies `hidden_states *= layer_scalar`
+  to the whole residual stream at layer end — the Rust port matches. The
+  trained values are real (`[0.146, 0.578, 0.613, 0.520]`), not ≈1.
+- **`use_ordered_embeddings = false`** in this checkpoint's config, so the
+  plain tied lm_head path is correct; the centroid/masked-embedder head
+  (`Gemma4AssistantMaskedEmbedder`) is dead code for this pair.
+
+Remaining gap to the Python 0.981 reference: eval regime (greedy
+chat-formatted prompts vs T=1.0 / top-k 64 / top-p 0.95 Leviathan-Chen on
+the long-form `flappy` code suite) plus the spike's extra full 1-token
+target forward per cycle to install the bonus token (HF folds that into
+the next verify). With those addressed the cost model supports ~35-45
+tok/s on this hardware, consistent with the Python 44 tok/s claim.
+
+---
+
 Status: **end-to-end working** (2026-05-16, same session as kickoff).
 Branch `feat/gemma4-pair-adapter` still at `perf/inference-optimization`
 HEAD — work is local, not yet committed.

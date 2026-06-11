@@ -583,7 +583,18 @@ pub fn load_assistant_model(model_dir: impl AsRef<Path>) -> Result<AssistantMode
             n_heads: text.num_attention_heads,
             n_kv_heads,
             head_dim,
-            scale: 1.0 / (head_dim as f32).sqrt(),
+            // The assistant attends over the TARGET's K/V, which were
+            // produced under the target's softmax scale of 1.0 (QK-norm
+            // family — see `Attention { scale: 1.0, .. }` in model.rs).
+            // 1/sqrt(head_dim) divides the attention logits by 16-22.6,
+            // flattening softmax toward a uniform average over the borrowed
+            // KV. Default to the target's convention; MTPLX_PAIR_RSQRT_SCALE=1
+            // restores 1/sqrt(head_dim) for A/B.
+            scale: if std::env::var("MTPLX_PAIR_RSQRT_SCALE").is_ok() {
+                1.0 / (head_dim as f32).sqrt()
+            } else {
+                1.0
+            },
             sliding_window: text.sliding_window,
             q_proj: load_quantized_linear(
                 &weights,
@@ -687,15 +698,19 @@ pub fn build_inputs_embeds(
     prev_token_embed: &Array,
     recurrent_hidden: &Array,
 ) -> Result<Array, Exception> {
-    // Concat order: (recurrent_hidden, prev_token_embed). The previous
-    // ordering (prev_token_embed first) produced acceptance ~1% on the
-    // gemma4-27B-MTPLX-Optimized-Speed pair, identical to the Qwen3.6
-    // MTP concat-order bug — pre_projection's weight matrix expects
-    // recurrent first, embed second. Toggle via MTPLX_PAIR_CONCAT_ORDER=embed_first
-    // to A/B against the prior bug-for-bug behaviour.
+    // Concat order: (prev_token_embed, recurrent_hidden) — embed FIRST,
+    // matching HF's Gemma4AssistantCandidateGenerator:
+    //   inputs_embeds = torch.cat([last_token_embedding, last_hidden_state], dim=-1)
+    // The earlier flip to recurrent-first (8b30953) was measured under the
+    // wrong attention scale (1/sqrt(head_dim) instead of the target's 1.0),
+    // which flattened cross-attention and made the order A/B meaningless.
+    // With scale=1.0, the 2x2 sweep on the 27B pair (sky prompt, CHAT=1,
+    // 64 tok, block 8) gives: embed-first 0.43 acceptance / 10.5 tok/s vs
+    // recurrent-first 0.01 / 2.7. Toggle via
+    // MTPLX_PAIR_CONCAT_ORDER=recurrent_first to A/B the old behaviour.
     let recurrent_first = std::env::var("MTPLX_PAIR_CONCAT_ORDER")
-        .map(|v| v.as_str() != "embed_first")
-        .unwrap_or(true);
+        .map(|v| v.as_str() == "recurrent_first")
+        .unwrap_or(false);
     if recurrent_first {
         ops::concatenate_axis(&[recurrent_hidden, prev_token_embed], -1)
     } else {
