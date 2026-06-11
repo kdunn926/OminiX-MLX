@@ -4,12 +4,69 @@ use crate::cache::ProjectedContextCache;
 use crate::engine::spec_epoch::{DraftBlock, DraftModel};
 use crate::model::DFlashDraftModel;
 
+/// Vocabulary projection for draft logits.
+///
+/// `Dense` matmuls against a dequantized `[V, H]` bf16 weight — on a 4-bit
+/// target this reads ~4x the bytes of the packed weight every draft cycle
+/// (1.0 GB on 35B-A3B, 2.5 GB on dense 27B) and keeps a resident dequant
+/// copy. `Quantized` runs `quantized_matmul` against the target's packed
+/// lm_head / tied-embedding arrays directly — same logits the target's own
+/// `apply_lm_head` produces.
+pub enum DraftLmHead {
+    Dense(Array),
+    Quantized {
+        weight: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+        bits: i32,
+    },
+}
+
+impl DraftLmHead {
+    pub fn vocab_size(&self) -> i32 {
+        match self {
+            DraftLmHead::Dense(w) => w.shape()[0],
+            DraftLmHead::Quantized { weight, .. } => weight.shape()[0],
+        }
+    }
+
+    /// Project hidden states `[.., H]` to vocab logits `[.., V]`.
+    pub fn logits(&self, h: &Array) -> Result<Array, Exception> {
+        match self {
+            DraftLmHead::Dense(w) => mlx_rs::ops::matmul(h, w.t()),
+            DraftLmHead::Quantized {
+                weight,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => mlx_rs::ops::quantized_matmul(
+                h,
+                weight,
+                scales,
+                biases,
+                true,
+                *group_size,
+                *bits,
+                None::<&'static str>,
+            ),
+        }
+    }
+}
+
+impl From<Array> for DraftLmHead {
+    fn from(weight: Array) -> Self {
+        DraftLmHead::Dense(weight)
+    }
+}
+
 pub struct DFlashDraftAdapter {
     pub model: DFlashDraftModel,
     target_hidden: Option<Array>,
     staged_embedding: Option<Array>,
     mask_token_embedding: Array,
-    lm_head_weight: Array,
+    lm_head: DraftLmHead,
     /// Per-layer ProjectedContextCache. Holds post-fc/hidden_norm/k_proj/k_norm/RoPE
     /// k_ctx and v_ctx for all already-committed target positions, so each
     /// draft cycle only has to project & RoPE the new committed delta
@@ -18,14 +75,18 @@ pub struct DFlashDraftAdapter {
 }
 
 impl DFlashDraftAdapter {
-    pub fn new(model: DFlashDraftModel, mask_token_embedding: Array, lm_head_weight: Array) -> Self {
+    pub fn new(
+        model: DFlashDraftModel,
+        mask_token_embedding: Array,
+        lm_head: impl Into<DraftLmHead>,
+    ) -> Self {
         let num_layers = model.layers.len();
         Self {
             model,
             target_hidden: None,
             staged_embedding: None,
             mask_token_embedding,
-            lm_head_weight,
+            lm_head: lm_head.into(),
             caches: (0..num_layers).map(|_| ProjectedContextCache::new()).collect(),
         }
     }
@@ -44,7 +105,7 @@ impl DraftModel for DFlashDraftAdapter {
         for cache in &mut self.caches {
             cache.reset();
         }
-        let vocab = self.lm_head_weight.shape()[0];
+        let vocab = self.lm_head.vocab_size();
         Array::zeros::<f32>(&[1, vocab])
     }
 
@@ -102,12 +163,10 @@ impl DraftModel for DFlashDraftAdapter {
             self.model
                 .forward_with_caches(&noise_emb, &raw_delta, &mut self.caches)?;
 
-        let lm_head_t = self.lm_head_weight.t();
-
         // Skip output[0]: staged token at noise[0]; predictions are at output[1..block_len].
         let prediction_hidden = draft_hidden.index((.., 1.., ..));
 
-        let logits = mlx_rs::ops::matmul(&prediction_hidden, &lm_head_t)?;
+        let logits = self.lm_head.logits(&prediction_hidden)?;
         let tokens = mlx_rs::argmax_axis!(&logits, -1)?.as_dtype(Dtype::Uint32)?;
 
         Ok(DraftBlock { tokens, logits })

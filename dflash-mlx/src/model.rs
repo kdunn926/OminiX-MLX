@@ -6,6 +6,7 @@ use mlx_rs::{
     module::{Module, Param},
     nn,
     ops::{arange, clip, concatenate_axis, exp},
+    quantization::MaybeQuantized,
     Array, Dtype,
 };
 use mlx_rs_core::fused_swiglu;
@@ -229,9 +230,9 @@ fn build_rope(args: &DFlashDraftModelArgs) -> Result<YarnRope, Exception> {
 
 #[derive(Debug, Clone)]
 pub struct DFlashDraftMlp {
-    gate_proj: nn::Linear,
-    up_proj: nn::Linear,
-    down_proj: nn::Linear,
+    gate_proj: MaybeQuantized<nn::Linear>,
+    up_proj: MaybeQuantized<nn::Linear>,
+    down_proj: MaybeQuantized<nn::Linear>,
 }
 
 impl DFlashDraftMlp {
@@ -245,10 +246,10 @@ impl DFlashDraftMlp {
 
 #[derive(Debug, Clone)]
 pub struct DFlashDraftAttention {
-    q_proj: nn::Linear,
-    k_proj: nn::Linear,
-    v_proj: nn::Linear,
-    o_proj: nn::Linear,
+    q_proj: MaybeQuantized<nn::Linear>,
+    k_proj: MaybeQuantized<nn::Linear>,
+    v_proj: MaybeQuantized<nn::Linear>,
+    o_proj: MaybeQuantized<nn::Linear>,
     q_norm: nn::RmsNorm,
     k_norm: nn::RmsNorm,
     rope: YarnRope,
@@ -577,7 +578,7 @@ impl DFlashDraftLayer {
 pub struct DFlashDraftModel {
     pub args: DFlashDraftModelArgs,
     pub layers: Vec<DFlashDraftLayer>,
-    pub fc: nn::Linear,
+    pub fc: MaybeQuantized<nn::Linear>,
     pub hidden_norm: nn::RmsNorm,
     pub norm: nn::RmsNorm,
 }
@@ -705,6 +706,18 @@ impl DFlashDraftModel {
         let eps = args.rms_norm_eps as f32;
         let scale = (args.head_dim as f32).sqrt().recip();
 
+        // Optional on-load quantization of the draft's linears. The DFlash
+        // checkpoints ship BF16 (0.95 GB on 35B-A3B, 3.46 GB on dense 27B)
+        // and decode is bandwidth-bound, so every cycle re-reads the full
+        // draft — quantizing to 4-bit cuts that ~4x.
+        //   DFLASH_QUANT_DRAFT unset/0 → BF16 (checkpoint as-is)
+        //   DFLASH_QUANT_DRAFT=4|1|true → 4-bit, group 64 (matches target)
+        //   DFLASH_QUANT_DRAFT=8 → 8-bit, group 64
+        let quant = draft_quant_from_env();
+        if let Some((group_size, bits)) = quant {
+            eprintln!("DFlash draft: quantizing linears to {bits}-bit (group {group_size})");
+        }
+
         let mut layers = Vec::with_capacity(args.num_hidden_layers as usize);
         for i in 0..args.num_hidden_layers as usize {
             let prefix = format!("layers.{i}");
@@ -726,10 +739,10 @@ impl DFlashDraftModel {
             layers.push(DFlashDraftLayer {
                 input_layernorm: rms_norm(&weights, &format!("{prefix}.input_layernorm.weight"), eps)?,
                 self_attn: DFlashDraftAttention {
-                    q_proj: linear(&weights, &format!("{prefix}.self_attn.q_proj.weight"))?,
-                    k_proj: linear(&weights, &format!("{prefix}.self_attn.k_proj.weight"))?,
-                    v_proj: linear(&weights, &format!("{prefix}.self_attn.v_proj.weight"))?,
-                    o_proj: linear(&weights, &format!("{prefix}.self_attn.o_proj.weight"))?,
+                    q_proj: linear(&weights, &format!("{prefix}.self_attn.q_proj.weight"), quant)?,
+                    k_proj: linear(&weights, &format!("{prefix}.self_attn.k_proj.weight"), quant)?,
+                    v_proj: linear(&weights, &format!("{prefix}.self_attn.v_proj.weight"), quant)?,
+                    o_proj: linear(&weights, &format!("{prefix}.self_attn.o_proj.weight"), quant)?,
                     q_norm: rms_norm(&weights, &format!("{prefix}.self_attn.q_norm.weight"), eps)?,
                     k_norm: rms_norm(&weights, &format!("{prefix}.self_attn.k_norm.weight"), eps)?,
                     rope: rope.clone(),
@@ -745,20 +758,30 @@ impl DFlashDraftModel {
                     eps,
                 )?,
                 mlp: DFlashDraftMlp {
-                    gate_proj: linear(&weights, &format!("{prefix}.mlp.gate_proj.weight"))?,
-                    up_proj: linear(&weights, &format!("{prefix}.mlp.up_proj.weight"))?,
-                    down_proj: linear(&weights, &format!("{prefix}.mlp.down_proj.weight"))?,
+                    gate_proj: linear(&weights, &format!("{prefix}.mlp.gate_proj.weight"), quant)?,
+                    up_proj: linear(&weights, &format!("{prefix}.mlp.up_proj.weight"), quant)?,
+                    down_proj: linear(&weights, &format!("{prefix}.mlp.down_proj.weight"), quant)?,
                 },
             });
         }
 
         Ok(Self {
-            fc: linear(&weights, "fc.weight")?,
+            fc: linear(&weights, "fc.weight", quant)?,
             hidden_norm: rms_norm(&weights, "hidden_norm.weight", eps)?,
             norm: rms_norm(&weights, "norm.weight", eps)?,
             args,
             layers,
         })
+    }
+}
+
+/// Parse `DFLASH_QUANT_DRAFT` into `(group_size, bits)`. See `load_from_path`.
+fn draft_quant_from_env() -> Option<(i32, i32)> {
+    let v = std::env::var("DFLASH_QUANT_DRAFT").ok()?;
+    match v.trim() {
+        "" | "0" | "false" => None,
+        "8" => Some((64, 8)),
+        _ => Some((64, 4)),
     }
 }
 
@@ -769,11 +792,21 @@ fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array, Exce
         .ok_or_else(|| Exception::custom(format!("missing draft weight: {key}")))
 }
 
-fn linear(weights: &HashMap<String, Array>, key: &str) -> Result<nn::Linear, Exception> {
-    Ok(nn::Linear {
+fn linear(
+    weights: &HashMap<String, Array>,
+    key: &str,
+    quant: Option<(i32, i32)>,
+) -> Result<MaybeQuantized<nn::Linear>, Exception> {
+    let dense = nn::Linear {
         weight: Param::new(get_weight(weights, key)?),
         bias: Param::new(None),
-    })
+    };
+    match quant {
+        Some((group_size, bits)) => Ok(MaybeQuantized::Quantized(
+            nn::QuantizedLinear::try_from_linear(dense, group_size, bits)?,
+        )),
+        None => Ok(MaybeQuantized::Original(dense)),
+    }
 }
 
 fn rms_norm(weights: &HashMap<String, Array>, key: &str, eps: f32) -> Result<nn::RmsNorm, Exception> {

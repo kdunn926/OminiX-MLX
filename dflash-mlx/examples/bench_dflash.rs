@@ -16,8 +16,8 @@ use anyhow::{anyhow, Context, Result};
 use dflash_mlx::{
     build_tree, discover_draft_for_target, topk_per_position, verify_tree_naive,
     DDTreeConfig, DFlashDraftAdapter, DFlashDraftModel, DFlashSession, DraftCheckpointInfo,
-    DraftModel, Gemma4TargetAdapter, GemmaTreeTarget, MockDraftAdapter, Qwen36TargetAdapter,
-    SessionMetrics, SpeculativeCycleConfig, TargetModel,
+    DraftLmHead, DraftModel, Gemma4TargetAdapter, GemmaTreeTarget, MockDraftAdapter,
+    Qwen36TargetAdapter, SessionMetrics, SpeculativeCycleConfig, TargetModel,
 };
 use mlx_rs::ops::indexing::IndexOp;
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
@@ -153,10 +153,22 @@ fn main() -> Result<()> {
             let block_size = draft_model.args.block_size();
             let target_layer_ids = draft_model.args.target_layer_ids();
             let mask_token_id = draft_model.args.mask_token_id();
-            let lm_head_weight = model.get_lm_head_weight()?;
+            // Prefer the target's packed quantized lm_head for draft logits —
+            // the dense path matmuls a dequantized [vocab, hidden] BF16 copy,
+            // re-reading ~4x the bytes every draft cycle (2.5 GB on dense 27B).
+            let lm_head = match model.get_lm_head_quantized() {
+                Some((weight, scales, biases, group_size, bits)) => DraftLmHead::Quantized {
+                    weight,
+                    scales,
+                    biases,
+                    group_size,
+                    bits,
+                },
+                None => DraftLmHead::Dense(model.get_lm_head_weight()?),
+            };
             let mask_emb = model.embed_tokens(&[mask_token_id as i32])?;
             let target = Qwen36TargetAdapter::with_dflash(model, args.temp, target_layer_ids);
-            let draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight);
+            let draft = DFlashDraftAdapter::new(draft_model, mask_emb, lm_head);
             // NOTE: min_block_tokens must be strictly less than block_len for
             // adaptive sizing to engage. Setting them equal (as the prior config
             // did with block_size=16 for both) neutered the adaptive policy —

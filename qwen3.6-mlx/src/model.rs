@@ -508,6 +508,36 @@ impl Model {
         weight.as_dtype(Dtype::Bfloat16)?.contiguous()
     }
 
+    /// Packed quantized lm_head arrays `(weight, scales, biases, group_size,
+    /// bits)` when the vocabulary projection is quantized (explicit lm_head or
+    /// tied quantized embedding). Returns `None` for non-quantized
+    /// checkpoints — callers fall back to [`Self::get_lm_head_weight`].
+    /// Lets external drafters (DFlash) run `quantized_matmul` against the
+    /// packed weight instead of materializing and re-reading a dequantized
+    /// BF16 `[vocab, hidden]` copy every cycle.
+    pub fn get_lm_head_quantized(&self) -> Option<(Array, Array, Array, i32, i32)> {
+        match self.lm_head.as_ref() {
+            Some(MaybeQuantized::Quantized(ql)) => Some((
+                ql.inner.weight.as_ref().clone(),
+                ql.scales.as_ref().clone(),
+                ql.biases.as_ref().clone(),
+                ql.group_size,
+                ql.bits,
+            )),
+            Some(MaybeQuantized::Original(_)) => None,
+            None => match &self.text_model.embed_tokens {
+                MaybeQuantized::Quantized(qe) => Some((
+                    qe.inner.weight.as_ref().clone(),
+                    qe.scales.as_ref().clone(),
+                    qe.biases.as_ref().clone(),
+                    qe.group_size,
+                    qe.bits,
+                )),
+                MaybeQuantized::Original(_) => None,
+            },
+        }
+    }
+
     #[allow(non_snake_case)]
     fn forward_hidden(
         &mut self,

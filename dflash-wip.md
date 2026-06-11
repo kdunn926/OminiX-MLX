@@ -564,3 +564,33 @@ is NOT an acceptance bug — it is pure implementation overhead.
   (+~1.9 GB/cycle saved) the cost model gives **~1.5-2× over AR** at the
   measured 0.40 acceptance. This is where optimization effort should go.
 
+### Implemented (same day): quantized lm_head + 4-bit draft + sync dedup
+
+- `DraftLmHead::Quantized` — draft logits via `quantized_matmul` against
+  the target's packed lm_head/tied-embed arrays
+  (`Model::get_lm_head_quantized`), replacing the dequantized-BF16 matmul.
+- `DFLASH_QUANT_DRAFT=4|8` — on-load quantization of all draft linears
+  (q/k/v/o, gate/up/down, fc) to 4- or 8-bit group-64 via
+  `MaybeQuantized<nn::Linear>`. Costs ~0.06 acceptance on the 27B trace
+  prompt (0.396 → 0.337) but nets positive throughput.
+- `build_verify_inputs` now returns the drafted host vec, deleting the
+  duplicate eval + device→host copy per cycle.
+
+Results, dense 27B, standing prompt, temp 0, 200 tokens (short-prompt
+in-process comparison; the historical 0.41× was on the 5K hermes fixture):
+
+| config | DFlash tok/s | AR tok/s | speedup |
+|---|---|---|---|
+| before (bf16 draft + dequant lm_head, 5K prompt) | 7.27 | 17.58 | 0.41× |
+| quantized lm_head only | 16.18 | 19.12 | 0.85× |
+| + 4-bit draft | 17.08 | 19.06 | 0.90× |
+| + sync dedup | **17.49** | 19.01 | **0.92×** |
+
+Remaining gap is latency, not bytes: ~195 ms/cycle vs ~63 ms of predicted
+weight traffic for ~3.3 committed tokens. The serial structure dominates —
+2 remaining hard syncs/cycle with no `async_eval` overlap (the AR baseline
+pipelines), the 48-GDN-layer tape-capture verify path, and per-rejection
+tape replay (48 dispatches). Closing it means overlapping the draft graph
+build with verify via `async_eval` and trimming the GDN tape path — a
+structural change, not a knob.
+

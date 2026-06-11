@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use dflash_mlx::{
-    DraftBlock, DraftModel, DFlashDraftAdapter, DFlashDraftModel, DFlashSession,
+    DraftBlock, DraftLmHead, DraftModel, DFlashDraftAdapter, DFlashDraftModel, DFlashSession,
     DraftCheckpointInfo, Qwen36TargetAdapter, SpeculativeCycleConfig, TargetModel,
 };
 use mlx_rs::{
@@ -133,7 +133,16 @@ fn main() -> Result<()> {
     let block_size = draft_model.args.block_size();
     let target_layer_ids = draft_model.args.target_layer_ids();
     let mask_token_id = draft_model.args.mask_token_id();
-    let lm_head_weight = model.get_lm_head_weight()?;
+    let lm_head = match model.get_lm_head_quantized() {
+        Some((weight, scales, biases, group_size, bits)) => DraftLmHead::Quantized {
+            weight,
+            scales,
+            biases,
+            group_size,
+            bits,
+        },
+        None => DraftLmHead::Dense(model.get_lm_head_weight()?),
+    };
     let mask_emb = model.embed_tokens(&[mask_token_id as i32])?;
 
     let target = TraceTarget {
@@ -143,7 +152,7 @@ fn main() -> Result<()> {
         verify_posteriors: Vec::new(),
     };
     let draft = TraceDraft {
-        inner: DFlashDraftAdapter::new(draft_model, mask_emb, lm_head_weight),
+        inner: DFlashDraftAdapter::new(draft_model, mask_emb, lm_head),
         draft_context_lens: Vec::new(),
         drafted_blocks: Vec::new(),
     };

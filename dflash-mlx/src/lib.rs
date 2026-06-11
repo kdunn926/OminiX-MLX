@@ -9,7 +9,7 @@ pub mod verify_qmm;
 pub use engine::acceptance::match_acceptance_length;
 pub use engine::config::{AdaptiveBlockPolicy, DDTreeConfig, SpeculativeCycleConfig};
 pub use engine::copyspec::CopySpecIndex;
-pub use engine::draft_adapter::DFlashDraftAdapter;
+pub use engine::draft_adapter::{DFlashDraftAdapter, DraftLmHead};
 pub use engine::gemma4_adapter::Gemma4TargetAdapter;
 pub use engine::qwen36_adapter::{DraftCheckpointInfo, MockDraftAdapter, Qwen36TargetAdapter};
 pub use engine::ddtree::{

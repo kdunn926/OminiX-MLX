@@ -339,22 +339,16 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
             // drafted_count = block_len - 1: DFlash returns one fewer token than the noise
             // block length because noise[0] is the staged token and its output is skipped.
             let drafted_count = drafted_tokens.shape()[0] as usize;
-            let verify_inputs = match build_verify_inputs(last_token, &drafted_tokens) {
-                Ok(inputs) => inputs,
-                Err(err) => {
-                    finished = true;
-                    return Some(Err(err));
-                }
-            };
+            let (verify_inputs, drafted_vec) =
+                match build_verify_inputs(last_token, &drafted_tokens) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        finished = true;
+                        return Some(Err(err));
+                    }
+                };
             let verify_logits = match self.target.verify(&verify_inputs) {
                 Ok(logits) => logits,
-                Err(err) => {
-                    finished = true;
-                    return Some(Err(err));
-                }
-            };
-            let drafted_vec = match array_to_vec_u32(&drafted_tokens) {
-                Ok(tokens) => tokens,
                 Err(err) => {
                     finished = true;
                     return Some(Err(err));
@@ -827,7 +821,14 @@ where
     }
 }
 
-fn build_verify_inputs(last_token: u32, drafted_tokens: &Array) -> Result<Array, Exception> {
+/// Returns the verify input array `[1, drafted+1]` AND the drafted tokens as
+/// a host vec. Pulling the drafted tokens to host is the cycle's first hard
+/// GPU sync — returning the vec lets the caller reuse it instead of paying a
+/// second eval + device→host copy on the same array.
+fn build_verify_inputs(
+    last_token: u32,
+    drafted_tokens: &Array,
+) -> Result<(Array, Vec<u32>), Exception> {
     if drafted_tokens.shape().len() != 1 {
         return Err(Exception::custom(format!(
             "build_verify_inputs expects a 1D drafted token array, got {:?}",
@@ -848,10 +849,8 @@ fn build_verify_inputs(last_token: u32, drafted_tokens: &Array) -> Result<Array,
     let mut verify_inputs = Vec::with_capacity(drafted.len() + 1);
     verify_inputs.push(last_token);
     verify_inputs.extend(drafted.iter().copied());
-    Ok(Array::from_slice(
-        &verify_inputs,
-        &[1, verify_inputs.len() as i32],
-    ))
+    let inputs = Array::from_slice(&verify_inputs, &[1, verify_inputs.len() as i32]);
+    Ok((inputs, drafted))
 }
 
 fn array_to_vec_u32(array: &Array) -> Result<Vec<u32>, Exception> {
@@ -995,13 +994,14 @@ mod tests {
     fn build_verify_inputs_shifts_previous_token() {
         let _guard = crate::mlx_test_guard();
         let drafted = Array::from_slice(&[11u32, 12, 13, 14], &[4]);
-        let inputs = build_verify_inputs(10, &drafted).unwrap();
+        let (inputs, drafted_vec) = build_verify_inputs(10, &drafted).unwrap();
         // Now includes all drafted tokens: [last_token, draft[0..n]]
         assert_eq!(inputs.shape(), &[1, 5]);
         assert_eq!(
             array_to_vec_u32(&inputs.index((0, ..))).unwrap(),
             vec![10, 11, 12, 13, 14]
         );
+        assert_eq!(drafted_vec, vec![11, 12, 13, 14]);
     }
 
     #[test]
