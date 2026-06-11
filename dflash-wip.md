@@ -506,3 +506,61 @@ first**, before chasing per-op BF16 floor.
    standardizing in the Rust metrics so cross-language comparisons
    aren't misleading.
 
+---
+
+## Update 2026-06-11 — full-stack review: why DFlash loses to AR
+
+A correctness/perf review of the whole DFlash path (spec_epoch, adapters,
+acceptance, draft model, rollback, bench) found the protocol sound — greedy
+posterior/correction row indexing, staged-token alignment, GDN tape rollback
+(incl. conv-window reconstruction), and the incremental
+`ProjectedContextCache` are all correct. The "no speedup" decomposes into
+avoidable overhead and MoE physics:
+
+### New measurements
+
+`bench_dflash`, standing prompt "The theory of general relativity",
+200 tokens, Qwen3.6-35B-A3B-4bit:
+
+| temp | AR tok/s | DFlash tok/s | acceptance (a/d) | speedup |
+|---|---|---|---|---|
+| 0.0 | 73.0 | 47.1 | 0.375 | 0.65× |
+| 0.7 | 73.0 | 37.2 | 0.241 | 0.51× |
+
+The historical 0.43 was measured at the bench's default temp 0.7 with
+stochastic acceptance, which understates drafter quality vs the Python
+greedy ~0.5 reference; greedy gives 0.375 — same ballpark, small residual
+gap (BF16 kernel-noise floor documented above).
+
+`trace_dflash_verify` on dense **Qwen3.6-27B-4bit** (temp 0, 64 tok):
+**acceptance 0.396** (38/96), 2.67 tokens committed/cycle, context
+bookkeeping exact on every cycle. So the 27B's 7.27-vs-17.58 tok/s deficit
+is NOT an acceptance bug — it is pure implementation overhead.
+
+### Cost accounting (per steady-state Reduced cycle, block 4)
+
+- Draft forward: ~0.95 GB (35B) / **3.46 GB (27B)** bf16 weight reads —
+  the draft is unquantized.
+- Draft lm_head: matmul against a **dequantized bf16 [vocab, H] weight**
+  (`get_lm_head_weight`) — 1.02 GB (35B) / **2.54 GB (27B)** read per
+  cycle, plus a permanently-resident dequant buffer.
+- 3 GPU sync points per cycle (one redundant — `drafted_tokens` is pulled
+  to host twice: spec_epoch.rs:342 and :356); no `async_eval` overlap,
+  unlike the AR baseline's pipelined loop.
+- temp>0 acceptance copies the full `[dc+1, vocab]` fp32 softmax to host
+  (~4 MB/cycle at block 4).
+- `verify_qmm` is dead in measured configs: shape gate accepts m==16/m≤4
+  but real verify rows are 5 or 17.
+
+### Verdict
+
+- **35B MoE: fundamentally capped at ≈ break-even.** A verify of L tokens
+  reads ~`256·(1−e^(−8L/256))/8`× one token's routed-expert bytes (4.6× at
+  L=5), so at the block-4 steady state both Rust and Python collapse to,
+  even a perfect implementation lands ~55-70 tok/s vs 73 AR. Wrong tool
+  for this target.
+- **Dense 27B: the winnable case.** Verify ≈ free (bandwidth-bound), so
+  with a 4-bit draft (+~2.6 GB/cycle saved) and a quantized lm_head
+  (+~1.9 GB/cycle saved) the cost model gives **~1.5-2× over AR** at the
+  measured 0.40 acceptance. This is where optimization effort should go.
+
