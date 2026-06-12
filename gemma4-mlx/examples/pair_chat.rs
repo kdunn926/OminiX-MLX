@@ -66,6 +66,9 @@ fn main() -> Result<()> {
     if let Some(b) = env::var("PAIR_BLOCK").ok().and_then(|s| s.parse().ok()) {
         opts.block = b;
     }
+    if let Ok(dir) = env::var("PAIR_PROMPT_CACHE_DIR") {
+        opts.prompt_cache_dir = Some(PathBuf::from(dir));
+    }
 
     // Stream by decoding the accumulated ids and printing the new suffix.
     let mut acc_ids: Vec<u32> = Vec::new();

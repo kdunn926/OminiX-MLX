@@ -62,6 +62,10 @@ pub struct PairGenerateOptions {
     pub top_p: f32,
     /// RNG seed for stochastic runs. `None` seeds from the wall clock.
     pub seed: Option<u64>,
+    /// When set, reuse a saved KV prefix for the longest matching prompt
+    /// prefix (multi-turn chat: each turn re-prefills only the new
+    /// suffix) and save the extended prefix after prefill.
+    pub prompt_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for PairGenerateOptions {
@@ -74,6 +78,7 @@ impl Default for PairGenerateOptions {
             top_k: 0,
             top_p: 0.0,
             seed: None,
+            prompt_cache_dir: None,
         }
     }
 }
@@ -192,9 +197,21 @@ impl Gemma4PairSession {
 
         // ── Prefill. The cache holds only validated tokens; `pending`
         // (the model's next-token prediction) joins it with the first
-        // folded verify pass.
+        // folded verify pass. With a prompt-cache dir, reuse the longest
+        // matching saved prefix and prefill only the suffix (the loader
+        // always leaves >= 1 suffix token, so the seed hidden below is
+        // well-defined).
         let prefill_start = std::time::Instant::now();
-        let prompt_arr = Array::from(prompt_ids).index(NewAxis);
+        let mut cached_prefix = 0usize;
+        if let Some(dir) = opts.prompt_cache_dir.as_ref() {
+            if let Some((loaded, n)) = KVCache::try_load_kv_caches(prompt_ids, dir)? {
+                if loaded.len() == cache.len() {
+                    cache = loaded;
+                    cached_prefix = n;
+                }
+            }
+        }
+        let prompt_arr = Array::from(&prompt_ids[cached_prefix..]).index(NewAxis);
         let prefill_hidden = self.target.model.forward(ModelInput {
             inputs: &prompt_arr,
             mask: None,
@@ -216,6 +233,15 @@ impl Gemma4PairSession {
         } else {
             argmax_host(&first_logits.reshape(&[-1])?)?
         };
+        // GPU-resident twin of `pending`, used to build the verify chain
+        // without a host round-trip.
+        let mut pending_arr = Array::from(&[pending][..]);
+        // Persist the (possibly extended) prompt prefix for the next turn.
+        if let Some(dir) = opts.prompt_cache_dir.as_ref() {
+            if prompt_ids.len() > cached_prefix {
+                KVCache::save_kv_caches(&cache, prompt_ids, dir)?;
+            }
+        }
         metrics.prefill_s = prefill_start.elapsed().as_secs_f64();
 
         // ── Folded speculative loop.
@@ -235,8 +261,14 @@ impl Gemma4PairSession {
             // draft block, per the HF candidate generator).
             let draft_pos = kv.sliding_k.shape()[2];
 
-            let (drafted, q_rows) = if opts.temp > 0.0 {
-                self.draft_stochastic(
+            // Draft + verify. Greedy fuses the entire cycle — draft chain,
+            // verify forward, and a batched argmax over all verify rows —
+            // into ONE lazy graph with a single eval and a single
+            // device→host copy. Stochastic mode inherently syncs per draft
+            // step (host-side sampling) and keeps the unfused shape.
+            let (drafted, accepted, next_pending, hidden);
+            if opts.temp > 0.0 {
+                let (d, q_rows) = self.draft_stochastic(
                     &kv,
                     draft_pos,
                     pending,
@@ -244,49 +276,74 @@ impl Gemma4PairSession {
                     cur_block,
                     opts,
                     &mut rng,
-                )?
+                )?;
+                let mut chain: Vec<i32> = Vec::with_capacity(d.len() + 1);
+                chain.push(pending);
+                chain.extend_from_slice(&d);
+                let in_arr = Array::from(chain.as_slice()).index(NewAxis);
+                let h = self.target.model.forward(ModelInput {
+                    inputs: &in_arr,
+                    mask: None,
+                    cache: &mut cache,
+                })?;
+                let logits = self.target.forward_via_hidden(&h)?;
+                eval([&logits])?;
+                let q_rows = q_rows.expect("stochastic drafting returns q_rows");
+                let (acc, next) = lc_accept(&logits, &d, &q_rows, opts, &mut rng)?;
+                drafted = d;
+                accepted = acc;
+                next_pending = next;
+                hidden = h;
             } else {
-                (
-                    self.draft_greedy(&kv, draft_pos, pending, seed_hidden.clone(), cur_block)?,
-                    None,
-                )
-            };
+                let draft_toks = self.draft_greedy(
+                    &kv,
+                    draft_pos,
+                    &pending_arr,
+                    seed_hidden.clone(),
+                    cur_block,
+                )?;
+                // Verify input [1, N+1] assembled on device from the lazy
+                // draft tokens.
+                let mut parts: Vec<&Array> = Vec::with_capacity(draft_toks.len() + 1);
+                parts.push(&pending_arr);
+                parts.extend(draft_toks.iter());
+                let chain_flat = mlx_rs::ops::concatenate(&parts)?;
+                let in_arr = chain_flat.reshape(&[1, -1])?;
+                let h = self.target.model.forward(ModelInput {
+                    inputs: &in_arr,
+                    mask: None,
+                    cache: &mut cache,
+                })?;
+                let logits = self.target.forward_via_hidden(&h)?;
+                // Row i of `preds` is the target's argmax for drafted[i]'s
+                // position; row N is the bonus row.
+                let preds = argmax_axis!(&logits, -1)?.as_dtype(Dtype::Int32)?;
+                let drafted_flat = if draft_toks.len() > 1 {
+                    let refs: Vec<&Array> = draft_toks.iter().collect();
+                    mlx_rs::ops::concatenate(&refs)?
+                } else {
+                    draft_toks[0].clone()
+                };
+                // THE one sync of the cycle.
+                eval([&preds, &drafted_flat])?;
+                let preds_row = preds.index((0, ..)).contiguous()?;
+                eval([&preds_row])?;
+                let preds_host = preds_row.as_slice::<i32>().to_vec();
+                let d = drafted_flat.as_slice::<i32>().to_vec();
 
-            // One target pass over [pending, drafts..]: row i of the
-            // logits is the distribution for drafted[i]'s position; row N
-            // is the bonus row.
-            let mut chain: Vec<i32> = Vec::with_capacity(drafted.len() + 1);
-            chain.push(pending);
-            chain.extend_from_slice(&drafted);
-            let in_arr = Array::from(chain.as_slice()).index(NewAxis);
-            let hidden = self.target.model.forward(ModelInput {
-                inputs: &in_arr,
-                mask: None,
-                cache: &mut cache,
-            })?;
-            let logits = self.target.forward_via_hidden(&hidden)?;
-            eval([&logits])?;
-
-            let (accepted, next_pending) = match q_rows.as_ref() {
-                Some(q_rows) => {
-                    lc_accept(&logits, &drafted, q_rows, opts, &mut rng)?
-                }
-                None => {
-                    let mut acc = 0usize;
-                    for (i, &d) in drafted.iter().enumerate() {
-                        let pred =
-                            argmax_host(&logits.index((.., i as i32, ..)).reshape(&[-1])?)?;
-                        if d == pred {
-                            acc += 1;
-                        } else {
-                            break;
-                        }
+                let mut acc = 0usize;
+                for (i, &dt) in d.iter().enumerate() {
+                    if dt == preds_host[i] {
+                        acc += 1;
+                    } else {
+                        break;
                     }
-                    let bonus =
-                        argmax_host(&logits.index((.., acc as i32, ..)).reshape(&[-1])?)?;
-                    (acc, bonus)
                 }
-            };
+                drafted = d;
+                accepted = acc;
+                next_pending = preds_host[accepted];
+                hidden = h;
+            }
 
             // Keep [pending + accepted drafts]; trim the rejected tail.
             let to_drop = (drafted.len() - accepted) as i32;
@@ -318,6 +375,7 @@ impl Gemma4PairSession {
                 }
             }
             pending = next_pending;
+            pending_arr = Array::from(&[pending][..]);
         }
 
         metrics.decode_s = decode_start.elapsed().as_secs_f64();
@@ -346,17 +404,19 @@ impl Gemma4PairSession {
         embed.multiply(&scale)?.as_dtype(Dtype::Bfloat16)
     }
 
-    /// GPU-resident greedy drafter: one eval per block.
+    /// GPU-resident greedy drafter. Returns the per-step token arrays
+    /// (each `[1]`, i32) WITHOUT evaluating — the caller fuses them into
+    /// the verify graph so the whole cycle materializes with one eval.
     fn draft_greedy(
         &mut self,
         kv: &SharedKvStates,
         draft_pos: i32,
-        seed_token: i32,
+        seed_token: &Array,
         seed_hidden: Array,
         n: usize,
-    ) -> Result<Vec<i32>, Exception> {
-        let seed_arr = Array::from(&[seed_token][..]).index(NewAxis);
-        let mut prev_embed = self.scaled_embed(&seed_arr)?;
+    ) -> Result<Vec<Array>, Exception> {
+        let seed_2d = seed_token.reshape(&[1, 1])?;
+        let mut prev_embed = self.scaled_embed(&seed_2d)?;
         let mut recurrent = seed_hidden;
         let mut toks: Vec<Array> = Vec::with_capacity(n);
         for _ in 0..n {
@@ -369,10 +429,7 @@ impl Gemma4PairSession {
             recurrent = aout.last_hidden;
             toks.push(tok);
         }
-        let refs: Vec<&Array> = toks.iter().collect();
-        let all = mlx_rs::ops::concatenate(&refs)?;
-        eval([&all])?;
-        Ok(all.as_slice::<i32>().to_vec())
+        Ok(toks)
     }
 
     /// Stochastic drafter: samples each step from the truncated softmax;

@@ -102,9 +102,34 @@ tok/s on this hardware, consistent with the Python 44 tok/s claim.
    T=1.0/top-k 64/top-p 0.95, acceptance 0.59-0.60). Ready to wire into
    OminiX-API as a backend.
 
-Next (not started): pipelined/batched drafting beyond one-eval-per-block,
-tree drafting revisit at the now-higher base acceptance, prompt-cache
-support in the session.
+### Final round (2026-06-11 evening): single-eval cycles, tree verdict, prompt cache, OminiX-API
+
+1. **Single-eval cycles** (greedy path): the draft chain, verify forward,
+   and a batched argmax over all verify rows now fuse into ONE lazy graph
+   with exactly one eval + one device→host copy per cycle (previously:
+   draft eval + logits eval + one `.item()` per acceptance row). Small
+   consistent gain — sky 17.33 / fib 18.96 / french 14.54 tok/s — with
+   bit-identical acceptance decisions.
+2. **Tree drafting: CLOSED.** Re-measured tree2 at block 4 and current
+   acceptance: 0.47× of linear on both a strong and a weak prompt
+   (8.0 vs 17.2; 6.8 vs 14.4 tok/s). The fork does recover tokens
+   (acceptance 0.59→0.72 / 0.43→0.59) but pays double drafter + double
+   verify + snapshot-restore, and drafter steps dominate cycle cost — an
+   ideal single-pass tree verify still leaves the doubled drafting
+   underwater. Not worth pursuing at this drafter cost structure.
+3. **Prompt cache** (`PairGenerateOptions::prompt_cache_dir`): reuses the
+   longest matching saved KV prefix (suffix-only prefill) and re-saves the
+   extended prefix after prefill. Warm-turn prefill 1.48s → 0.61s on a
+   ~120-token prompt (savings scale with prompt length); generation
+   deterministic across cold/warm. `PAIR_PROMPT_CACHE_DIR` in pair_chat.
+4. **OminiX-API wiring** (separate repo, uncommitted alongside its
+   existing WIP): new `ModelBackend::Gemma4Mtplx` backed by
+   `Gemma4PairSession` — pair-root detection via `mtplx_pair.json` /
+   `target/`+`assistant/` subdirs, config/tokenizer/eos resolution falls
+   back to `target/`, temperature/top_p/seed pass through to the session,
+   metrics logged per request. Serve with:
+   `ominix-api --llm-model <abs path to Gemma4-27B-MTPLX-Optimized-Speed>`
+   (full pair-root path — the registry short id points at `target/`).
 
 ---
 
