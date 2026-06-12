@@ -7,8 +7,9 @@
 //! single-layer draft chains greedily in feature space, and the target
 //! verifies each block.
 //!
-//! The whole feature is env-gated behind `OMINIX_EAGLE3=1` — see
-//! [`session`] for the knob table. Reference semantics: vLLM
+//! EAGLE-3 is the **default** decode path for targets with a discoverable
+//! draft checkpoint; opt out with `OMINIX_EAGLE3=0` — see [`session`] for
+//! the knob table and discovery rules. Reference semantics: vLLM
 //! `llama_eagle3.py` / llama.cpp commit 88a3927.
 
 pub mod adapter;
@@ -19,4 +20,4 @@ pub mod session;
 pub use adapter::Eagle3DraftAdapter;
 pub use config::Eagle3Config;
 pub use model::Eagle3DraftModel;
-pub use session::{env_enabled, Eagle3Session};
+pub use session::{discover_draft, env_enabled, Eagle3Session};

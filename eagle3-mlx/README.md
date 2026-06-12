@@ -5,7 +5,10 @@ draft checkpoints. Currently wired for the Gemma4 family via
 `RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3` (a 0.9B single-layer draft head
 trained against `google/gemma-4-26B-A4B-it`).
 
-The whole feature is **env-gated**: nothing engages unless `OMINIX_EAGLE3=1`.
+EAGLE-3 is the **default decode path** for targets with a discoverable draft
+checkpoint: the session/example auto-discover the draft next to the target and
+fall back to plain AR when none is found (or when validation fails). Opt out
+with `OMINIX_EAGLE3=0`.
 
 ## How it works
 
@@ -39,18 +42,24 @@ implementations: vLLM `llama_eagle3.py`, llama.cpp commit `88a3927`.
 hf download RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3 \
     --local-dir ./models/gemma-4-26B-A4B-it-eagle3
 
-OMINIX_EAGLE3=1 cargo run --release -p eagle3-mlx --example eagle3_generate -- \
+# EAGLE-3 engages automatically: the draft is auto-discovered next to the
+# target (any sibling `*eagle3*` dir with a matching gemma4 verifier).
+cargo run --release -p eagle3-mlx --example eagle3_generate -- \
     ./models/gemma4-26B-a4b-it-UD-MLX-4bit \
-    ./models/gemma-4-26B-A4B-it-eagle3 \
     "Explain speculative decoding in two sentences."
 ```
+
+Draft resolution order: explicit dir argument → `EAGLE3_DRAFT_DIR` →
+`eagle3_draft_path` in the target's config.json → sibling `<target>-eagle3`
+dirs → any sibling `*eagle3*` checkpoint with a Gemma4 verifier. No draft
+found (or `OMINIX_EAGLE3=0`) → plain AR decode on the same model.
 
 ### Env knobs
 
 | var | effect |
 |-----|--------|
-| `OMINIX_EAGLE3=1` | master gate; `Eagle3Session::load` refuses without it |
-| `EAGLE3_DRAFT_DIR` | default draft checkpoint dir for the example |
+| `OMINIX_EAGLE3=0` | opt-out; EAGLE-3 is on by default when a draft is discoverable |
+| `EAGLE3_DRAFT_DIR` | explicit draft checkpoint dir (skips auto-discovery) |
 | `EAGLE3_BLOCK` | draft chain length (default: checkpoint's `speculative_tokens` = 3; the head was trained with 3 TTT steps, so much deeper chains exceed the training horizon) |
 | `EAGLE3_QUANT_DRAFT` | quantize draft embed_tokens + lm_head at load: `8` (default), `4`, or `0`/`off` for bf16 |
 | `EAGLE3_MAX_TOKENS` / `EAGLE3_TEMP` | example-only generation knobs |
