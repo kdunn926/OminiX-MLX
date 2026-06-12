@@ -19,6 +19,16 @@ bottom are reviewed directly as part of working the list.
 
 ## P0 — current spike branch (gemma4 sliding cache / async vision prefill)
 
+- [ ] **HIGH bug (2026-06-11)** `gemma4-mlx/examples/chat_gemma4_ud.rs` — the flat
+  `Vec<KVCache>` path degenerates on the 26B-A4B UD checkpoint (instant repetition
+  loops: "enough to stability." / "..."), under EVERY expert activation variant —
+  so it is NOT the GeGLU experts fix. The same checkpoint + loader through
+  `chat_text` (init_layered_cache: SlidingKVCache for sliding slots) answers
+  perfectly at ~25 tok/s with proper EOS. Suspect: sliding-window masking vs an
+  unbounded flat KVCache in `Attention::forward` (mask offset / window math), or
+  the prompt-cache plumbing. The example's own header notes it stays on
+  Vec<KVCache> only because the prompt-cache API is typed to KVCache — either fix
+  the flat path or port the example to layered caches + extend the save/load API.
 - [x] **HIGH bug** `mlx-rs-core/src/cache.rs:111-138` — blanket `impl KeyValueCache for &mut T`
   forwards only 6 of 10 methods; `trim_kv`, `compact_kv`, `try_fused_attention`,
   `compact_to_last_n`, `physical_offset` fall through to trait defaults: sliding
