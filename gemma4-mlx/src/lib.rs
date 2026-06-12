@@ -8,6 +8,7 @@ pub mod sliding_cache;
 pub mod vision;
 pub mod model;
 pub mod mtplx_target;
+pub mod pair_session;
 pub mod quant_switch;
 pub mod ud_loader;
 pub mod unified_vision;

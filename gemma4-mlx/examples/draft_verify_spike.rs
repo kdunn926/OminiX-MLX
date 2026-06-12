@@ -539,17 +539,20 @@ fn draft_linear(
     seed_hidden: Array,
     n: usize,
 ) -> Result<Vec<i32>> {
+    // GPU-resident greedy chain: the argmax and the next step's embedding
+    // lookup stay on device, so the whole block builds as ONE lazy graph
+    // with a single eval + device→host copy at the end — instead of two
+    // evals plus an `.item()` round-trip per draft step.
     let mut prev_arr = Array::from(&[seed_token][..]).index(NewAxis);
     let mut prev_embed = scaled_token_embed(&mut pair.target, &prev_arr)?;
     let mut recurrent = seed_hidden;
-    let mut out = Vec::with_capacity(n);
+    let mut toks: Vec<Array> = Vec::with_capacity(n);
     for step in 0..n {
         let inputs = build_inputs_embeds(&prev_embed, &recurrent)?;
         // The HF Gemma4 assistant uses a SINGLE position_id (= kv_len - 1)
         // for the entire draft loop; the recurrent hidden carries the "step"
         // information, RoPE doesn't advance. See `candidate_generator.py::
         // Gemma4AssistantCandidateGenerator.get_candidates`.
-        let _ = step;
         // Default: kv_offset - 1 (matches existing impl). Env knobs:
         //   MTPLX_PAIR_POS=kv      → kv_offset (one past last cached)
         //   MTPLX_PAIR_POS=advance → kv_offset - 1 + step (RoPE advances per draft step)
@@ -561,14 +564,17 @@ fn draft_linear(
             _ => kv_offset - 1,
         };
         let aout = pair.assistant.forward(&inputs, position_offset, kv)?;
-        eval([&aout.logits, &aout.last_hidden])?;
-        let tok = argmax_i32(&aout.logits.index((.., -1, ..)).reshape(&[-1])?)?;
-        out.push(tok);
-        prev_arr = Array::from(&[tok][..]).index(NewAxis);
-        prev_embed = scaled_token_embed(&mut pair.target, &prev_arr)?;
+        let tok = argmax_axis!(&aout.logits.index((.., -1, ..)), -1)?
+            .as_dtype(Dtype::Int32)?;          // [1], stays on GPU
+        let tok_2d = tok.reshape(&[1, 1])?;
+        prev_embed = scaled_token_embed(&mut pair.target, &tok_2d)?;
         recurrent = aout.last_hidden;
+        toks.push(tok);
     }
-    Ok(out)
+    let tok_refs: Vec<&Array> = toks.iter().collect();
+    let all = mlx_rs::ops::concatenate(&tok_refs)?; // [n]
+    eval([&all])?;
+    Ok(all.as_slice::<i32>().to_vec())
 }
 
 /// Same as `draft_linear`, but at step 0 takes the SECOND best token from
@@ -766,6 +772,17 @@ fn run_linear_folded(
     let mut stats: Vec<CycleStats> = Vec::new();
     let t0 = std::time::Instant::now();
 
+    // Adaptive block (MTPLX_PAIR_ADAPTIVE=0 disables): shrink by 1 (floor 2)
+    // after a zero-accept cycle, recover by 1 after a full-accept cycle —
+    // NEVER above the configured block. Growth beyond it was measured
+    // harmful (sky 16.7→11.8, fib 18.5→14.1 with a grow-to-8 rule): drafter
+    // steps are the dominant per-cycle cost and chains rarely survive past
+    // ~4, so big blocks burn assistant forwards on doomed drafts.
+    let adaptive = std::env::var("MTPLX_PAIR_ADAPTIVE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let mut cur_block = block;
+
     'outer: while emitted.len() < max_new {
         // The pending token came from the target — commit it up front.
         emitted.push(pending);
@@ -786,14 +803,14 @@ fn run_linear_folded(
                 kv_offset,
                 pending,
                 seed_hidden.clone(),
-                block,
+                cur_block,
                 temp,
                 &mut rng,
             )?;
             (d, Some(q))
         } else {
             (
-                draft_linear(pair, &kv, kv_offset, pending, seed_hidden.clone(), block)?,
+                draft_linear(pair, &kv, kv_offset, pending, seed_hidden.clone(), cur_block)?,
                 None,
             )
         };
@@ -846,7 +863,7 @@ fn run_linear_folded(
         eval([&seed_hidden])?;
 
         stats.push(CycleStats {
-            drafted: block,
+            drafted: cur_block,
             accepted,
         });
         for i in 0..accepted {
@@ -857,9 +874,16 @@ fn run_linear_folded(
         }
         if verbose {
             eprintln!(
-                "  [folded] cycle: drafted={block} accepted={accepted} emitted_total={}",
+                "  [folded] cycle: drafted={cur_block} accepted={accepted} emitted_total={}",
                 emitted.len()
             );
+        }
+        if adaptive {
+            if accepted == cur_block {
+                cur_block = (cur_block + 1).min(block);
+            } else if accepted == 0 {
+                cur_block = cur_block.saturating_sub(1).max(2);
+            }
         }
         pending = next_pending;
     }

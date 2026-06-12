@@ -77,6 +77,35 @@ tok/s on this hardware, consistent with the Python 44 tok/s claim.
    DFlash's `AdaptiveBlockPolicy`), and a production session API outside
    the spike.
 
+### Headroom follow-up (same day): GPU drafter + shrink-only adaptive + session API
+
+1. **GPU-resident greedy drafting**: argmax + next-step embedding stay on
+   device; one eval per draft block instead of 2 evals + an `.item()` per
+   step. Marginal (+0.1 tok/s — assistant compute dominates, syncs don't),
+   kept for cleanliness.
+2. **Adaptive block, shrink-only**: shrink by 1 (floor 2) on a zero-accept
+   cycle, recover by 1 on a full-accept cycle, NEVER above the configured
+   block. A grow-to-8 variant was measured harmful (sky 16.7→11.8). Final:
+
+   | prompt (96 tok, CHAT=1, temp 0) | fixed block 4 | shrink-only adaptive | vs AR 11.7 |
+   |---|---|---|---|
+   | sky-blue | 16.7 | **17.1** (acc 0.59) | 1.46× |
+   | fibonacci | 18.5 | **18.8** (acc 0.65) | **1.61×** |
+   | french-revolution | 12.3 | **14.5** (acc 0.43) | 1.24× |
+
+3. **Production session API**: `gemma4_mlx::pair_session::Gemma4PairSession`
+   (`load(pair_root)` / `generate(prompt_ids, opts, eos, on_token)`)
+   encapsulates the winning configuration — folded cycle, GPU drafting,
+   shrink-only adaptive block 4, greedy or LC sampling (temp/top-k/top-p) —
+   with no env knobs. `examples/pair_chat.rs` is the streaming CLI;
+   reproduces the spike numbers exactly (17.16 tok/s greedy, 13.9 LC at
+   T=1.0/top-k 64/top-p 0.95, acceptance 0.59-0.60). Ready to wire into
+   OminiX-API as a backend.
+
+Next (not started): pipelined/batched drafting beyond one-eval-per-block,
+tree drafting revisit at the now-higher base acceptance, prompt-cache
+support in the session.
+
 ---
 
 Status: **end-to-end working** (2026-05-16, same session as kickoff).
