@@ -38,8 +38,39 @@ fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut model = load_ud_mlx_4bit(&model_dir)?;
     let tokenizer = load_tokenizer(&model_dir)?;
 
-    let encoding = tokenizer.encode(prompt, true)?;
-    let prompt_ids: Vec<i32> = encoding.get_ids().iter().map(|&i| i as i32).collect();
+    // Build the Gemma4 turn structure with the real special tokens
+    // (`<|turn>` / `<turn|>`), same as chat_text. Feeding the instruct
+    // model a raw untemplated prompt was the root cause of the
+    // "flat-KVCache degeneration" finding: the model answers raw text
+    // with junk/instant EOS regardless of cache backend.
+    //   <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n
+    let bos_id = tokenizer
+        .token_to_id("<bos>")
+        .ok_or("tokenizer missing <bos>")? as i32;
+    let turn_start = tokenizer
+        .token_to_id("<|turn>")
+        .ok_or("tokenizer missing <|turn>")? as i32;
+    let turn_end = tokenizer
+        .token_to_id("<turn|>")
+        .ok_or("tokenizer missing <turn|>")? as i32;
+    let newline = tokenizer
+        .token_to_id("\n")
+        .ok_or("tokenizer missing newline")? as i32;
+    let encode = |s: &str| -> Result<Vec<i32>, Box<dyn Error + Send + Sync>> {
+        Ok(tokenizer
+            .encode(s, false)?
+            .get_ids()
+            .iter()
+            .map(|&i| i as i32)
+            .collect())
+    };
+    let mut prompt_ids: Vec<i32> = vec![bos_id, turn_start];
+    prompt_ids.extend(encode("user\n")?);
+    prompt_ids.extend(encode(&prompt)?);
+    prompt_ids.push(turn_end);
+    prompt_ids.push(newline);
+    prompt_ids.push(turn_start);
+    prompt_ids.extend(encode("model\n")?);
 
     // ── Prefix cache (#31): if GEMMA4_PROMPT_CACHE_DIR is set, try to
     // reuse a previously-saved KV state for the longest matching prefix

@@ -19,7 +19,7 @@ bottom are reviewed directly as part of working the list.
 
 ## P0 — current spike branch (gemma4 sliding cache / async vision prefill)
 
-- [ ] **HIGH bug (2026-06-11)** `gemma4-mlx/examples/chat_gemma4_ud.rs` — the flat
+- [x] **HIGH bug (2026-06-11)** `gemma4-mlx/examples/chat_gemma4_ud.rs` — the flat
   `Vec<KVCache>` path degenerates on the 26B-A4B UD checkpoint (instant repetition
   loops: "enough to stability." / "..."), under EVERY expert activation variant —
   so it is NOT the GeGLU experts fix. The same checkpoint + loader through
@@ -29,6 +29,20 @@ bottom are reviewed directly as part of working the list.
   the prompt-cache plumbing. The example's own header notes it stays on
   Vec<KVCache> only because the prompt-cache API is typed to KVCache — either fix
   the flat path or port the example to layered caches + extend the save/load API.
+  **RESOLVED 2026-06-12 — not a cache bug.** The two examples differed in prompt
+  construction, not cache behavior: `chat_gemma4_ud` fed the instruct model the
+  RAW prompt (`tokenizer.encode(prompt, true)` — BOS only, no turn markers) while
+  `chat_text` builds `<bos><|turn>user\n…<turn|>\n<|turn>model\n`. An it-tuned
+  gemma4 given untemplated text answers with junk/instant EOS regardless of cache
+  backend (`chat_text`'s own header documents this for `chat_gemma4`). Fixed by
+  building the same turn structure in `chat_gemma4_ud`. The flat-cache path was
+  then verified equivalent to layered: 1400-token greedy generation (sliding
+  window engaged from ~token 1024) is **byte-identical** between
+  `Vec<KVCache>` (`chat_gemma4_ud`, 30.8 tok/s) and `init_layered_cache`
+  (`chat_text`, 27.3 tok/s), and a 2.2k-token prompt exercising chunked-prefill
+  window masks was also checked (see commit). `Attention::forward`'s per-layer
+  offset-aware sliding mask (`create_causal_mask(L, physical_post - L, window)`)
+  is correct for the unbounded cache.
 - [x] **HIGH bug** `mlx-rs-core/src/cache.rs:111-138` — blanket `impl KeyValueCache for &mut T`
   forwards only 6 of 10 methods; `trim_kv`, `compact_kv`, `try_fused_attention`,
   `compact_to_last_n`, `physical_offset` fall through to trait defaults: sliding
