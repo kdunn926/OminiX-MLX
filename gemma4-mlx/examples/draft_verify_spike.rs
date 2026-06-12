@@ -44,11 +44,25 @@
 //! against HF (position_ids locked for the whole block); layer_scalar
 //! whole-stream placement confirmed correct (hidden_states *= scalar).
 //!
-//! Remaining gap to Python's 0.981: eval regime (greedy chat prompts
-//! here vs T=1.0/top-k 64/top-p 0.95 Leviathan-Chen on long-form code)
-//! plus this harness spends an extra full 1-token target forward per
-//! cycle to install the bonus token (HF folds it into the next verify).
-//! Linear already ~matches AR despite that overhead.
+//! FOLDED LOOP + BLOCK SWEEP (2026-06-11, later same day): the dedicated
+//! per-cycle bonus forward is folded into the next verify (see
+//! `run_linear_folded`, default; MTPLX_PAIR_NO_FOLD=1 restores the old
+//! loop). Folding costs ~0.07 acceptance consistently (the drafter
+//! empirically prefers the unfolded hidden(pending) seed over the
+//! HF-faithful hidden(last_validated)) but halves target passes per
+//! cycle. The bigger lever is BLOCK SIZE — drafter steps are the
+//! dominant per-cycle cost, and long chains rarely survive:
+//!
+//!   folded, 96 tok, CHAT=1, temp=0 (AR baseline 11.7 tok/s):
+//!     prompt        block 8            block 4
+//!     sky-blue      11.0 (acc 0.34)    16.6 (acc 0.55)  = 1.42x AR
+//!     fibonacci     14.4 (acc 0.47)    18.4 (acc 0.64)  = 1.57x AR
+//!     french-rev     7.4 (acc 0.18)    12.2 (acc 0.34)  = 1.04x AR
+//!
+//! Default block is now 4. LC sampling (MTPLX_PAIR_TEMP=1.0 TOP_K=64
+//! TOP_P=0.95, the Python 0.981 regime) measures ~0.44 acceptance on
+//! chat prompts — the 0.981 figure is a long-form code-suite number;
+//! fibonacci's 0.64 at block 4 is the comparable regime here.
 //! ============================================================
 //!
 //! Usage:
@@ -699,6 +713,160 @@ struct CycleStats {
     accepted: usize,
 }
 
+/// Folded linear loop: the bonus/correction token is verified as part of the
+/// NEXT cycle's target forward instead of a dedicated 1-token forward —
+/// matching HF's `Gemma4AssistantCandidateGenerator` + `_assisted_decoding`.
+///
+/// Per cycle: ONE target pass over `[pending, d_0..d_{N-1}]` (N+1 tokens)
+/// instead of two (N-token verify + 1-token bonus install). The single pass
+/// verifies the drafts, installs `pending`'s K/V, and yields the hidden state
+/// for the next drafter seed. The seeding also becomes HF-exact: the drafter
+/// conditions on `[embed(pending) || hidden(last VALIDATED token)]`, whereas
+/// the unfolded loop used `hidden(pending)` (one position later than the
+/// drafter was trained on).
+fn run_linear_folded(
+    pair: &mut Pair,
+    prompt_ids: &[i32],
+    max_new: usize,
+    block: usize,
+    verbose: bool,
+) -> Result<(Vec<i32>, Vec<CycleStats>, f32)> {
+    let n_layers = pair.target.args.num_hidden_layers as usize;
+    let mut cache: Vec<KVCache> = init_cache::<KVCache>(n_layers);
+    let hidden_h = pair.target.args.hidden_size;
+
+    // Prefill. Cache holds only the prompt; `pending` (the model's next-token
+    // prediction) is NOT in the cache — its K/V lands with the first verify.
+    let prompt_arr = Array::from(prompt_ids).index(NewAxis);
+    let prefill_hidden = pair.target.model.forward(ModelInput {
+        inputs: &prompt_arr,
+        mask: None,
+        cache: &mut cache,
+    })?;
+    eval([&prefill_hidden])?;
+    let mut seed_hidden = prefill_hidden
+        .index((.., -1, ..))
+        .reshape(&[1, 1, hidden_h])?;
+    let first_logits = pair.target.forward_via_hidden(&seed_hidden)?;
+    eval([&first_logits])?;
+
+    let temp = pair_temp();
+    let mut rng = Lcg::from_env();
+    let mut pending: i32 = if temp > 0.0 {
+        let probs = softmax_row_fp32(&first_logits.reshape(&[-1])?, temp)?;
+        sample_categorical(&probs, &mut rng)
+    } else {
+        argmax_i32(&first_logits.reshape(&[-1])?)?
+    };
+    if temp > 0.0 {
+        eprintln!("  [LC] folded stochastic draft + Leviathan-Chen acceptance at T={temp:.3}");
+    }
+
+    let mut emitted: Vec<i32> = Vec::new();
+    let mut stats: Vec<CycleStats> = Vec::new();
+    let t0 = std::time::Instant::now();
+
+    'outer: while emitted.len() < max_new {
+        // The pending token came from the target — commit it up front.
+        emitted.push(pending);
+        if EOS.contains(&pending) || emitted.len() >= max_new {
+            break;
+        }
+
+        let kv = build_shared_kv(&cache, pair.last_sliding, pair.last_full)?;
+        // The cache holds only validated tokens, so `pending` sits at
+        // position cache_len. `draft_linear`'s default (frozen) position is
+        // `kv_offset - 1`, so hand it cache_len + 1.
+        let kv_offset = kv.sliding_k.shape()[2] + 1;
+
+        let (drafted, q_rows): (Vec<i32>, Option<Vec<Vec<f32>>>) = if temp > 0.0 {
+            let (d, q) = draft_linear_stochastic(
+                pair,
+                &kv,
+                kv_offset,
+                pending,
+                seed_hidden.clone(),
+                block,
+                temp,
+                &mut rng,
+            )?;
+            (d, Some(q))
+        } else {
+            (
+                draft_linear(pair, &kv, kv_offset, pending, seed_hidden.clone(), block)?,
+                None,
+            )
+        };
+
+        // Single target pass over [pending, drafted..]. Row i of the logits
+        // is the target's distribution for the position of drafted[i]
+        // (input i is its predecessor); row N is the bonus row.
+        let mut chain: Vec<i32> = Vec::with_capacity(drafted.len() + 1);
+        chain.push(pending);
+        chain.extend_from_slice(&drafted);
+        let in_arr = Array::from(chain.as_slice()).index(NewAxis);
+        let hidden = pair.target.model.forward(ModelInput {
+            inputs: &in_arr,
+            mask: None,
+            cache: &mut cache,
+        })?;
+        let logits = pair.target.forward_via_hidden(&hidden)?;
+        eval([&logits])?;
+
+        let (accepted, next_pending) = if let Some(q_rows) = q_rows.as_ref() {
+            let prev = logits.index((.., 0, ..));
+            let rest = logits.index((.., 1.., ..));
+            lc_acceptance(&prev, &rest, &drafted, q_rows, temp, &mut rng)?
+        } else {
+            let mut acc = 0usize;
+            for (i, &d) in drafted.iter().enumerate() {
+                let pred = argmax_i32(&logits.index((.., i as i32, ..)).reshape(&[-1])?)?;
+                if d == pred {
+                    acc += 1;
+                } else {
+                    break;
+                }
+            }
+            let bonus = argmax_i32(&logits.index((.., acc as i32, ..)).reshape(&[-1])?)?;
+            (acc, bonus)
+        };
+
+        // Cache grew by N+1; keep [pending + accepted drafts].
+        let to_drop = (drafted.len() - accepted) as i32;
+        if to_drop > 0 {
+            for c in cache.iter_mut() {
+                c.trim(to_drop);
+            }
+        }
+        // Next drafter seed: hidden at the last VALIDATED position
+        // (input index `accepted` = pending when 0, else d_{accepted-1}).
+        seed_hidden = hidden
+            .index((.., accepted as i32, ..))
+            .reshape(&[1, 1, hidden_h])?;
+        eval([&seed_hidden])?;
+
+        stats.push(CycleStats {
+            drafted: block,
+            accepted,
+        });
+        for i in 0..accepted {
+            emitted.push(drafted[i]);
+            if EOS.contains(&drafted[i]) || emitted.len() >= max_new {
+                break 'outer;
+            }
+        }
+        if verbose {
+            eprintln!(
+                "  [folded] cycle: drafted={block} accepted={accepted} emitted_total={}",
+                emitted.len()
+            );
+        }
+        pending = next_pending;
+    }
+
+    Ok((emitted, stats, t0.elapsed().as_secs_f32()))
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Linear,
@@ -935,7 +1103,10 @@ fn main() -> Result<()> {
     let max_new: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(96);
     // Default block_size=6 matches the assistant's generation_config.json
     // (`num_assistant_tokens: 6`) and `mtplx_pair.json`'s tuned setting.
-    let block: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(6);
+    // Default block 4: the 2026-06-11 sweep shows smaller blocks win across
+    // acceptance regimes (drafter steps are the dominant per-cycle cost; long
+    // chains rarely survive verification). See header RESULTS.
+    let block: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(4);
 
     println!("target_dir : {}", root.display());
     println!("prompt     : {prompt:?}");
@@ -998,18 +1169,34 @@ fn main() -> Result<()> {
         last_full,
     };
 
-    let (e_lin, s_lin, t_lin) = run_mode(&mut pair, Mode::Linear, &prompt_ids, max_new, block, false)?;
-    report("LINEAR", &e_lin, &s_lin, t_lin, &tokenizer);
+    // Default: folded linear (one target pass per cycle). MTPLX_PAIR_NO_FOLD=1
+    // restores the unfolded loop (separate bonus forward) for A/B. Tree2 is
+    // opt-in via MTPLX_PAIR_TREE2=1 — known worse (costs 2x verify for ~same
+    // acceptance).
+    let folded = std::env::var("MTPLX_PAIR_NO_FOLD").is_err();
+    let (e_lin, s_lin, t_lin) = if folded {
+        run_linear_folded(&mut pair, &prompt_ids, max_new, block, false)?
+    } else {
+        run_mode(&mut pair, Mode::Linear, &prompt_ids, max_new, block, false)?
+    };
+    report(
+        if folded { "LINEAR (folded)" } else { "LINEAR (unfolded)" },
+        &e_lin,
+        &s_lin,
+        t_lin,
+        &tokenizer,
+    );
 
-    let (e_tree, s_tree, t_tree) =
-        run_mode(&mut pair, Mode::Tree2, &prompt_ids, max_new, block, false)?;
-    report("TREE2 (top-2 fork @ root)", &e_tree, &s_tree, t_tree, &tokenizer);
-
-    let lin_tps = e_lin.len() as f32 / t_lin.max(1e-6);
-    let tree_tps = e_tree.len() as f32 / t_tree.max(1e-6);
-    println!("\n=== Comparison ===");
-    println!("  Linear : {:.2} tok/s", lin_tps);
-    println!("  Tree2  : {:.2} tok/s", tree_tps);
-    println!("  Tree/Lin: {:.2}×", tree_tps / lin_tps.max(1e-6));
+    if std::env::var("MTPLX_PAIR_TREE2").is_ok() {
+        let (e_tree, s_tree, t_tree) =
+            run_mode(&mut pair, Mode::Tree2, &prompt_ids, max_new, block, false)?;
+        report("TREE2 (top-2 fork @ root)", &e_tree, &s_tree, t_tree, &tokenizer);
+        let lin_tps = e_lin.len() as f32 / t_lin.max(1e-6);
+        let tree_tps = e_tree.len() as f32 / t_tree.max(1e-6);
+        println!("\n=== Comparison ===");
+        println!("  Linear : {:.2} tok/s", lin_tps);
+        println!("  Tree2  : {:.2} tok/s", tree_tps);
+        println!("  Tree/Lin: {:.2}×", tree_tps / lin_tps.max(1e-6));
+    }
     Ok(())
 }

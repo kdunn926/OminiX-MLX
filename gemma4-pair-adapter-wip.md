@@ -48,6 +48,35 @@ target forward per cycle to install the bonus token (HF folds that into
 the next verify). With those addressed the cost model supports ~35-45
 tok/s on this hardware, consistent with the Python 44 tok/s claim.
 
+### Follow-up (same day): folded loop + block sweep → 1.0-1.6× over AR
+
+1. **Bonus-forward fold implemented** (`run_linear_folded`, now the spike
+   default; `MTPLX_PAIR_NO_FOLD=1` restores the old loop): one target pass
+   per cycle over `[pending, drafts..]` instead of an N-token verify plus a
+   1-token bonus install. Folding costs ~0.07 acceptance on every prompt
+   tested — the drafter empirically prefers the unfolded
+   `hidden(pending)` seed over the HF-faithful `hidden(last_validated)`,
+   despite the latter matching `Gemma4AssistantCandidateGenerator`'s
+   indexing exactly — but still nets equal-or-better tok/s.
+2. **Block size is the dominant lever.** Drafter steps (2 evals each) are
+   the main per-cycle cost and chains rarely survive past ~4:
+
+   | prompt (96 tok, CHAT=1, temp 0) | block 8 | block 4 | vs AR 11.7 |
+   |---|---|---|---|
+   | sky-blue | 11.0 (acc 0.34) | **16.6** (acc 0.55) | **1.42×** |
+   | fibonacci | 14.4 (acc 0.47) | **18.4** (acc 0.64) | **1.57×** |
+   | french-revolution | 7.4 (acc 0.18) | **12.2** (acc 0.34) | 1.04× |
+
+   Spike default block is now 4. The pair is above AR on code/factual
+   prompts and at parity on freeform prose. LC sampling at the Python
+   reference regime (T=1.0/top-k 64/top-p 0.95) measures ~0.44 acceptance
+   on chat prompts — 0.981 is a long-form code-suite number, not
+   reproducible on chat-style prompts.
+3. Remaining headroom: batch the drafter's 2-evals-per-step sync structure
+   (async/pipelined drafting), adaptive block (shrink on rejection like
+   DFlash's `AdaptiveBlockPolicy`), and a production session API outside
+   the spike.
+
 ---
 
 Status: **end-to-end working** (2026-05-16, same session as kickoff).
