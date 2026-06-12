@@ -43,11 +43,109 @@ use mlx_rs_core::{
 
 use crate::config::Eagle3Config;
 
+/// A weight matrix that may be load-time quantized.
+///
+/// The draft's two big tensors dominate its cost: `lm_head` (`[32k, H]`,
+/// 180 MB bf16) is fully re-read by every chain step's logits matmul, and
+/// `embed_tokens` (`[262k, H]`, 1.5 GB bf16) dominates resident memory.
+/// Quantizing both cuts per-cycle bandwidth ~4x and residency ~3.7x;
+/// the decoder-layer projections are small and stay bf16.
+pub enum QuantizableWeight {
+    Dense(Array),
+    Quantized {
+        w: Array,
+        scales: Array,
+        biases: Array,
+        group_size: i32,
+        bits: i32,
+    },
+}
+
+impl QuantizableWeight {
+    fn quantize(w: Array, bits: i32) -> Result<Self, Exception> {
+        let group_size = 64;
+        let (wq, scales, biases) = ops::quantize(&w, group_size, bits, None)?;
+        mlx_rs::transforms::eval([&wq, &scales, &biases])?;
+        Ok(Self::Quantized {
+            w: wq,
+            scales,
+            biases,
+            group_size,
+            bits,
+        })
+    }
+
+    /// `x @ w.T` — the lm_head projection.
+    fn matmul_t(&self, x: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(w) => ops::matmul(x, w.t()),
+            Self::Quantized {
+                w,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => ops::quantized_matmul(
+                x,
+                w,
+                scales,
+                biases,
+                true,
+                *group_size,
+                *bits,
+                None::<&'static str>,
+            ),
+        }
+    }
+
+    /// Row gather — the embedding lookup. `ids` indexes axis 0.
+    fn rows(&self, ids: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(w) => w.try_index(ids),
+            Self::Quantized {
+                w,
+                scales,
+                biases,
+                group_size,
+                bits,
+            } => ops::dequantize(
+                &w.try_index(ids)?,
+                &scales.try_index(ids)?,
+                &biases.try_index(ids)?,
+                *group_size,
+                *bits,
+                None::<&'static str>,
+            ),
+        }
+    }
+
+    fn shape0(&self) -> i32 {
+        match self {
+            Self::Dense(w) => w.shape()[0],
+            Self::Quantized { w, .. } => w.shape()[0],
+        }
+    }
+}
+
+/// `EAGLE3_QUANT_DRAFT`: `8` (default) or `4` quantize the draft's
+/// embed_tokens + lm_head at load; `0`/`off` keeps them bf16.
+///
+/// Measured on 26B-A4B (300-token greedy): 8-bit is both faster than 4-bit
+/// (40.0 vs 39.3 tok/s — 4-bit's acceptance dip 0.482→0.466 costs more than
+/// its bandwidth saving) and acceptance-lossless vs bf16.
+fn quant_draft_bits() -> Option<i32> {
+    match std::env::var("EAGLE3_QUANT_DRAFT").ok().as_deref() {
+        Some("0") | Some("off") | Some("none") => None,
+        Some("4") => Some(4),
+        _ => Some(8),
+    }
+}
+
 pub struct Eagle3DraftModel {
     pub config: Eagle3Config,
 
     // [V_target, H] — full target vocab so committed token ids embed directly.
-    embed_tokens: Array,
+    embed_tokens: QuantizableWeight,
     // [H, 3H] — aux hidden fusion.
     fc: Array,
 
@@ -65,7 +163,7 @@ pub struct Eagle3DraftModel {
 
     // Final norm + reduced-vocab head.
     norm: Array,
-    lm_head: Array, // [V_draft, H]
+    lm_head: QuantizableWeight, // [V_draft, H]
     // [V_draft] i64 offsets: target_id = draft_id + d2t[draft_id].
     d2t: Array,
 
@@ -105,8 +203,19 @@ impl Eagle3DraftModel {
             .build()
             .expect("Infallible");
 
+        let quant_bits = quant_draft_bits();
+        let wrap = |w: Array| -> Result<QuantizableWeight, Error> {
+            match quant_bits {
+                Some(bits) => Ok(QuantizableWeight::quantize(w, bits)?),
+                None => Ok(QuantizableWeight::Dense(w)),
+            }
+        };
+        if let Some(bits) = quant_bits {
+            eprintln!("[eagle3] draft embed_tokens + lm_head quantized to {bits}-bit (EAGLE3_QUANT_DRAFT)");
+        }
+
         let model = Self {
-            embed_tokens: get(&weights, "embed_tokens.weight")?,
+            embed_tokens: wrap(get(&weights, "embed_tokens.weight")?)?,
             fc: get(&weights, "fc.weight")?,
             input_layernorm: get(&weights, "layers.0.input_layernorm.weight")?,
             hidden_norm: get(&weights, "layers.0.hidden_norm.weight")?,
@@ -119,7 +228,7 @@ impl Eagle3DraftModel {
             up_proj: get(&weights, "layers.0.mlp.up_proj.weight")?,
             down_proj: get(&weights, "layers.0.mlp.down_proj.weight")?,
             norm: get(&weights, "norm.weight")?,
-            lm_head: get(&weights, "lm_head.weight")?,
+            lm_head: wrap(get(&weights, "lm_head.weight")?)?,
             d2t: get(&weights, "d2t")?,
             rope,
             n_heads: tl.num_attention_heads,
@@ -147,10 +256,10 @@ impl Eagle3DraftModel {
                 2 * h
             )));
         }
-        if model.lm_head.shape()[0] != model.config.draft_vocab_size {
+        if model.lm_head.shape0() != model.config.draft_vocab_size {
             return Err(Error::InvalidConfig(format!(
                 "lm_head rows {} != draft_vocab_size {}",
-                model.lm_head.shape()[0],
+                model.lm_head.shape0(),
                 model.config.draft_vocab_size
             )));
         }
@@ -163,7 +272,7 @@ impl Eagle3DraftModel {
 
     /// Embed committed token ids `[B, T]` (target vocab) → `[B, T, H]`.
     pub fn embed(&self, ids: &Array) -> Result<Array, Exception> {
-        self.embed_tokens.try_index(ids)
+        self.embed_tokens.rows(ids)
     }
 
     /// Fuse concatenated aux hidden states `[B, T, n_aux*H]` → `[B, T, H]`.
@@ -251,7 +360,7 @@ impl Eagle3DraftModel {
     /// Draft-vocab logits for pre-norm hidden rows `[B, T, H]` → `[B, T, Vd]`.
     pub fn logits(&self, prenorm_hidden: &Array) -> Result<Array, Exception> {
         let normed = fast::rms_norm(prenorm_hidden, &self.norm, self.eps)?;
-        ops::matmul(&normed, self.lm_head.t())
+        self.lm_head.matmul_t(&normed)
     }
 
     /// Greedy-pick a draft token from the last row of `[B, T, Vd]` logits and

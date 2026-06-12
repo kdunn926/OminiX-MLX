@@ -52,6 +52,7 @@ OMINIX_EAGLE3=1 cargo run --release -p eagle3-mlx --example eagle3_generate -- \
 | `OMINIX_EAGLE3=1` | master gate; `Eagle3Session::load` refuses without it |
 | `EAGLE3_DRAFT_DIR` | default draft checkpoint dir for the example |
 | `EAGLE3_BLOCK` | draft chain length (default: checkpoint's `speculative_tokens` = 3; the head was trained with 3 TTT steps, so much deeper chains exceed the training horizon) |
+| `EAGLE3_QUANT_DRAFT` | quantize draft embed_tokens + lm_head at load: `8` (default), `4`, or `0`/`off` for bf16 |
 | `EAGLE3_MAX_TOKENS` / `EAGLE3_TEMP` | example-only generation knobs |
 
 ## Model gating
@@ -70,18 +71,20 @@ adapter (the draft model + session loop are family-agnostic).
 |------|--------------|------------|
 | autoregressive (`ar_bench`, layered KV) | 32.0 | — |
 | autoregressive (`ar_bench`, flat KV) | 32.2 | — |
-| EAGLE-3, block 2 | 35.4 | 0.48 |
-| EAGLE-3, block 3 (default) | 36.3 | 0.48 |
-| EAGLE-3, block 4 | 35.5 | 0.47 |
-| EAGLE-3, block 5 | 34.9 | 0.45 |
+| EAGLE-3, block 2, bf16 draft | 35.4 | 0.48 |
+| EAGLE-3, block 3, bf16 draft | 36.3 | 0.48 |
+| EAGLE-3, block 4, bf16 draft | 35.5 | 0.47 |
+| EAGLE-3, block 5, bf16 draft | 34.9 | 0.45 |
+| EAGLE-3, block 3, 4-bit draft head | 39.3 | 0.47 |
+| **EAGLE-3, block 3, 8-bit draft head (default)** | **40.0** | **0.48** |
 
-A 1.13x speedup over AR. Short factual answers reach 0.83 acceptance. The
-modest ratio is the same MoE economics dflash hit: with only 3.8B active
-params the AR step is already cheap, while each verify block pays the expert
-gather for `block+1` positions and the draft's bf16 lm_head/embedding adds
-~0.5 GB of reads per cycle (quantizing the draft head is the obvious next
-optimization). Greedy speculative decoding is output-identical to greedy AR
-by construction (every committed token is argmax'd from target logits).
+A 1.24x speedup over AR with the default 8-bit draft head (acceptance-lossless
+vs bf16; 4-bit trades a small acceptance dip for nothing). Short factual
+answers reach 0.83 acceptance. The remaining gap to bigger ratios is MoE
+economics (same as dflash): with only 3.8B active params the AR step is
+already cheap, while each verify block pays the expert gather for `block+1`
+positions. Greedy speculative decoding is output-identical to greedy AR by
+construction (every committed token is argmax'd from target logits).
 
 ## Known limits
 
