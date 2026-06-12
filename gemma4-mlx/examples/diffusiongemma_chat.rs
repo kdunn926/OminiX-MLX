@@ -8,6 +8,11 @@
 //!   DIFFUSION_STEPS=N   override max denoising steps (default from config, 48)
 //!   DIFFUSION_RAW=1     skip the chat template (raw continuation)
 //!   DIFFUSION_SEED=N    seed MLX RNG (canvas init is random)
+//!
+//! Smoke (2026-06-11, diffusiongemma-26B-A4B-it-4bit, sky-blue question,
+//! chat template, seed 7): coherent two-sentence answer, clean EOS at
+//! 43 tokens, 14.9 tok/s; the canvas converged in 10/48 denoising steps
+//! via the stability early-exit (442 decoder work-tok/s).
 
 use std::env;
 use std::path::PathBuf;
