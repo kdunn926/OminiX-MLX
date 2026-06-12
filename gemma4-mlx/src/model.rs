@@ -3206,14 +3206,14 @@ pub fn load_all_weights_unfiltered(model_dir: &Path) -> Result<HashMap<String, A
     Ok(all_weights)
 }
 
-fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array, Error> {
+pub(crate) fn get_weight(weights: &HashMap<String, Array>, key: &str) -> Result<Array, Error> {
     weights
         .get(key)
         .cloned()
         .ok_or_else(|| Error::Model(format!("Weight not found: {key}")))
 }
 
-fn get_weight_optional(weights: &HashMap<String, Array>, key: &str) -> Option<Array> {
+pub(crate) fn get_weight_optional(weights: &HashMap<String, Array>, key: &str) -> Option<Array> {
     weights.get(key).cloned()
 }
 
@@ -3371,7 +3371,7 @@ fn fuse_qkv_linears(
     }
 }
 
-fn make_mq_embedding(
+pub(crate) fn make_mq_embedding(
     weights: &HashMap<String, Array>,
     prefix: &str,
     quant: Option<&QuantizationConfig>,
@@ -3420,7 +3420,7 @@ fn make_mq_embedding(
 
 /// Apply either an embedding or its quantized counterpart as a linear
 /// projection (tied lm_head fallback).
-fn mq_embedding_as_linear(
+pub(crate) fn mq_embedding_as_linear(
     embed: &mut MaybeQuantized<nn::Embedding>,
     x: &Array,
 ) -> Result<Array, Exception> {
@@ -3471,7 +3471,7 @@ fn mq_linear_dequant_weight(
     }
 }
 
-fn make_rms_norm(weight: Array, eps: f32) -> nn::RmsNorm {
+pub(crate) fn make_rms_norm(weight: Array, eps: f32) -> nn::RmsNorm {
     // HF Gemma4 weights are stored as actual scale values (initialized to ones),
     // NOT as zero-centered offsets. Use them directly.
     nn::RmsNorm {
@@ -3844,6 +3844,11 @@ pub fn build_model_from_weights(
                     gate_proj: make_qsl("gate_proj")?,
                     up_proj: make_qsl("up_proj")?,
                     down_proj: make_qsl("down_proj")?,
+                    // Use the configured activation (gelu_pytorch_tanh for
+                    // Gemma4). The previous hardcoded fused_swiglu silently
+                    // ran SiLU experts on the UD path while the reference
+                    // (mlx-vlm gemma4 SwitchGLU) uses GeGLU.
+                    activation,
                 };
                 let sgx = crate::quant_switch::SwitchGluExperts {
                     hidden_size: args.hidden_size,

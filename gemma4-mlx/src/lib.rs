@@ -2,6 +2,7 @@
 
 pub mod assistant;
 pub mod chat;
+pub mod diffusion;
 pub mod mixed_cache;
 pub mod sliding_cache;
 pub mod vision;

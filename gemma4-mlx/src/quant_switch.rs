@@ -118,6 +118,19 @@ pub struct SwitchGLU {
     pub up_proj: QuantizedSwitchLinear,
     #[param]
     pub down_proj: QuantizedSwitchLinear,
+
+    /// Expert activation. Gemma4 UD checkpoints use SwiGLU (the fused
+    /// kernel); DiffusionGemma experts use geglu (gelu_approx(gate) * up).
+    pub activation: crate::model::GemmaActivation,
+}
+
+impl SwitchGLU {
+    fn activate(&self, gate: &Array, up: &Array) -> Result<Array, Exception> {
+        match self.activation {
+            crate::model::GemmaActivation::Silu => fused_swiglu(up, gate),
+            other => other.apply(gate)?.multiply(up),
+        }
+    }
 }
 
 impl SwitchGLU {
@@ -141,7 +154,7 @@ impl SwitchGLU {
 
             let gate = self.gate_proj.apply(&x_sorted, &indices_sorted, true)?;
             let up = self.up_proj.apply(&x_sorted, &indices_sorted, true)?;
-            let activated = fused_swiglu(&up, &gate)?;
+            let activated = self.activate(&gate, &up)?;
             let output = self.down_proj.apply(&activated, &indices_sorted, true)?;
 
             let output_unsorted =
@@ -156,7 +169,7 @@ impl SwitchGLU {
         } else {
             let gate = self.gate_proj.apply(&x_expanded, indices, false)?;
             let up = self.up_proj.apply(&x_expanded, indices, false)?;
-            let activated = fused_swiglu(&up, &gate)?;
+            let activated = self.activate(&gate, &up)?;
             let output = self.down_proj.apply(&activated, indices, false)?;
 
             let shape = output.shape();
