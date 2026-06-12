@@ -53,6 +53,7 @@ members = [
     "qwen3.5-35B-mlx",
     "qwen3.6-mlx",
     "dflash-mlx",
+    "eagle3-mlx",
     "mtplx-mlx",
     "deepseek-ocr2-mlx",
     "qwen3-vl-mlx",

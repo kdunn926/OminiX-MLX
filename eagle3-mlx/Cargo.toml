@@ -1,0 +1,25 @@
+[package]
+name = "eagle3-mlx"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "EAGLE-3 speculative decoding for MLX Rust (speculators-format draft checkpoints)"
+
+[dependencies]
+mlx-rs = { path = "../mlx-rs", features = ["metal", "accelerate", "safetensors"] }
+mlx-rs-core = { path = "../mlx-rs-core" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+safetensors = "0.6"
+memmap2 = "0.9"
+tokenizers = "0.21"
+dflash-mlx = { path = "../dflash-mlx" }
+gemma4-mlx = { path = "../gemma4-mlx" }
+
+[dev-dependencies]
+anyhow = "1"
+
+[[example]]
+name = "eagle3_generate"
+path = "examples/eagle3_generate.rs"

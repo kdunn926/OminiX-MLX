@@ -63,6 +63,15 @@ pub trait DraftModel {
     /// embedding at noise[0] and skips output[0], making draft predictions align with
     /// posterior targets.  Default is a no-op for adapters that don't use it.
     fn set_staged_embedding(&mut self, _emb: Array) {}
+
+    /// Notify the draft of the tokens committed this cycle, in order: the
+    /// `n_accepted` accepted drafted tokens followed by the target's
+    /// correction/bonus token. Fires on every cycle of `run_generate`,
+    /// including CopySpec short-circuit cycles where `draft_block` was never
+    /// called — drafters that maintain token-aligned state (e.g. EAGLE-style
+    /// feature caches) rely on this rather than on their own drafted tokens.
+    /// Default is a no-op for stateless drafters.
+    fn observe_committed(&mut self, _tokens: &[u32]) {}
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +237,7 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                     .and_then(|token| scalar_token(&token))
                 {
                     Ok(token) => {
+                        self.draft.observe_committed(&[token]);
                         pending.push_back(Ok(token));
                         initialized = true;
                         continue;
@@ -274,6 +284,9 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
                     .and_then(|token| scalar_token(&token))
                 {
                     Ok(token) => {
+                        // The single-token verify above appended one hidden
+                        // row; keep token-aligned drafters in sync with it.
+                        self.draft.observe_committed(&[token]);
                         pending.push_back(Ok(token));
                         continue;
                     }
@@ -433,16 +446,15 @@ impl<Target: TargetModel, Draft: DraftModel> DFlashSession<Target, Draft> {
             }
             pending.push_back(Ok(target_token));
 
-            // Extend the CopySpec index with everything that got committed
-            // this cycle: the n_accepted drafted tokens that survived
-            // verification + the target's correction/stage token.
+            // Everything that got committed this cycle: the n_accepted
+            // drafted tokens that survived verification + the target's
+            // correction/stage token. Drives both the CopySpec index and
+            // the drafter's committed-token bookkeeping.
+            let mut committed: Vec<u32> =
+                drafted_vec.iter().take(n_accepted).copied().collect();
+            committed.push(target_token);
+            self.draft.observe_committed(&committed);
             if let Some(copyspec) = self.copyspec.as_mut() {
-                let mut committed: Vec<u32> = drafted_vec
-                    .iter()
-                    .take(n_accepted)
-                    .copied()
-                    .collect();
-                committed.push(target_token);
                 copyspec.append_committed(&committed);
             }
 
