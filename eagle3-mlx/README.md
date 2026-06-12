@@ -90,9 +90,10 @@ construction (every committed token is argmax'd from target logits).
 
 - Linear chains only (tree drafting was evaluated for this codebase and closed
   as a regression; see `gemma4-pair-adapter-wip.md`).
-- The target adapter uses the flat `KVCache`; contexts past the 1024-token
-  sliding window inherit the open `chat_gemma4_ud` flat-cache finding in
-  `review-findings.md` until that bug is resolved.
+- The target adapter uses the flat `KVCache`, which grows unbounded with
+  context (the flat path itself is verified output-identical to the layered
+  sliding cache through long generations — see `review-findings.md`, resolved
+  2026-06-12).
 - `Eagle3Session` disables the DFlash hidden-segment cap
   (`DFLASH_MAX_HIDDEN_SEGS=0`) unless overridden, so the hidden accumulator
   grows with generation length (~17 KB/token at 3x2816 bf16).
