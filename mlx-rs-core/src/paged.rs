@@ -573,10 +573,15 @@ impl PagedKvCache {
     /// (forked / free-list-reused sequences) fall back to the
     /// `paged_gather_blocks` Metal kernel.
     fn gather(&self) -> Result<Option<(Array, Array)>, Exception> {
-        let n = self.table.n_tokens;
-        if n == 0 {
+        if self.table.n_tokens == 0 {
             return Ok(None);
         }
+        // Contiguous single-sequence case → free arena slice, no copy.
+        if let Some(kv) = self.contiguous_slice()? {
+            return Ok(Some(kv));
+        }
+        // Non-contiguous (forked / free-list-reused) → gather kernel.
+        let n = self.table.n_tokens;
         let pool = self.pool.borrow();
         let (b, h, k_d, v_d) = pool
             .dims()
@@ -588,23 +593,43 @@ impl PagedKvCache {
         let v_arena = pool
             .v_arena_ref()
             .ok_or_else(|| Exception::custom("PagedKvCache::gather: no value arena"))?;
+        let seq = pool.arena_tokens();
+        let table = self.block_table_array();
+        let k = crate::metal_kernels::gather_blocks(k_arena, &table, n, bs, seq, b, h, k_d)?;
+        let v = crate::metal_kernels::gather_blocks(v_arena, &table, n, bs, seq, b, h, v_d)?;
+        Ok(Some((k, v)))
+    }
 
+    /// If the sequence's physical blocks are contiguous in the arena (the
+    /// common single-sequence case), return a **free slice** `[B, Hkv, n, D]`
+    /// of K and V — no copy, no gather kernel. Returns `None` when the block
+    /// table is non-contiguous (forked / free-list-reused) so the caller can
+    /// gather or fall back to the paged kernel. Shared by `gather` and the
+    /// `try_fused_attention` contiguous decode fast-path.
+    fn contiguous_slice(&self) -> Result<Option<(Array, Array)>, Exception> {
+        let n = self.table.n_tokens;
+        if n == 0 {
+            return Ok(None);
+        }
         let blocks = &self.table.blocks;
         let contiguous = blocks
             .iter()
             .enumerate()
             .all(|(i, id)| id.0 == blocks[0].0 + i);
-        if contiguous {
-            let start = blocks[0].0 as i32 * bs;
-            let k = k_arena.index((Ellipsis, start..start + n, ..));
-            let v = v_arena.index((Ellipsis, start..start + n, ..));
-            return Ok(Some((k, v)));
+        if !contiguous {
+            return Ok(None);
         }
-
-        let seq = pool.arena_tokens();
-        let table = self.block_table_array();
-        let k = crate::metal_kernels::gather_blocks(k_arena, &table, n, bs, seq, b, h, k_d)?;
-        let v = crate::metal_kernels::gather_blocks(v_arena, &table, n, bs, seq, b, h, v_d)?;
+        let pool = self.pool.borrow();
+        let bs = pool.block_size();
+        let k_arena = pool
+            .k_arena_ref()
+            .ok_or_else(|| Exception::custom("PagedKvCache::contiguous_slice: no key arena"))?;
+        let v_arena = pool
+            .v_arena_ref()
+            .ok_or_else(|| Exception::custom("PagedKvCache::contiguous_slice: no value arena"))?;
+        let start = blocks[0].0 as i32 * bs;
+        let k = k_arena.index((Ellipsis, start..start + n, ..));
+        let v = v_arena.index((Ellipsis, start..start + n, ..));
         Ok(Some((k, v)))
     }
 }
@@ -696,6 +721,28 @@ impl KeyValueCache for PagedKvCache {
             return Ok(None);
         }
         self.append(&k_new, &v_new)?;
+
+        // Contiguous-decode fast path. When the sequence's physical blocks are
+        // contiguous in the arena (the common single-sequence case), a free
+        // arena slice + standard SDPA is much faster than the
+        // `paged_attention_decode` kernel, which is register-bound at D=256 and
+        // ~never beats contiguous SDPA below ~2300 tokens (its block-table
+        // indirection is pure overhead when blocks are already contiguous).
+        // This recovers the regression vs the default contiguous `KVCache` for
+        // single-sequence decode while keeping the paged kernel for the
+        // genuinely scattered (forked / free-list-reused) case below.
+        if let Some((k, v)) = self.contiguous_slice()? {
+            let out = crate::utils::scaled_dot_product_attention::<crate::cache::KVCache>(
+                q.clone(),
+                k,
+                v,
+                None,
+                scale,
+                None,
+            )?;
+            return Ok(Some(out));
+        }
+
         let b = q.shape()[0];
         let hq = q.shape()[1];
         let d = q.shape()[3];
