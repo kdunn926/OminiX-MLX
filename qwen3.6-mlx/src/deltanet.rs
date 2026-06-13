@@ -21,13 +21,6 @@ use crate::cache::RecurrentState;
 /// the 48-head, 128-dim state configuration. Benchmarks on 257 tokens:
 /// interval 4 → 2.46s, 8 → 2.38s, 16 → 2.65s, none → 2.86s.
 const EVAL_INTERVAL: i32 = 8;
-// Disabled (set to 0 — `seq_len < 0` is never true, so the direct path always wins)
-// on mlx 0.31.2: the underlying quantized-matmul kernel now matches Python's
-// numerically, so padding short windows just adds noise (verified on the z
-// projection at len=9: padded path drifts by max_abs=0.125 vs direct).
-const EXACT_SMALL_PROJ_AB_PAD_M: i32 = 0;
-const EXACT_SMALL_PROJ_QKV_PAD_M: i32 = 0;
-const EXACT_SMALL_PROJ_Z_PAD_M: i32 = 0;
 
 /// Tape capture from a `forward_prefill_with_tape` call.
 ///
@@ -167,28 +160,6 @@ fn rms_norm_no_weight(x: &Array, eps: f32) -> Result<Array, Exception> {
     Ok(unsafe { Array::from_ptr(res) })
 }
 
-fn exact_small_proj_with_pad_m(
-    linear: &mut MaybeQuantized<nn::Linear>,
-    x: &Array,
-    pad_m: i32,
-) -> Result<Array, Exception> {
-    if x.shape().len() == 3 {
-        let batch_size = x.shape()[0];
-        let seq_len = x.shape()[1];
-        let hidden_dim = x.shape()[2];
-        if seq_len < pad_m {
-            let pad = zeros_dtype(
-                &[batch_size, pad_m - seq_len, hidden_dim],
-                x.dtype(),
-            )?;
-            let padded = concatenate_axis(&[x, &pad], 1)?;
-            let out = crate::verify_hook::quantized_linear_forward(linear, &padded)?;
-            return Ok(out.index((.., ..seq_len, ..)));
-        }
-    }
-    crate::verify_hook::quantized_linear_forward(linear, x)
-}
-
 impl GatedDeltaNet {
     /// Process a single token through the DeltaNet layer (decode step).
     #[allow(non_snake_case)]
@@ -202,10 +173,10 @@ impl GatedDeltaNet {
         // x: [B, 1, hidden]
 
         // 1. Project
-        let qkv = exact_small_proj_with_pad_m(&mut self.in_proj_qkv, x, EXACT_SMALL_PROJ_QKV_PAD_M)?; // [B, 1, conv_dim]
-        let z = exact_small_proj_with_pad_m(&mut self.in_proj_z, x, EXACT_SMALL_PROJ_Z_PAD_M)?; // [B, 1, value_dim]
-        let a = exact_small_proj_with_pad_m(&mut self.in_proj_a, x, EXACT_SMALL_PROJ_AB_PAD_M)?; // [B, 1, num_v_heads]
-        let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?; // [B, 1, num_v_heads]
+        let qkv = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_qkv, x)?; // [B, 1, conv_dim]
+        let z = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_z, x)?; // [B, 1, value_dim]
+        let a = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_a, x)?; // [B, 1, num_v_heads]
+        let b = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_b, x)?; // [B, 1, num_v_heads]
 
         // 2. Causal Conv1d update
         // qkv: [B, 1, conv_dim] → [B, conv_dim, 1]
@@ -283,10 +254,10 @@ impl GatedDeltaNet {
         let L = shape[1];
 
         // 1. Project full sequence (parallel)
-        let qkv = exact_small_proj_with_pad_m(&mut self.in_proj_qkv, x, EXACT_SMALL_PROJ_QKV_PAD_M)?; // [B, L, conv_dim]
-        let z = exact_small_proj_with_pad_m(&mut self.in_proj_z, x, EXACT_SMALL_PROJ_Z_PAD_M)?; // [B, L, value_dim]
-        let a = exact_small_proj_with_pad_m(&mut self.in_proj_a, x, EXACT_SMALL_PROJ_AB_PAD_M)?; // [B, L, num_v_heads]
-        let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?; // [B, L, num_v_heads]
+        let qkv = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_qkv, x)?; // [B, L, conv_dim]
+        let z = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_z, x)?; // [B, L, value_dim]
+        let a = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_a, x)?; // [B, L, num_v_heads]
+        let b = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_b, x)?; // [B, L, num_v_heads]
 
         // 2. Causal Conv1d on full sequence (parallel)
         let qkv_cf = qkv.transpose_axes(&[0, 2, 1])?; // [B, conv_dim, L]
@@ -431,10 +402,10 @@ impl GatedDeltaNet {
         let B = shape[0];
         let L = shape[1];
 
-        let qkv = exact_small_proj_with_pad_m(&mut self.in_proj_qkv, x, EXACT_SMALL_PROJ_QKV_PAD_M)?;
-        let z = exact_small_proj_with_pad_m(&mut self.in_proj_z, x, EXACT_SMALL_PROJ_Z_PAD_M)?;
-        let a = exact_small_proj_with_pad_m(&mut self.in_proj_a, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
-        let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
+        let qkv = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_qkv, x)?;
+        let z = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_z, x)?;
+        let a = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_a, x)?;
+        let b = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_b, x)?;
 
         let qkv_cf = qkv.transpose_axes(&[0, 2, 1])?;
         // Capture the conv1d input BEFORE conv1d_prefill consumes/updates
@@ -528,10 +499,10 @@ impl GatedDeltaNet {
         let batch_size = shape[0];
         let seq_len = shape[1];
 
-        let qkv = exact_small_proj_with_pad_m(&mut self.in_proj_qkv, x, EXACT_SMALL_PROJ_QKV_PAD_M)?;
-        let z = exact_small_proj_with_pad_m(&mut self.in_proj_z, x, EXACT_SMALL_PROJ_Z_PAD_M)?;
-        let a = exact_small_proj_with_pad_m(&mut self.in_proj_a, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
-        let b = exact_small_proj_with_pad_m(&mut self.in_proj_b, x, EXACT_SMALL_PROJ_AB_PAD_M)?;
+        let qkv = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_qkv, x)?;
+        let z = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_z, x)?;
+        let a = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_a, x)?;
+        let b = crate::verify_hook::quantized_linear_forward(&mut self.in_proj_b, x)?;
 
         let qkv_cf = qkv.transpose_axes(&[0, 2, 1])?;
         let qkv_after_conv = self.conv1d_prefill(&qkv_cf, cache, batch_size, seq_len)?;
