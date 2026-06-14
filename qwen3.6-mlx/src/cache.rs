@@ -1,5 +1,6 @@
 use mlx_rs::{error::Exception, Array};
 use mlx_rs_core::cache::{KVCache, KeyValueCache, QuantizedKVCache, TurboQuantKVCache};
+use mlx_rs_core::kvflash::KvFlashCache;
 use mlx_rs_core::paged::PagedKvCache;
 
 /// Recurrent state for DeltaNet layers.
@@ -109,6 +110,9 @@ impl HybridCache {
             // (the API forces an in-memory prefix cache when paging is enabled).
             HybridCache::Paged(_) => Err(Exception::custom(
                 "HybridCache::save_to_path: Paged not supported (in-memory only)",
+            )),
+            HybridCache::KvFlash(_) => Err(Exception::custom(
+                "HybridCache::save_to_path: KvFlash not supported (lossy resident pool)",
             )),
         }
     }
@@ -255,6 +259,11 @@ pub enum HybridCache {
     /// Cloning forks the block table (shared prefix blocks, CoW on divergence);
     /// dropping releases blocks back to the shared pool.
     Paged(PagedKvCache),
+    /// Spike: KVFlash bounded-residency cache (sink + recent window, LRU
+    /// chunk eviction at decode). Wired via `KVCacheMode::KvFlash`
+    /// (`DFLASH_KVFLASH=<pool>`). Decode attends a `<= pool` working set so
+    /// throughput stays flat as context grows.
+    KvFlash(KvFlashCache),
 }
 
 impl HybridCache {
@@ -265,6 +274,7 @@ impl HybridCache {
             HybridCache::TurboQuantKV(tq) => tq.offset(),
             HybridCache::Recurrent(rec) => rec.step,
             HybridCache::Paged(p) => p.offset(),
+            HybridCache::KvFlash(kf) => kf.offset(),
         }
     }
 
@@ -286,6 +296,11 @@ impl HybridCache {
             HybridCache::QuantizedKV(qkv) => qkv.trim_kv(n_drop),
             HybridCache::Recurrent(_) => Ok(()), // no-op; see trim_gdn
             HybridCache::Paged(p) => p.trim_kv(n_drop),
+            // Spec-decode rollback isn't supported on the lossy resident pool
+            // (a trimmed token may already be evicted); KvFlash is decode-only.
+            HybridCache::KvFlash(_) => Err(Exception::custom(
+                "HybridCache::trim: KvFlash does not support speculative rollback",
+            )),
         }
     }
 
@@ -322,6 +337,9 @@ impl HybridCache {
                 Ok(())
             }
             HybridCache::Paged(p) => p.trim_kv(n_drop),
+            HybridCache::KvFlash(_) => Err(Exception::custom(
+                "HybridCache::trim_gdn: KvFlash does not support speculative rollback",
+            )),
             HybridCache::Recurrent(rec) => {
                 let snap = snapshot.ok_or_else(|| {
                     Exception::custom(

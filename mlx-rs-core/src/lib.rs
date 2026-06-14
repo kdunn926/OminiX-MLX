@@ -20,6 +20,7 @@ pub mod convert;
 pub mod cache;
 pub mod error;
 pub mod generate;
+pub mod kvflash;
 pub mod memory;
 pub mod metal_kernels;
 pub mod paged;

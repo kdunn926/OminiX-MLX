@@ -83,6 +83,12 @@ impl TransformerBlock {
                     mask,
                     cache: Some(paged_cache),
                 })?,
+            (AttentionLayer::FullAttention(attn), HybridCache::KvFlash(kf_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(kf_cache),
+                })?,
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
                 let L = normed.shape()[1];
                 if L > 1 {
@@ -140,6 +146,12 @@ impl TransformerBlock {
                     x: &normed,
                     mask,
                     cache: Some(paged_cache),
+                })?,
+            (AttentionLayer::FullAttention(attn), HybridCache::KvFlash(kf_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(kf_cache),
                 })?,
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
                 let L = normed.shape()[1];
@@ -206,6 +218,11 @@ pub enum KVCacheMode {
     /// `PagedKvPool` (behind `OMINIX_PAGED_ATTENTION`). Decode runs through
     /// the fused paged-attention kernel; recurrent layers are unaffected.
     Paged,
+    /// Spike: KVFlash bounded-residency cache for full-attention layers
+    /// (`DFLASH_KVFLASH=<pool>`, `DFLASH_KVFLASH_SINK`). Decode attends a
+    /// `<= pool` resident set (sink + recent), so throughput stays flat as
+    /// context grows. Lossy (drops cold chunks); no spec-decode rollback.
+    KvFlash,
 }
 
 pub struct Qwen36TextModel {
@@ -291,6 +308,22 @@ impl Model {
                         // Draws from the thread-default PagedKvPool installed by
                         // the engine; one shared arena backs all full-attn layers.
                         KVCacheMode::Paged => HybridCache::Paged(PagedKvCache::default()),
+                        KVCacheMode::KvFlash => {
+                            let pool: i32 = std::env::var("DFLASH_KVFLASH")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .filter(|&n| n > 0)
+                                .unwrap_or(4096);
+                            let sink: i32 = std::env::var("DFLASH_KVFLASH_SINK")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(mlx_rs_core::kvflash::DEFAULT_SINK);
+                            HybridCache::KvFlash(mlx_rs_core::kvflash::KvFlashCache::new(
+                                pool,
+                                sink,
+                                mlx_rs_core::kvflash::DEFAULT_CHUNK,
+                            ))
+                        }
                     }
                 } else {
                     HybridCache::Recurrent(RecurrentState::new())

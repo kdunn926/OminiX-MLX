@@ -116,6 +116,10 @@ fn main() -> anyhow::Result<()> {
     } else if std::env::var("PAGED_KV").is_ok() {
         eprintln!("kv_backend: paged");
         Generate::new_paged_kv(&mut model, temp, &prompt_tokens)
+    } else if std::env::var("KVFLASH").is_ok() || std::env::var("DFLASH_KVFLASH").is_ok() {
+        let pool = std::env::var("DFLASH_KVFLASH").unwrap_or_else(|_| "4096".into());
+        eprintln!("kv_backend: kvflash (pool={pool})");
+        Generate::new_kvflash(&mut model, temp, &prompt_tokens)
     } else {
         eprintln!("kv_backend: standard fp16");
         Generate::new(&mut model, temp, &prompt_tokens)

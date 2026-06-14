@@ -199,6 +199,23 @@ impl<'a> Generate<'a> {
         }
     }
 
+    /// Spike: KVFlash bounded-residency KV for full-attention layers. Decode
+    /// attends a `<= pool` resident set (sink + recent), so throughput stays
+    /// flat as context grows. Pool/sink from `DFLASH_KVFLASH`/`_SINK`.
+    pub fn new_kvflash(model: &'a mut Model, temp: f32, prompt: &'a Array) -> Self {
+        let cache = model.new_cache(KVCacheMode::KvFlash);
+        Self {
+            model,
+            cache,
+            temp,
+            state: GenerateState::Prefill { prompt },
+            prefetched: None,
+            token_count: 0,
+            profile: decode_env_knobs().0,
+            cache_clear_interval: decode_env_knobs().1,
+        }
+    }
+
     /// Build a Generate with a pre-populated cache (e.g. from a
     /// prompt-cache prefix load). Caller wraps each loaded `KVCache`
     /// in `HybridCache::KV(...)` and supplies the suffix prompt.
