@@ -1,0 +1,107 @@
+# KVFlash spike — bounded-residency KV for MLX
+
+**Branch:** `spike/kvflash` · **Status:** spike (decode-bounding core only)
+
+Port of the decode-time bounded-attention core of FlashMemory-style KV paging
+([lucebox-hub#373](https://github.com/Luce-Org/lucebox-hub/pull/373)) to
+Rust/MLX on Apple Silicon.
+
+## Idea
+
+Instead of letting the full-attention KV cache grow with context, keep a fixed
+**resident pool** of at most `pool` tokens — the first `sink` attention-sink
+tokens (StreamingLLM) plus the most-recent `pool - sink` — and evict the oldest
+non-sink 64-token chunk when it overflows. Decode then attends a `≤ pool`
+working set, so **decode throughput stays flat as context grows** instead of
+degrading with KV size.
+
+### Why it's exact over the kept set
+
+The model bakes RoPE into K at write time using the token's true position;
+`offset()` returns the logical count so positions keep advancing. RoPE is
+*relative*, so a query at position `N` attending any kept key at position `p`
+sees the correct offset `N − p` regardless of which middle chunks were dropped.
+Attention over the resident set is therefore **bit-identical to a full-cache
+run restricted to those keys** — the only loss is the dropped chunks'
+contribution (the LRU/StreamingLLM quality trade-off).
+
+## What's implemented
+
+- `mlx-rs-core/src/kvflash.rs` — `KvFlashCache` (impls `KeyValueCache`):
+  step-buffered K/V, chunk-granular LRU eviction on decode, returns the bounded
+  resident set from `update_and_fetch`.
+- `qwen3.6-mlx` — `KVCacheMode::KvFlash` / `HybridCache::KvFlash`,
+  `Generate::new_kvflash`, env `DFLASH_KVFLASH=<pool>` /
+  `DFLASH_KVFLASH_SINK` / `KVFLASH=1`, generate-example selection.
+
+Plugs into the existing SDPA path: the bounded resident set is just what
+`update_and_fetch` returns, so no attention-kernel changes.
+
+```bash
+DFLASH_KVFLASH=2048 cargo run --release -p qwen3-6-mlx --example generate -- \
+    models/Qwen3.6-27B-4bit "<long prompt>" 64 0
+```
+
+## Spike scope / differences from the source PR
+
+- **Decode-bounding only.** Multi-token (prefill) appends accumulate the full
+  KV so the prefill causal mask stays aligned; eviction triggers only on
+  single-token decode appends. Bounded *chunked prefill* (the PR's prefill
+  speedup + prefill memory bound) is future work — so prefill cost/memory here
+  is unchanged from full-cache.
+- **No host paging.** Apple Silicon is unified memory — there's no discrete-GPU
+  VRAM to page to/from, so evicted chunks are simply dropped. The PR's ~99%
+  VRAM reduction doesn't map; the *decode throughput* win (bounded KV read)
+  does.
+- **LRU policy only.** The drafter/scored residency that preserves long-range
+  recall is out of scope; this is sink + recent (pure recency = StreamingLLM),
+  so mid-context facts are lost once evicted (see needle result below).
+- **No spec-decode rollback** on the lossy pool.
+
+## Results (Qwen3.6-27B-4bit, M-series, greedy)
+
+Validated: unit test (resident bounded ≤ pool, sink + recent kept, logical
+offset advances); short context (< pool) **byte-identical** to standard fp16.
+
+Long-context decode (32-token greedy, needle = a code planted at position ~0):
+
+| context | mode | prefill (TTFT) | decode tok/s | needle recall |
+|---|---|---|---|---|
+| 7.6K  | standard fp16     | 75.7s  | 18.1 | ✓ |
+| 7.6K  | kvflash pool=2048 | 75.7s  | 18.6 | ✗ |
+| 21.6K | standard fp16     | 220.7s | **15.9** | ✓ |
+| 21.6K | kvflash pool=2048 | 220.1s | **18.9** | ✗ |
+
+**The core property holds.** Standard decode **degrades with context**
+(18.1 → 15.9 tok/s as the KV read grows 7.6K → 21.6K), while kvflash stays
+**flat** (~18.6–18.9) because it reads a bounded 2048-token pool regardless of
+logical length — a **1.19× decode speedup at 21.6K** that widens with context
+(the PR's full-cache curve keeps falling to 13.1 tok/s at 256K; kvflash would
+stay ~flat). Prefill (TTFT) is identical in both modes — kvflash doesn't bound
+prefill in this spike.
+
+**The recall trade-off is real.** With pure LRU (sink=4 + recent), the planted
+code sits past the sink and is evicted once context exceeds the pool, so
+kvflash answers wrong while the full cache recalls it. A scored-residency
+policy (next steps) is what the source PR uses to keep recall high at low
+residency; this spike deliberately ships only the LRU/StreamingLLM policy.
+
+### Hardware caveat
+
+On this **hybrid** arch (48 GatedDeltaNet + 16 full-attention layers) the
+DeltaNet recurrence dominates **prefill** and is sequential — ~76 s to prefill
+7.6K tokens on M-series. So (a) prefill isn't the part kvflash speeds up here
+(that's bounded *chunked* prefill, out of spike scope), and (b) the decode KV
+read only becomes a large fraction of the step around ~30K+ tokens, where
+prefilling repeatedly for A/B is expensive. The documented 2.9× decode speedup
+is at 64K–256K on a discrete GPU; the same bandwidth dynamic holds on MLX but
+the absolute context where it pays off is large and slow to set up on this
+hybrid model.
+
+## Next steps if pursued
+
+1. Bounded **chunked prefill** (attend only the pool per chunk) → prefill
+   speedup + prefill memory bound (the PR's bigger win).
+2. Scored residency (a small drafter ranks chunks) to recover mid-context
+   recall instead of pure LRU.
+3. Wire into gemma4 (full-attention layers only; SWA layers already ring-buffer).
