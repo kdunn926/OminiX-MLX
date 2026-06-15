@@ -426,7 +426,6 @@ impl KeyValueCache for KvFlashCache {
 pub struct KvFlashPagedCache {
     ck: Vec<Array>,     // frozen chunk keys   [B, Hkv, chunk, D]
     cv: Vec<Array>,     // frozen chunk values
-    cmean: Vec<Array>,  // per-chunk reduced mean key [D] for cheap scoring
     pk: Option<Array>,  // pending (sub-chunk) tail
     pv: Option<Array>,
     plen: i32,
@@ -438,7 +437,10 @@ pub struct KvFlashPagedCache {
     tau: i32,
     steps: i32,
     resident: Vec<usize>, // chunk indices in the attention set (sorted)
-    q_mean: Option<Array>, // [D] head-mean of the latest query
+    /// Per-KV-head latest query `[Hkv, D]` (group-mean of the Hq heads) used
+    /// to score chunks at reselection — kept per-head (not mean-head) so a
+    /// single retrieval head's match isn't averaged away.
+    q_heads: Option<Array>,
     pub pages_in: usize,
 }
 
@@ -459,7 +461,6 @@ impl Clone for KvFlashPagedCache {
         Self {
             ck: self.ck.clone(),
             cv: self.cv.clone(),
-            cmean: self.cmean.clone(),
             pk: self.pk.clone(),
             pv: self.pv.clone(),
             plen: self.plen,
@@ -471,7 +472,7 @@ impl Clone for KvFlashPagedCache {
             tau: self.tau,
             steps: self.steps,
             resident: self.resident.clone(),
-            q_mean: self.q_mean.clone(),
+            q_heads: self.q_heads.clone(),
             pages_in: self.pages_in,
         }
     }
@@ -485,7 +486,6 @@ impl KvFlashPagedCache {
         Self {
             ck: Vec::new(),
             cv: Vec::new(),
-            cmean: Vec::new(),
             pk: None,
             pv: None,
             plen: 0,
@@ -497,7 +497,7 @@ impl KvFlashPagedCache {
             tau: tau.max(1),
             steps: 0,
             resident: Vec::new(),
-            q_mean: None,
+            q_heads: None,
             pages_in: 0,
         }
     }
@@ -513,11 +513,8 @@ impl KvFlashPagedCache {
             let pv = self.pv.take().unwrap();
             let ck = pk.index((Ellipsis, ..self.chunk, ..));
             let cv = pv.index((Ellipsis, ..self.chunk, ..));
-            // reduced mean key [D] (mean over Hkv and chunk positions, batch 0).
-            let cm = ck.mean_axes(&[0, 1, 2], false)?; // [D]
             self.ck.push(ck);
             self.cv.push(cv);
-            self.cmean.push(cm);
             let rem = self.plen - self.chunk;
             if rem > 0 {
                 self.pk = Some(pk.index((Ellipsis, self.chunk.., ..)));
@@ -546,22 +543,30 @@ impl KvFlashPagedCache {
         let mid_hi = n - recent_c; // exclusive
         let mid_budget = (budget - sink_c - recent_c).max(0);
 
-        // Score middle chunks against the latest query.
+        // Score middle chunks against the latest query: max over positions AND
+        // KV-heads of q·k, so a single retrieval head matching a single token
+        // (the needle) spikes the chunk's score rather than being averaged out.
         let mut chosen: Vec<usize> = Vec::new();
         if mid_budget > 0 && mid_hi > mid_lo {
-            if let Some(qm) = self.q_mean.as_ref() {
-                // stack middle cmeans → [n_mid, D], score = mids @ qm → [n_mid]
+            if let Some(qh) = self.q_heads.as_ref() {
                 let mids: Vec<&Array> = (mid_lo..mid_hi)
-                    .map(|i| &self.cmean[i as usize])
+                    .map(|i| &self.ck[i as usize])
                     .collect();
-                let stacked = mlx_rs::ops::stack_axis(&mids, 0)?; // [n_mid, D]
-                let qcol = qm.reshape(&[-1, 1])?; // [D,1]
-                let scores = mlx_rs::ops::matmul(&stacked, &qcol)?.reshape(&[-1])?;
-                let scores = scores.contiguous()?;
-                mlx_rs::transforms::eval([&scores])?;
-                let sv = scores.as_slice::<f32>().to_vec();
-                let mut order: Vec<usize> =
-                    (0..sv.len()).collect();
+                let kcat = concatenate_axis(&mids, 2)?; // [B, Hkv, n_mid*chunk, D]
+                let hkv = kcat.shape()[1];
+                let nmc = kcat.shape()[2];
+                let dd = kcat.shape()[3];
+                let kflat = kcat.reshape(&[hkv, nmc, dd])?; // squeeze B=1
+                let qcol = qh.reshape(&[hkv, dd, 1])?; // [Hkv, D, 1]
+                // [Hkv, n_mid*chunk] per-head scores
+                let s = mlx_rs::ops::matmul(&kflat, &qcol)?.reshape(&[hkv, nmc])?;
+                let s = s.max_axes(&[0], false)?; // max over heads → [n_mid*chunk]
+                let n_mid = mid_hi - mid_lo;
+                let s = s.reshape(&[n_mid, self.chunk])?.max_axes(&[1], false)?; // [n_mid]
+                let s = s.as_dtype(mlx_rs::Dtype::Float32)?.contiguous()?;
+                mlx_rs::transforms::eval([&s])?;
+                let sv = s.as_slice::<f32>().to_vec();
+                let mut order: Vec<usize> = (0..sv.len()).collect();
                 order.sort_by(|&a, &b| sv[b].partial_cmp(&sv[a]).unwrap_or(std::cmp::Ordering::Equal));
                 for &o in order.iter().take(mid_budget as usize) {
                     chosen.push(mid_lo as usize + o);
@@ -671,8 +676,21 @@ impl KeyValueCache for KvFlashPagedCache {
     }
 
     fn observe_query(&mut self, q: &Array) -> Result<(), Exception> {
-        // Head + seq mean → [D]; drives the next reselection.
-        self.q_mean = Some(q.mean_axes(&[0, 1, 2], false)?);
+        // Per-KV-head query `[Hkv, D]` from the LAST query position (the actual
+        // "what do I retrieve next" query — meaning over the whole block would
+        // dilute it with the question's filler tokens). GQA: group-mean the Hq
+        // heads down to Hkv, but keep heads separate so the retrieval head
+        // survives the next reselection.
+        let qs = q.shape();
+        let (hq, d) = (qs[1], qs[3]);
+        let hkv = self.ck.first().map(|c| c.shape()[1]).unwrap_or(hq).max(1);
+        let g = (hq / hkv).max(1);
+        let q_last = q.index((Ellipsis, qs[2] - 1.., ..)); // [B, Hq, 1, D]
+        // [B, Hkv, g, 1, D] → mean over (B, group, 1) → [Hkv, D]
+        let qh = q_last
+            .reshape(&[qs[0], hkv, g, 1, d])?
+            .mean_axes(&[0, 2, 3], false)?; // [Hkv, D]
+        self.q_heads = Some(qh);
         Ok(())
     }
 }
