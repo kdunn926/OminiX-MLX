@@ -318,10 +318,18 @@ impl Model {
                                 .ok()
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(mlx_rs_core::kvflash::DEFAULT_SINK);
+                            // Bound prefill too (memory bound + O(seq·pool)
+                            // attention) when DFLASH_KVFLASH_PREFILL=1. Default
+                            // off = decode-only bounding (full prefill KV).
+                            let bound_prefill = matches!(
+                                std::env::var("DFLASH_KVFLASH_PREFILL").ok().as_deref(),
+                                Some("1") | Some("true")
+                            );
                             HybridCache::KvFlash(mlx_rs_core::kvflash::KvFlashCache::new(
                                 pool,
                                 sink,
                                 mlx_rs_core::kvflash::DEFAULT_CHUNK,
+                                bound_prefill,
                             ))
                         }
                     }

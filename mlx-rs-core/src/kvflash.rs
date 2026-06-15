@@ -68,6 +68,12 @@ pub struct KvFlashCache {
     pool: i32,
     /// Eviction granularity (tokens).
     chunk: i32,
+    /// When true, evict on multi-token (prefill) appends too, so prefill
+    /// attention is bounded to the pool (memory bound + O(seq·pool) attention
+    /// instead of O(seq²)). Requires chunked prefill with chunk ≤ pool − sink,
+    /// and that the just-appended block is the suffix of the resident set —
+    /// both hold for the qwen3.6 chunked-prefill path (hardware causal mask).
+    bound_prefill: bool,
     /// Number of evictions performed (stat).
     pub evictions: usize,
 }
@@ -75,7 +81,8 @@ pub struct KvFlashCache {
 impl KvFlashCache {
     /// `pool`: max resident tokens. `sink`: front tokens always kept.
     /// `chunk`: eviction granularity (oldest non-sink chunk dropped).
-    pub fn new(pool: i32, sink: i32, chunk: i32) -> Self {
+    /// `bound_prefill`: also bound prefill (evict on multi-token appends).
+    pub fn new(pool: i32, sink: i32, chunk: i32, bound_prefill: bool) -> Self {
         let chunk = chunk.max(1);
         let sink = sink.clamp(0, (pool - chunk).max(0));
         Self {
@@ -87,6 +94,7 @@ impl KvFlashCache {
             sink,
             pool: pool.max(sink + chunk),
             chunk,
+            bound_prefill,
             evictions: 0,
         }
     }
@@ -229,9 +237,12 @@ impl KeyValueCache for KvFlashCache {
         self.resident = end;
         self.logical += num_new;
 
-        // Evict only on single-token (decode) appends so multi-token prefill
-        // keeps a contiguous causal window for the caller's mask.
-        if num_new == 1 {
+        // Evict on single-token (decode) appends always; on multi-token
+        // (prefill) appends only when `bound_prefill`. Eviction keeps the
+        // just-appended block as the resident suffix, so the caller's hardware
+        // causal mask (`L_k − L_q` offset) stays correct: the pool prefix is
+        // fully visible and the new block is causal among itself.
+        if num_new == 1 || self.bound_prefill {
             self.evict()?;
         }
 
@@ -282,8 +293,8 @@ mod tests {
     #[test]
     fn bounds_resident_and_keeps_sink_plus_recent() {
         let _ = arange::<_, f32>(0.0, 1.0, None); // touch mlx to init device
-        // pool 8, sink 2, chunk 2.
-        let mut c = KvFlashCache::new(8, 2, 2);
+        // pool 8, sink 2, chunk 2, decode-only bounding.
+        let mut c = KvFlashCache::new(8, 2, 2, false);
         // Prefill 5 tokens in one shot (multi-token append: no eviction).
         let k = Array::from_slice(&[0.0, 1.0, 2.0, 3.0, 4.0], &[1, 1, 5, 1]);
         c.update_and_fetch(k.clone(), k).unwrap();
@@ -304,5 +315,26 @@ mod tests {
         // Resident is bounded.
         assert!(ids.len() as i32 <= c.pool());
         assert!(c.evictions > 0, "expected evictions");
+    }
+
+    #[test]
+    fn bounded_prefill_caps_resident_during_chunked_append() {
+        let _ = arange::<_, f32>(0.0, 1.0, None);
+        // pool 8, sink 2, chunk 2, bound_prefill = true.
+        let mut c = KvFlashCache::new(8, 2, 2, true);
+        // Simulate chunked prefill: 4-token chunks, total 20 tokens.
+        let mut next = 0.0f32;
+        for _chunk in 0..5 {
+            let ids: Vec<f32> = (0..4).map(|_| { let v = next; next += 1.0; v }).collect();
+            let k = Array::from_slice(&ids, &[1, 1, 4, 1]);
+            c.update_and_fetch(k.clone(), k).unwrap();
+            // Resident stays bounded *during* prefill (the whole point).
+            assert!(c.resident() <= c.pool(), "prefill resident {} > pool {}", c.resident(), c.pool());
+        }
+        assert_eq!(c.offset(), 20); // logical advanced for all 20
+        let ids = resident_ids(&c);
+        assert_eq!(&ids[..2], &[0, 1], "sink not preserved across prefill: {ids:?}");
+        assert_eq!(*ids.last().unwrap(), 19, "most-recent prefill token missing: {ids:?}");
+        assert!(c.evictions > 0, "expected prefill evictions");
     }
 }

@@ -44,11 +44,16 @@ DFLASH_KVFLASH=2048 cargo run --release -p qwen3-6-mlx --example generate -- \
 
 ## Spike scope / differences from the source PR
 
-- **Decode-bounding only.** Multi-token (prefill) appends accumulate the full
-  KV so the prefill causal mask stays aligned; eviction triggers only on
-  single-token decode appends. Bounded *chunked prefill* (the PR's prefill
-  speedup + prefill memory bound) is future work — so prefill cost/memory here
-  is unchanged from full-cache.
+- **Bounded prefill (opt-in, `DFLASH_KVFLASH_PREFILL=1`).** With it on, eviction
+  also runs on the multi-token chunked-prefill appends, so each prefill chunk
+  attends a `≤ pool` resident set instead of the growing prefix — bounding
+  prefill **memory** to `O(pool)` and prefill attention to `O(seq·pool)`
+  instead of `O(seq²)`. Works with **zero mask changes**: qwen3.6 chunked
+  prefill passes a hardware causal mask (offset `L_k − L_q`), and the new chunk
+  is always the resident suffix, so the pool prefix is fully visible and the
+  chunk is causal among itself. Requires `chunk ≤ pool − sink` (default
+  64 ≤ 2044). Off by default = decode-only bounding (prefill accumulates full
+  KV, TTFT unchanged).
 - **No host paging.** Apple Silicon is unified memory — there's no discrete-GPU
   VRAM to page to/from, so evicted chunks are simply dropped. The PR's ~99%
   VRAM reduction doesn't map; the *decode throughput* win (bounded KV read)
@@ -69,8 +74,18 @@ Long-context decode (32-token greedy, needle = a code planted at position ~0):
 |---|---|---|---|---|
 | 7.6K  | standard fp16     | 75.7s  | 18.1 | ✓ |
 | 7.6K  | kvflash pool=2048 | 75.7s  | 18.6 | ✗ |
-| 21.6K | standard fp16     | 220.7s | **15.9** | ✓ |
-| 21.6K | kvflash pool=2048 | 220.1s | **18.9** | ✗ |
+| 21.6K | standard fp16          | 220.7s | **15.9** | ✓ |
+| 21.6K | kvflash pool=2048      | 220.1s | **18.9** | ✗ |
+| 21.6K | kvflash pool=2048 +prefill-bound | 210.9s | 18.7 | ✗ |
+
+Bounded prefill (`DFLASH_KVFLASH_PREFILL=1`) keeps **decode flat** (18.7) and
+shaves TTFT only ~4% (220→211s) — on this hybrid model the sequential DeltaNet
+recurrence (48/64 layers, which kvflash doesn't touch) dominates prefill, so
+bounding the 16 attention layers moves TTFT little. Its real benefit is the
+**prefill memory bound**: resident KV stays `≤ pool` (2048 tokens) through
+prefill instead of holding the full 21.6K — the property that lets 64K–256K
+contexts fit at all. (Output stays coherent; with the needle evicted the model
+correctly reports the code isn't present rather than hallucinating.)
 
 **The core property holds.** Standard decode **degrades with context**
 (18.1 → 15.9 tok/s as the KV read grows 7.6K → 21.6K), while kvflash stays
@@ -100,8 +115,11 @@ hybrid model.
 
 ## Next steps if pursued
 
-1. Bounded **chunked prefill** (attend only the pool per chunk) → prefill
-   speedup + prefill memory bound (the PR's bigger win).
+1. ~~Bounded chunked prefill~~ — **done** (`DFLASH_KVFLASH_PREFILL=1`; see the
+   bounded-prefill row above). On this hybrid model the DeltaNet recurrence
+   (48/64 layers, unaffected by KV bounding) dominates prefill, so the TTFT win
+   is bounded by the attention share; the **prefill memory bound** (`O(pool)`)
+   is the load-bearing benefit for fitting 64K–256K contexts.
 2. Scored residency (a small drafter ranks chunks) to recover mid-context
    recall instead of pure LRU.
 3. Wire into gemma4 (full-attention layers only; SWA layers already ring-buffer).
