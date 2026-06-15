@@ -101,6 +101,30 @@ kvflash answers wrong while the full cache recalls it. A scored-residency
 policy (next steps) is what the source PR uses to keep recall high at low
 residency; this spike deliberately ships only the LRU/StreamingLLM policy.
 
+### Gemma4 (the better showcase)
+
+Wired into gemma4 too (`init_kvflash_cache`: global/full-attention slots get
+`KvFlashCache`, sliding slots keep their already-window-bounded
+`SlidingKVCache`, shared-KV store slots stay unbounded). Gemma4-26B-A4B is an
+all-attention MoE — no DeltaNet — so prefill is ~10× faster than qwen3.6 and
+the global layers are the clear decode bottleneck at long context.
+
+| gemma4-26B-A4B @ 15.9K | prefill | decode tok/s |
+|---|---|---|
+| flat (all unbounded)              | 33.2s | 26.9 |
+| layered (sliding-trim, default)   | 26.0s | 26.9 |
+| **kvflash global pool=1024**      | 26.4s | **32.1** |
+| **kvflash pool=1024 +prefill**    | **23.9s** | 31.9 |
+
+**1.19× decode** vs both the default layered cache and flat. Note layered and
+flat tie on decode (26.9): layered bounds the *sliding* layers but leaves the
+*global* layers unbounded, and at 16K the global layers are the decode
+bottleneck — so only kvflash (which bounds them) speeds decode up. Bounded
+prefill is also the **fastest prefill** (23.9s, beating even layered) because
+gemma4's global layers are real attention whose `O(seq²)` prefill cost the pool
+bounds — the qwen3.6 case below doesn't show this because DeltaNet dominates
+its prefill.
+
 ### Hardware caveat
 
 On this **hybrid** arch (48 GatedDeltaNet + 16 full-attention layers) the
