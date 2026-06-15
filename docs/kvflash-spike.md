@@ -253,13 +253,20 @@ than the unbounded baseline (31.4 vs 28.3, 1.11× at only 8K; widens with
 context since only the global layers are bounded). So on gemma4 the drafter buys
 recall *and* speed simultaneously.
 
-**gemma4-12B-it-4bit:** the drafter scoring works identically (ranks the needle
-chunk #1; paging decode 21.1 vs 19.8 tok/s layered, 1.07× at 8K), but this
-checkpoint's plain-AR output degenerates under *both* loaders and the unchanged
-layered baseline (malformed tokens, even on a short prompt) — a pre-existing 12B
-it-4bit / `ar_bench` AR-path issue unrelated to kvflash (the 12B works via the
-`Gemma4PairSession` path, per `docs/mtp-gemma4-12B-plan.md`). So end-to-end
-recall isn't demonstrable on it here, though the wiring and scoring are correct.
+**gemma4-12B-it-4bit:** also recalls — `host-paging + drafter` decodes 21.2 vs
+19.8 tok/s layered (1.07× at 8K; the 12B has 8 global layers, the most to bound)
+and emits `CRIMSON-ORCHID-7741` (drafter ranks the needle chunk #1).
+
+> This one took a detour. The 12B first appeared to *degenerate* (output looped
+> `<start_of_turn>model`), under both loaders and the unchanged layered baseline,
+> even on a short prompt — which looked like a 12B model/loader fault. The actual
+> cause was a **harness bug**: `ar_bench` encodes prompts with
+> `add_special_tokens=false`, omitting the leading `<bos>` Gemma requires. The 12B
+> unified checkpoints (it-4bit *and* qat-4bit) are acutely BOS-sensitive and
+> degenerate without it; the 26B tolerated its absence on long prompts, masking
+> it. The real chat/serving paths apply the jinja template (`{{ bos_token }}`) and
+> were never affected. Fixed by prepending `<bos>` in `ar_bench` (`NO_BOS=1` opts
+> out); with the fix all gemma4 configs recall.
 
 ### Hardware caveat
 
