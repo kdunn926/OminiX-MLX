@@ -168,8 +168,45 @@ query is scored against the full chunk store. Cost is decode throughput —
 is faster but can miss the page-in window for a short answer). On unified memory
 it also gives up the memory bound (all chunks stay resident) — the trade is
 **recall + bounded attention read, at full memory**, which on a memory-rich Mac
-is often the right one. A trained drafter (vs the cheap in-model `q·k` score)
-would make reselection cheaper and more precise.
+is often the right one. The in-model `q·k` score is the *cheap* drafter; the
+*real* one is below.
+
+## The drafter (`DFLASH_KVFLASH_DRAFTER=1`) — reranker-driven residency
+
+The source PR drives residency with a small **drafter** model rather than the
+target's incidental attention. We play that role with **Qwen3-Reranker-0.6B** —
+a Qwen3 dense LM used as a cross-encoder. A reranker scores *text* `(query,
+document)` pairs, which sidesteps the target/drafter **tokenizer mismatch**
+(Qwen3.6 vocab 248320 vs Qwen3 151936) for free: chunk by the *target's* own
+64-token blocks (the same ones the cache freezes), decode each chunk to text,
+and rerank against the question. Score = `logit("yes") − logit("no")` at the
+last position (monotone with the model card's softmax score; we only rank).
+
+The ranked order (best-first) is installed via `kvflash::set_drafter_pins`;
+`KvFlashPagedCache.reselect()` pins the top middle chunks resident for the whole
+generation — computed **once** before decode, no per-step rescan.
+
+**Result (Qwen3.6-27B, same 8.3K mid-context needle, pool=2048):**
+
+| policy | needle recall | decode |
+|---|---|---|
+| kvflash paging, in-model `q·k`, `tau=1` | ✓ | 13.8 tok/s (full scan/step) |
+| **kvflash paging, reranker drafter** | **✓** | **18.4 tok/s** + 8.9s one-time rerank |
+
+The reranker ranked the needle chunk **#1** of 131 (`top chunks [64, 130, 0, …]`,
+needle at chunk 64) in 8.9s, the model recalled `CRIMSON-ORCHID-7741`, and decode
+ran at the **full bounded-decode speed** (18.4 vs 13.8) because the static pins
+replace the per-step `q·all_chunks` scan with an index lookup. So the drafter is
+both **more precise** (trained relevance — finds the chunk even when the query
+isn't in the recent window) and **cheaper at decode** (no target-attention scan)
+than in-model scoring; the cost moves to a single up-front rerank pass. This is
+the PR's full design — bounded attention working set + recall + a drafter — on
+unified memory.
+
+A lighter knob, `DFLASH_KVFLASH_SHARE=1`, keeps in-model `q·k` scoring but
+amortizes it across the full-attention layers (the first layer to reselect each
+step computes the scores; the rest reuse them — one GPU sync/step instead of one
+per layer), for when a separate drafter model isn't wanted.
 
 ### Gemma4 (the better showcase)
 
