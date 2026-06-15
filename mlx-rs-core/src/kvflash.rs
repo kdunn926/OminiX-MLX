@@ -90,6 +90,11 @@ pub struct KvFlashCache {
     policy: Policy,
     /// Recent tokens always protected from scored eviction (recency window).
     recent: i32,
+    /// Per-`observe_query` decay applied to accumulated scores before adding
+    /// the new attention mass. `1.0` = plain H2O accumulation; `< 1.0`
+    /// recency-weights so recent queries (e.g. the trailing question) dominate
+    /// — which is what recovers a needle that only the late query attends.
+    decay: f32,
     /// Per-resident-position accumulated attention mass `[resident]` (device).
     /// Maintained in lockstep with `keys`/`values` on append/evict. `None`
     /// until the first write or under `Policy::Lru`.
@@ -117,6 +122,7 @@ impl KvFlashCache {
             bound_prefill,
             policy: Policy::Lru,
             recent: 0,
+            decay: 1.0,
             scores: None,
             evictions: 0,
         }
@@ -124,11 +130,13 @@ impl KvFlashCache {
 
     /// Switch to H2O-style scored residency: keep sink + a `recent`-token
     /// recency window + the highest accumulated-attention middle chunks.
-    /// Requires the caller to wire [`KeyValueCache::observe_query`].
-    pub fn enable_scoring(&mut self, recent: i32) {
+    /// `decay` (per `observe_query`, `<= 1.0`) recency-weights the
+    /// accumulation. Requires the caller to wire [`KeyValueCache::observe_query`].
+    pub fn enable_scoring(&mut self, recent: i32, decay: f32) {
         self.policy = Policy::Scored;
         // Leave room for sink + at least one evictable middle chunk.
         self.recent = recent.clamp(0, (self.pool - self.sink - self.chunk).max(0));
+        self.decay = decay.clamp(0.0, 1.0);
     }
 
     pub fn policy(&self) -> Policy {
@@ -395,6 +403,7 @@ impl KeyValueCache for KvFlashCache {
         // sum over the query block and batch → [R]
         let mass = attn.sum_axes(&[0, 1], false)?; // [R]
         self.scores = Some(match self.scores.take() {
+            Some(s) if self.decay < 1.0 => s.multiply(mlx_rs::array!(self.decay))?.add(&mass)?,
             Some(s) => s.add(&mass)?,
             None => mass,
         });
@@ -474,7 +483,7 @@ mod tests {
         // pool 6, sink 1, recent 2, chunk 1, scored. D = 16 one-hot keys so a
         // query at index 3 attends position 3; V[i] = i so we can read survivors.
         let mut c = KvFlashCache::new(6, 1, 1, false);
-        c.enable_scoring(2);
+        c.enable_scoring(2, 1.0);
         let d = 16usize;
         let q3 = {
             // query == one-hot(3) * 8 (strong), shape [1,1,1,16]

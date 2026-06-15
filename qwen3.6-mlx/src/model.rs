@@ -340,7 +340,14 @@ impl Model {
                                     .ok()
                                     .and_then(|v| v.parse().ok())
                                     .unwrap_or(pool / 2);
-                                kf.enable_scoring(recent);
+                                // Recency-weighting (DFLASH_KVFLASH_DECAY<1) makes
+                                // the trailing query (e.g. the question) dominate
+                                // the score so the chunk it attends survives.
+                                let decay: f32 = std::env::var("DFLASH_KVFLASH_DECAY")
+                                    .ok()
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(1.0);
+                                kf.enable_scoring(recent, decay);
                             }
                             HybridCache::KvFlash(kf)
                         }
