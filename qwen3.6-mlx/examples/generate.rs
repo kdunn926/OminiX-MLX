@@ -3,6 +3,9 @@ use mlx_rs_core::cache::KeyValueCache;
 use qwen3_6_mlx::{load_model, load_tokenizer, Generate};
 use std::collections::HashSet;
 
+#[path = "reranker_drafter.rs"]
+mod reranker_drafter;
+
 fn main() -> anyhow::Result<()> {
     let use_cpu = std::env::args().any(|a| a == "--cpu");
     if use_cpu {
@@ -103,6 +106,52 @@ fn main() -> anyhow::Result<()> {
             }
         }
     };
+
+    // kvflash host-paging "drafter": before decode, rerank the prompt's 64-token
+    // chunks once with Qwen3-Reranker-0.6B and pin the most-relevant ones
+    // resident for the whole generation. The reranker scores (query, chunk_text)
+    // pairs, so the target/drafter tokenizer mismatch is irrelevant — we chunk by
+    // the target's tokens (matching the cache) and decode each to text. Pairs
+    // with DFLASH_KVFLASH=<pool> DFLASH_KVFLASH_PAGING=1.
+    if std::env::var("DFLASH_KVFLASH_DRAFTER").as_deref() == Ok("1") {
+        let chunk = 64usize;
+        let chunk_texts: Vec<String> = prompt_ids_full
+            .chunks(chunk)
+            .map(|c| {
+                let ids: Vec<u32> = c.iter().map(|&x| x as u32).collect();
+                tokenizer.decode(&ids, false).unwrap_or_default()
+            })
+            .collect();
+        // Query = the prompt tail (the question), decoded to text.
+        let qn = std::env::var("DFLASH_KVFLASH_DRAFTER_QTOK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(160usize)
+            .min(prompt_ids_full.len());
+        let qids: Vec<u32> = prompt_ids_full[prompt_ids_full.len() - qn..]
+            .iter()
+            .map(|&x| x as u32)
+            .collect();
+        let query = tokenizer.decode(&qids, true).unwrap_or_default();
+        let rr_dir = std::env::var("DFLASH_KVFLASH_RERANKER")
+            .unwrap_or_else(|_| "models/Qwen3-Reranker-0.6B-4bit".into());
+        eprintln!(
+            "drafter: reranking {} chunks vs query ({} tok) with {}",
+            chunk_texts.len(),
+            qn,
+            rr_dir
+        );
+        let t0 = std::time::Instant::now();
+        let mut rr = reranker_drafter::RerankerDrafter::load(&rr_dir)?;
+        let order = rr.rank(&query, &chunk_texts)?;
+        drop(rr);
+        eprintln!(
+            "drafter: ranked in {:.1}s; top chunks {:?}",
+            t0.elapsed().as_secs_f64(),
+            &order[..order.len().min(8)]
+        );
+        mlx_rs_core::kvflash::set_drafter_pins(order);
+    }
 
     let mut gen = if let Some((hybrid_caches, _)) = prompt_cache_load {
         eprintln!("kv_backend: standard fp16 (warm-start from prompt cache)");

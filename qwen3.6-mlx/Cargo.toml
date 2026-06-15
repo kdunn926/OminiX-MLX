@@ -17,6 +17,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 
 [dev-dependencies]
 anyhow = "1"
+# Reranker "drafter" for kvflash host paging: Qwen3-Reranker-0.6B is a Qwen3
+# dense causal LM, loaded via the qwen3-mlx crate (example/spike only).
+qwen3-mlx = { path = "../qwen3-mlx" }
 
 [[example]]
 name = "generate"

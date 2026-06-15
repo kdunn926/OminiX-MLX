@@ -441,7 +441,41 @@ pub struct KvFlashPagedCache {
     /// to score chunks at reselection — kept per-head (not mean-head) so a
     /// single retrieval head's match isn't averaged away.
     q_heads: Option<Array>,
+    /// "Drafter" mode: score the chunks ONCE per decode step (the first layer
+    /// to reselect computes them; the rest reuse via a thread-local), instead
+    /// of recomputing `q·k` in all ~16 full-attention layers. Amortizes the
+    /// reselection scan 16×→1× — the source PR's drafter role (decouple chunk
+    /// scoring from the target's per-layer attention), minus a separate small
+    /// model (no same-tokenizer drafter available locally).
+    shared_scoring: bool,
     pub pages_in: usize,
+}
+
+thread_local! {
+    // (logical_position, middle-chunk scores) shared across this step's layers.
+    static SHARED_RESEL_SCORES: std::cell::RefCell<Option<(i32, Vec<f32>)>> =
+        const { std::cell::RefCell::new(None) };
+
+    // Drafter pins: chunk indices in reranker-relevance order (best first),
+    // set once by an external reranker ("drafter") before decode. When present,
+    // reselection keeps the highest-ranked middle chunks resident for the whole
+    // generation instead of scoring with the target's own `q·k`. This is the
+    // source PR's drafter role with a real model — Qwen3-Reranker-0.6B scoring
+    // (query, chunk_text) relevance — decoupled from the target's attention.
+    static DRAFTER_PINS: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install reranker-ranked chunk order (best-first) as the residency policy for
+/// all `KvFlashPagedCache`s on this thread. Chunk indices must match the cache's
+/// 64-token chunking of the same prompt token stream.
+pub fn set_drafter_pins(order: Vec<usize>) {
+    DRAFTER_PINS.with(|c| *c.borrow_mut() = Some(order));
+}
+
+/// Clear any installed drafter pins (fall back to in-model `q·k` scoring).
+pub fn clear_drafter_pins() {
+    DRAFTER_PINS.with(|c| *c.borrow_mut() = None);
 }
 
 impl std::fmt::Debug for KvFlashPagedCache {
@@ -473,6 +507,7 @@ impl Clone for KvFlashPagedCache {
             steps: self.steps,
             resident: self.resident.clone(),
             q_heads: self.q_heads.clone(),
+            shared_scoring: self.shared_scoring,
             pages_in: self.pages_in,
         }
     }
@@ -498,6 +533,9 @@ impl KvFlashPagedCache {
             steps: 0,
             resident: Vec::new(),
             q_heads: None,
+            // Amortize per-step q·k scoring across layers (one scan/step instead
+            // of one per full-attention layer). Off unless DFLASH_KVFLASH_SHARE.
+            shared_scoring: std::env::var("DFLASH_KVFLASH_SHARE").is_ok(),
             pages_in: 0,
         }
     }
@@ -547,8 +585,59 @@ impl KvFlashPagedCache {
         // KV-heads of q·k, so a single retrieval head matching a single token
         // (the needle) spikes the chunk's score rather than being averaged out.
         let mut chosen: Vec<usize> = Vec::new();
-        if mid_budget > 0 && mid_hi > mid_lo {
-            if let Some(qh) = self.q_heads.as_ref() {
+        // Drafter (reranker) pins take priority: walk chunks in reranker-relevance
+        // order, keep the highest-ranked ones that fall in the middle range until
+        // the budget is full. Computed once before decode, so the relevant chunk
+        // stays resident for the whole answer (no per-step rescan).
+        let pins: Option<Vec<usize>> =
+            DRAFTER_PINS.with(|c| c.borrow().clone());
+        if let (Some(order), true) = (pins.as_ref(), mid_budget > 0 && mid_hi > mid_lo) {
+            for &p in order {
+                if chosen.len() >= mid_budget as usize {
+                    break;
+                }
+                if (p as i32) >= mid_lo && (p as i32) < mid_hi {
+                    chosen.push(p);
+                }
+            }
+            // Underfilled (reranker saw fewer chunks than budget) → pad with the
+            // most-recent middle chunks not already chosen.
+            if chosen.len() < mid_budget as usize {
+                let have: std::collections::HashSet<usize> = chosen.iter().copied().collect();
+                for i in (mid_lo..mid_hi).rev() {
+                    if chosen.len() >= mid_budget as usize {
+                        break;
+                    }
+                    if !have.contains(&(i as usize)) {
+                        chosen.push(i as usize);
+                    }
+                }
+            }
+        } else if mid_budget > 0 && mid_hi > mid_lo {
+            let n_mid = (mid_hi - mid_lo) as usize;
+            // "Drafter" amortization: the first full-attention layer to reselect
+            // this step computes the per-chunk scores and shares them (keyed by
+            // logical position); later layers reuse them, skipping the matmul +
+            // eval barrier (one GPU sync/step instead of one per attention
+            // layer). One layer's relevance view stands in for all — the
+            // source PR's drafter role, without a separate small model.
+            let shared: Option<Vec<f32>> = if self.shared_scoring {
+                SHARED_RESEL_SCORES.with(|c| {
+                    c.borrow().as_ref().and_then(|(lg, v)| {
+                        (*lg == self.logical && v.len() == n_mid).then(|| v.clone())
+                    })
+                })
+            } else {
+                None
+            };
+
+            if let Some(sv) = shared {
+                let mut order: Vec<usize> = (0..sv.len()).collect();
+                order.sort_by(|&a, &b| sv[b].partial_cmp(&sv[a]).unwrap_or(std::cmp::Ordering::Equal));
+                for &o in order.iter().take(mid_budget as usize) {
+                    chosen.push(mid_lo as usize + o);
+                }
+            } else if let Some(qh) = self.q_heads.as_ref() {
                 let mids: Vec<&Array> = (mid_lo..mid_hi)
                     .map(|i| &self.ck[i as usize])
                     .collect();
@@ -561,11 +650,14 @@ impl KvFlashPagedCache {
                 // [Hkv, n_mid*chunk] per-head scores
                 let s = mlx_rs::ops::matmul(&kflat, &qcol)?.reshape(&[hkv, nmc])?;
                 let s = s.max_axes(&[0], false)?; // max over heads → [n_mid*chunk]
-                let n_mid = mid_hi - mid_lo;
-                let s = s.reshape(&[n_mid, self.chunk])?.max_axes(&[1], false)?; // [n_mid]
+                let s = s.reshape(&[n_mid as i32, self.chunk])?.max_axes(&[1], false)?; // [n_mid]
                 let s = s.as_dtype(mlx_rs::Dtype::Float32)?.contiguous()?;
                 mlx_rs::transforms::eval([&s])?;
                 let sv = s.as_slice::<f32>().to_vec();
+                if self.shared_scoring {
+                    let (lg, vv) = (self.logical, sv.clone());
+                    SHARED_RESEL_SCORES.with(|c| *c.borrow_mut() = Some((lg, vv)));
+                }
                 let mut order: Vec<usize> = (0..sv.len()).collect();
                 order.sort_by(|&a, &b| sv[b].partial_cmp(&sv[a]).unwrap_or(std::cmp::Ordering::Equal));
                 for &o in order.iter().take(mid_budget as usize) {
