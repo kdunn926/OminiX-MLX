@@ -253,6 +253,23 @@ than the unbounded baseline (31.4 vs 28.3, 1.11× at only 8K; widens with
 context since only the global layers are bounded). So on gemma4 the drafter buys
 recall *and* speed simultaneously.
 
+**Context-scaling (decode tok/s, layered baseline → paging+drafter), both recall:**
+
+| context | 26B layered | 26B drafter | 12B layered | 12B drafter |
+|---|---|---|---|---|
+| peak (~33 tok) | 33.5 | — | 22.6 | — |
+| 8.3K | 28.4 | 31.4 (1.11×) | 19.8 | 21.2 (1.07×) |
+| 18K | 26.3 | **30.2 (1.15×)** | 19.5 | **21.2 (1.09×)** |
+
+The gap **widens with context** — the paging decode rate tracks the model's peak
+(90–94% held at 18K) because its global-KV read is pool-capped, while the
+baseline keeps paying for the growing cache (down to 78–86% of peak). The 12B
+drafter is dead flat (21.2 → 21.2, 8K→18K). Heads toward the 15.9K **1.19×**
+(pool=1024) row above and keeps opening past 20K. Caveats: the one-time rerank
+scales linearly with chunk count (8.6s/131 chunks @8K → 18.7s/281 @18K;
+sequential — batch the reranker to cut it); prefill is unchanged (paging bounds
+decode, not prefill: 30s/26B, 63s/12B at 18K).
+
 **gemma4-12B-it-4bit:** also recalls — `host-paging + drafter` decodes 21.2 vs
 19.8 tok/s layered (1.07× at 8K; the 12B has 8 global layers, the most to bound)
 and emits `CRIMSON-ORCHID-7741` (drafter ranks the needle chunk #1).
