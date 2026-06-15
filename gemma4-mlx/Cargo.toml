@@ -83,4 +83,7 @@ path = "examples/decode_consistency.rs"
 anyhow = "1"
 coreml-bridge = { path = "../ane-vit/coreml-bridge" }
 npyz = "0.8"
+# Reranker "drafter" for kvflash host paging (ar_bench example only):
+# Qwen3-Reranker-0.6B is a Qwen3 dense LM, loaded via the qwen3-mlx crate.
+qwen3-mlx = { path = "../qwen3-mlx" }
 

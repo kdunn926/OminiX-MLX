@@ -20,19 +20,24 @@ use mlx_rs::Array;
 use mlx_rs_core::cache::{KVCache, KeyValueCache};
 use std::time::Instant;
 
-/// Run AR generation with a pre-built cache and report timing.
+#[path = "reranker_drafter.rs"]
+mod reranker_drafter;
+
+/// Run AR generation with a pre-built cache and report timing + generated ids.
 fn run_with_cache<C: KeyValueCache + Default>(
     model: &mut Model,
     mut cache: Vec<C>,
     max_tokens: usize,
     prompt: &Array,
-) -> Result<(f64, f64, usize)> {
+) -> Result<(f64, f64, usize, Vec<u32>)> {
     let t0 = Instant::now();
     let mut prefill = 0.0;
     let mut count = 0usize;
+    let mut out_ids: Vec<u32> = Vec::with_capacity(max_tokens);
     let gen = Generate::new(model, &mut cache, 0.0, prompt);
     for (i, tok) in gen.take(max_tokens).enumerate() {
-        let _ = tok.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let tok = tok.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        out_ids.push(tok.item::<u32>());
         if i == 0 {
             prefill = t0.elapsed().as_secs_f64();
         }
@@ -41,7 +46,7 @@ fn run_with_cache<C: KeyValueCache + Default>(
     let elapsed = t0.elapsed().as_secs_f64();
     let decode_s = (elapsed - prefill).max(0.001);
     let decode_tok_s = (count.saturating_sub(1) as f64) / decode_s;
-    Ok((prefill, decode_tok_s, count))
+    Ok((prefill, decode_tok_s, count, out_ids))
 }
 
 fn main() -> Result<()> {
@@ -76,12 +81,58 @@ fn main() -> Result<()> {
     let paged = std::env::var("PAGED_KV").is_ok();
     let flat = std::env::var("FLAT_KV").is_ok();
     let kvflash = std::env::var("KVFLASH").is_ok() || std::env::var("DFLASH_KVFLASH").is_ok();
-    let kv_label = if kvflash {
+    let paging = std::env::var("DFLASH_KVFLASH_PAGING").as_deref() == Ok("1");
+    let drafter = std::env::var("DFLASH_KVFLASH_DRAFTER").as_deref() == Ok("1");
+
+    // Reranker "drafter": before decode, rerank the prompt's 64-token chunks once
+    // and pin the most-relevant resident for the whole generation (recall). The
+    // reranker scores (query, chunk_text) text pairs, so the gemma/reranker
+    // tokenizer mismatch is irrelevant — we chunk by gemma's own tokens (matching
+    // the cache) and decode each to text. Needs paging (host-resident chunks).
+    if kvflash && paging && drafter {
+        let chunk = 64usize;
+        let chunk_texts: Vec<String> = ids
+            .chunks(chunk)
+            .map(|c| {
+                let cids: Vec<u32> = c.iter().map(|&x| x as u32).collect();
+                tokenizer.decode(&cids, false).unwrap_or_default()
+            })
+            .collect();
+        let qn = std::env::var("DFLASH_KVFLASH_DRAFTER_QTOK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(160usize)
+            .min(ids.len());
+        let qids: Vec<u32> = ids[ids.len() - qn..].iter().map(|&x| x as u32).collect();
+        let query = tokenizer.decode(&qids, true).unwrap_or_default();
+        let rr_dir = std::env::var("DFLASH_KVFLASH_RERANKER")
+            .unwrap_or_else(|_| "models/Qwen3-Reranker-0.6B-4bit".into());
+        eprintln!("drafter: reranking {} chunks vs query ({qn} tok) with {rr_dir}", chunk_texts.len());
+        let t0 = Instant::now();
+        let mut rr = reranker_drafter::RerankerDrafter::load(&rr_dir)?;
+        let order = rr.rank(&query, &chunk_texts)?;
+        drop(rr);
+        eprintln!(
+            "drafter: ranked in {:.1}s; top chunks {:?}",
+            t0.elapsed().as_secs_f64(),
+            &order[..order.len().min(8)]
+        );
+        mlx_rs_core::kvflash::set_drafter_pins(order);
+    }
+
+    let kv_label = if kvflash && paging {
+        let pool = std::env::var("DFLASH_KVFLASH").unwrap_or_else(|_| "4096".into());
+        let how = if drafter { "drafter pins" } else { "q·k" };
+        format!("kvflash host-paging ({how}, global pool={pool})")
+    } else if kvflash {
         let pool = std::env::var("DFLASH_KVFLASH").unwrap_or_else(|_| "4096".into());
         format!("kvflash (global pool={pool})")
     } else if paged { "paged".into() } else if flat { "flat (unbounded)".into() } else { "layered (sliding-trim)".into() };
     eprintln!("kv_backend: {kv_label}");
-    let (prefill, decode_tok_s, count) = if kvflash {
+    let (prefill, decode_tok_s, count, out_ids) = if kvflash && paging {
+        let cache = gemma4_mlx::init_kvflash_paged_cache(&model);
+        run_with_cache(&mut model, cache, max_tokens, &prompt)?
+    } else if kvflash {
         let cache = gemma4_mlx::init_kvflash_cache(&model);
         run_with_cache(&mut model, cache, max_tokens, &prompt)?
     } else if paged {
@@ -94,6 +145,9 @@ fn main() -> Result<()> {
         let cache = init_layered_cache(&model);
         run_with_cache(&mut model, cache, max_tokens, &prompt)?
     };
+    if let Ok(text) = tokenizer.decode(&out_ids, true) {
+        eprintln!("--- output ---\n{text}\n--------------");
+    }
 
     let decode_s = (count.saturating_sub(1) as f64) / decode_tok_s.max(0.001);
     println!(

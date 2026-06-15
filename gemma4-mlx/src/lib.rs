@@ -40,7 +40,8 @@ pub use model::{
     Generate, GenerateState, LanguageModel, Model, ModelInput, Router, UnscaledRmsNorm,
 };
 pub use mixed_cache::{
-    init_kvflash_cache, init_layered_cache, init_mixed_paged_cache, MixedKvCache,
+    init_kvflash_cache, init_kvflash_paged_cache, init_layered_cache, init_mixed_paged_cache,
+    MixedKvCache,
 };
 pub use sliding_cache::SlidingKVCache;
 pub use vision::{preprocess_image_gemma4, EmbedVision, Gemma4VisionConfig, VisionModel};
