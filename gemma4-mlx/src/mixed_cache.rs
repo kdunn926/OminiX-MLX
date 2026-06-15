@@ -13,6 +13,7 @@
 
 use mlx_rs::{error::Exception, Array};
 use mlx_rs_core::cache::{KVCache, KeyValueCache};
+use mlx_rs_core::kvflash::KvFlashCache;
 use mlx_rs_core::paged::PagedKvCache;
 
 use crate::model::Model;
@@ -33,6 +34,10 @@ pub enum MixedKvCache {
     Kv(KVCache),
     Paged(PagedKvCache),
     Sliding(SlidingKVCache),
+    /// Spike: KVFlash bounded-residency cache for full-attention layers
+    /// (sink + recent, LRU chunk eviction). Sliding layers already
+    /// window-bound, so kvflash only replaces the unbounded `Kv` slots.
+    KvFlash(KvFlashCache),
 }
 
 impl Default for MixedKvCache {
@@ -47,6 +52,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.offset(),
             MixedKvCache::Paged(c) => c.offset(),
             MixedKvCache::Sliding(c) => c.offset(),
+            MixedKvCache::KvFlash(c) => c.offset(),
         }
     }
 
@@ -55,6 +61,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.physical_offset(),
             MixedKvCache::Paged(c) => c.physical_offset(),
             MixedKvCache::Sliding(c) => c.physical_offset(),
+            MixedKvCache::KvFlash(c) => c.physical_offset(),
         }
     }
 
@@ -63,6 +70,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.max_size(),
             MixedKvCache::Paged(c) => c.max_size(),
             MixedKvCache::Sliding(c) => c.max_size(),
+            MixedKvCache::KvFlash(c) => c.max_size(),
         }
     }
 
@@ -75,6 +83,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.update_and_fetch(keys, values),
             MixedKvCache::Paged(c) => c.update_and_fetch(keys, values),
             MixedKvCache::Sliding(c) => c.update_and_fetch(keys, values),
+            MixedKvCache::KvFlash(c) => c.update_and_fetch(keys, values),
         }
     }
 
@@ -83,6 +92,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.reset(),
             MixedKvCache::Paged(c) => c.reset(),
             MixedKvCache::Sliding(c) => c.reset(),
+            MixedKvCache::KvFlash(c) => c.reset(),
         }
     }
 
@@ -108,6 +118,9 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Sliding(c) => {
                 c.try_fused_attention(q, k_new, v_new, scale, mask, kv_repeat)
             }
+            MixedKvCache::KvFlash(c) => {
+                c.try_fused_attention(q, k_new, v_new, scale, mask, kv_repeat)
+            }
         }
     }
 
@@ -116,6 +129,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.current_kv(),
             MixedKvCache::Paged(c) => c.current_kv(),
             MixedKvCache::Sliding(c) => c.current_kv(),
+            MixedKvCache::KvFlash(c) => c.current_kv(),
         }
     }
 
@@ -124,6 +138,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.eval(),
             MixedKvCache::Paged(c) => c.eval(),
             MixedKvCache::Sliding(c) => c.eval(),
+            MixedKvCache::KvFlash(c) => c.eval(),
         }
     }
 
@@ -136,6 +151,7 @@ impl KeyValueCache for MixedKvCache {
             // its older tail. Callers using DFlash with sliding layers
             // must snapshot+restore the SlidingKVCache via `Clone` instead.
             MixedKvCache::Sliding(c) => c.trim_kv(n_drop),
+            MixedKvCache::KvFlash(c) => c.trim_kv(n_drop),
         }
     }
 
@@ -144,6 +160,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.compact_kv(past_length, keep_indices),
             MixedKvCache::Paged(c) => c.compact_kv(past_length, keep_indices),
             MixedKvCache::Sliding(c) => c.compact_kv(past_length, keep_indices),
+            MixedKvCache::KvFlash(c) => c.compact_kv(past_length, keep_indices),
         }
     }
 
@@ -152,6 +169,7 @@ impl KeyValueCache for MixedKvCache {
             MixedKvCache::Kv(c) => c.compact_to_last_n(n),
             MixedKvCache::Paged(c) => c.compact_to_last_n(n),
             MixedKvCache::Sliding(c) => c.compact_to_last_n(n),
+            MixedKvCache::KvFlash(c) => c.compact_to_last_n(n),
         }
     }
 }
@@ -253,6 +271,77 @@ pub fn init_layered_cache(model: &Model) -> Vec<MixedKvCache> {
         .map(|slot| {
             if slot_full[slot] {
                 MixedKvCache::Kv(KVCache::default())
+            } else {
+                let window = slot_window[slot].unwrap_or(1024);
+                MixedKvCache::Sliding(SlidingKVCache::new(window))
+            }
+        })
+        .collect()
+}
+
+/// Spike: like [`init_layered_cache`], but the **full-attention** (global)
+/// slots get a [`KvFlashCache`] (bounded sink + recent residency) instead of
+/// the unbounded [`KVCache`]. Sliding slots keep their already-bounded
+/// [`SlidingKVCache`]. This is the kvflash analogue for Gemma4: the SWA layers
+/// already ring-buffer, so kvflash only needs to bound the few global layers
+/// whose KV otherwise grows with context.
+///
+/// Pool/sink/prefill-bounding from `DFLASH_KVFLASH` (default 4096),
+/// `DFLASH_KVFLASH_SINK`, `DFLASH_KVFLASH_PREFILL=1`. Same shared-KV /
+/// store-layer rules as [`init_layered_cache`] (those slots stay unbounded
+/// `Kv` so shared readers' RoPE offsets stay correct).
+pub fn init_kvflash_cache(model: &Model) -> Vec<MixedKvCache> {
+    let inner = &model.model;
+    let num_slots = *inner.kv_cache_map.iter().max().unwrap_or(&0) + 1;
+
+    let mut slot_full = vec![false; num_slots];
+    let mut slot_window: Vec<Option<i32>> = vec![None; num_slots];
+    let mut slot_shared = vec![false; num_slots];
+    for (i, layer) in inner.layers.iter().enumerate() {
+        let slot = inner.kv_cache_map[i];
+        if inner.kv_store_layers.contains(&i) {
+            slot_full[slot] = true;
+            slot_shared[slot] = true; // shared readers need true positions → unbounded
+        }
+        match layer.self_attn.sliding_window {
+            None => slot_full[slot] = true,
+            Some(w) => {
+                if slot_window[slot].is_none() {
+                    slot_window[slot] = Some(w);
+                }
+            }
+        }
+    }
+
+    let pool: i32 = std::env::var("DFLASH_KVFLASH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4096);
+    let sink: i32 = std::env::var("DFLASH_KVFLASH_SINK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(mlx_rs_core::kvflash::DEFAULT_SINK);
+    let bound_prefill = matches!(
+        std::env::var("DFLASH_KVFLASH_PREFILL").ok().as_deref(),
+        Some("1") | Some("true")
+    );
+
+    (0..num_slots)
+        .map(|slot| {
+            if slot_full[slot] {
+                // Shared-KV store slots must stay unbounded (see init_layered_cache):
+                // a lossy pool would break shared readers' physical-length RoPE.
+                if slot_shared[slot] {
+                    MixedKvCache::Kv(KVCache::default())
+                } else {
+                    MixedKvCache::KvFlash(KvFlashCache::new(
+                        pool,
+                        sink,
+                        mlx_rs_core::kvflash::DEFAULT_CHUNK,
+                        bound_prefill,
+                    ))
+                }
             } else {
                 let window = slot_window[slot].unwrap_or(1024);
                 MixedKvCache::Sliding(SlidingKVCache::new(window))

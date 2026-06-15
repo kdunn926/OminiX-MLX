@@ -75,9 +75,16 @@ fn main() -> Result<()> {
 
     let paged = std::env::var("PAGED_KV").is_ok();
     let flat = std::env::var("FLAT_KV").is_ok();
-    let kv_label = if paged { "paged" } else if flat { "flat (unbounded)" } else { "layered (sliding-trim)" };
+    let kvflash = std::env::var("KVFLASH").is_ok() || std::env::var("DFLASH_KVFLASH").is_ok();
+    let kv_label = if kvflash {
+        let pool = std::env::var("DFLASH_KVFLASH").unwrap_or_else(|_| "4096".into());
+        format!("kvflash (global pool={pool})")
+    } else if paged { "paged".into() } else if flat { "flat (unbounded)".into() } else { "layered (sliding-trim)".into() };
     eprintln!("kv_backend: {kv_label}");
-    let (prefill, decode_tok_s, count) = if paged {
+    let (prefill, decode_tok_s, count) = if kvflash {
+        let cache = gemma4_mlx::init_kvflash_cache(&model);
+        run_with_cache(&mut model, cache, max_tokens, &prompt)?
+    } else if paged {
         let cache = init_mixed_paged_cache(&model);
         run_with_cache(&mut model, cache, max_tokens, &prompt)?
     } else if flat {
