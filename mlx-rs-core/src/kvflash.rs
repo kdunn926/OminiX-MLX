@@ -411,6 +411,272 @@ impl KeyValueCache for KvFlashCache {
     }
 }
 
+/// Host-paging KVFlash cache: keep **all** chunks in (unified) memory and bound
+/// only the attention *working set*. Every `tau` decode steps it reselects the
+/// resident set by scoring **all** chunks — including paged-out ones — against
+/// the latest query, so a chunk is "paged back in" the moment a query attends
+/// it. This recovers the mid-context recall the drop-on-evict policies lose:
+/// the first decode reselection uses the trailing query (the question, captured
+/// at the end of prefill), which pulls its relevant chunk back into residency.
+///
+/// On Apple Silicon (unified memory) this trades the memory bound (all chunks
+/// stay resident in unified memory) for full recall plus a bounded attention
+/// read — the decode-throughput win is kept; the VRAM win is not (there is no
+/// separate host RAM to evacuate to).
+pub struct KvFlashPagedCache {
+    ck: Vec<Array>,     // frozen chunk keys   [B, Hkv, chunk, D]
+    cv: Vec<Array>,     // frozen chunk values
+    cmean: Vec<Array>,  // per-chunk reduced mean key [D] for cheap scoring
+    pk: Option<Array>,  // pending (sub-chunk) tail
+    pv: Option<Array>,
+    plen: i32,
+    logical: i32,
+    pool: i32,
+    chunk: i32,
+    sink_chunks: i32,
+    recent_chunks: i32,
+    tau: i32,
+    steps: i32,
+    resident: Vec<usize>, // chunk indices in the attention set (sorted)
+    q_mean: Option<Array>, // [D] head-mean of the latest query
+    pub pages_in: usize,
+}
+
+impl std::fmt::Debug for KvFlashPagedCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvFlashPagedCache")
+            .field("logical", &self.logical)
+            .field("chunks", &self.ck.len())
+            .field("resident", &self.resident.len())
+            .field("pool", &self.pool)
+            .field("pages_in", &self.pages_in)
+            .finish()
+    }
+}
+
+impl Clone for KvFlashPagedCache {
+    fn clone(&self) -> Self {
+        Self {
+            ck: self.ck.clone(),
+            cv: self.cv.clone(),
+            cmean: self.cmean.clone(),
+            pk: self.pk.clone(),
+            pv: self.pv.clone(),
+            plen: self.plen,
+            logical: self.logical,
+            pool: self.pool,
+            chunk: self.chunk,
+            sink_chunks: self.sink_chunks,
+            recent_chunks: self.recent_chunks,
+            tau: self.tau,
+            steps: self.steps,
+            resident: self.resident.clone(),
+            q_mean: self.q_mean.clone(),
+            pages_in: self.pages_in,
+        }
+    }
+}
+
+impl KvFlashPagedCache {
+    pub fn new(pool: i32, sink: i32, chunk: i32, recent: i32, tau: i32) -> Self {
+        let chunk = chunk.max(1);
+        let sink_chunks = (sink + chunk - 1) / chunk;
+        let recent_chunks = (recent.max(chunk) + chunk - 1) / chunk;
+        Self {
+            ck: Vec::new(),
+            cv: Vec::new(),
+            cmean: Vec::new(),
+            pk: None,
+            pv: None,
+            plen: 0,
+            logical: 0,
+            pool: pool.max((sink_chunks + recent_chunks + 1) * chunk),
+            chunk,
+            sink_chunks,
+            recent_chunks,
+            tau: tau.max(1),
+            steps: 0,
+            resident: Vec::new(),
+            q_mean: None,
+            pages_in: 0,
+        }
+    }
+
+    fn n_resident_chunks(&self) -> i32 {
+        self.pool / self.chunk
+    }
+
+    /// Freeze full `chunk`-sized blocks out of the pending tail.
+    fn freeze(&mut self) -> Result<(), Exception> {
+        while self.plen >= self.chunk {
+            let pk = self.pk.take().unwrap();
+            let pv = self.pv.take().unwrap();
+            let ck = pk.index((Ellipsis, ..self.chunk, ..));
+            let cv = pv.index((Ellipsis, ..self.chunk, ..));
+            // reduced mean key [D] (mean over Hkv and chunk positions, batch 0).
+            let cm = ck.mean_axes(&[0, 1, 2], false)?; // [D]
+            self.ck.push(ck);
+            self.cv.push(cv);
+            self.cmean.push(cm);
+            let rem = self.plen - self.chunk;
+            if rem > 0 {
+                self.pk = Some(pk.index((Ellipsis, self.chunk.., ..)));
+                self.pv = Some(pv.index((Ellipsis, self.chunk.., ..)));
+            } else {
+                self.pk = None;
+                self.pv = None;
+            }
+            self.plen = rem;
+        }
+        Ok(())
+    }
+
+    /// Reselect the resident chunk set: pin sink + recent chunks, fill the rest
+    /// with the highest-scoring middle chunks by `q_mean · cmean`.
+    fn reselect(&mut self) -> Result<(), Exception> {
+        let n = self.ck.len() as i32;
+        let budget = self.n_resident_chunks();
+        if n <= budget {
+            self.resident = (0..n as usize).collect();
+            return Ok(());
+        }
+        let sink_c = self.sink_chunks.min(n);
+        let recent_c = self.recent_chunks.min(n - sink_c);
+        let mid_lo = sink_c;
+        let mid_hi = n - recent_c; // exclusive
+        let mid_budget = (budget - sink_c - recent_c).max(0);
+
+        // Score middle chunks against the latest query.
+        let mut chosen: Vec<usize> = Vec::new();
+        if mid_budget > 0 && mid_hi > mid_lo {
+            if let Some(qm) = self.q_mean.as_ref() {
+                // stack middle cmeans → [n_mid, D], score = mids @ qm → [n_mid]
+                let mids: Vec<&Array> = (mid_lo..mid_hi)
+                    .map(|i| &self.cmean[i as usize])
+                    .collect();
+                let stacked = mlx_rs::ops::stack_axis(&mids, 0)?; // [n_mid, D]
+                let qcol = qm.reshape(&[-1, 1])?; // [D,1]
+                let scores = mlx_rs::ops::matmul(&stacked, &qcol)?.reshape(&[-1])?;
+                let scores = scores.contiguous()?;
+                mlx_rs::transforms::eval([&scores])?;
+                let sv = scores.as_slice::<f32>().to_vec();
+                let mut order: Vec<usize> =
+                    (0..sv.len()).collect();
+                order.sort_by(|&a, &b| sv[b].partial_cmp(&sv[a]).unwrap_or(std::cmp::Ordering::Equal));
+                for &o in order.iter().take(mid_budget as usize) {
+                    chosen.push(mid_lo as usize + o);
+                }
+            } else {
+                // No query yet → take the most recent middle chunks.
+                for i in (mid_hi - mid_budget).max(mid_lo)..mid_hi {
+                    chosen.push(i as usize);
+                }
+            }
+        }
+        let prev_resident: std::collections::HashSet<usize> =
+            self.resident.iter().copied().collect();
+        let mut res: Vec<usize> = Vec::new();
+        for i in 0..sink_c {
+            res.push(i as usize);
+        }
+        res.extend(chosen.iter().copied());
+        for i in mid_hi..n {
+            res.push(i as usize);
+        }
+        res.sort_unstable();
+        res.dedup();
+        // Count newly-paged-in chunks (were not resident last round).
+        for &i in &res {
+            if !prev_resident.contains(&i) {
+                self.pages_in += 1;
+            }
+        }
+        self.resident = res;
+        Ok(())
+    }
+
+    /// Concatenate the resident chunks (position order) + pending tail.
+    fn gather_resident(&self) -> Result<(Array, Array), Exception> {
+        let mut ks: Vec<&Array> = self.resident.iter().map(|&i| &self.ck[i]).collect();
+        let mut vs: Vec<&Array> = self.resident.iter().map(|&i| &self.cv[i]).collect();
+        if let (Some(pk), Some(pv)) = (self.pk.as_ref(), self.pv.as_ref()) {
+            ks.push(pk);
+            vs.push(pv);
+        }
+        Ok((concatenate_axis(&ks, 2)?, concatenate_axis(&vs, 2)?))
+    }
+}
+
+impl KeyValueCache for KvFlashPagedCache {
+    fn offset(&self) -> i32 {
+        self.logical
+    }
+
+    fn physical_offset(&self) -> i32 {
+        self.resident.len() as i32 * self.chunk + self.plen
+    }
+
+    fn max_size(&self) -> Option<i32> {
+        None
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        keys: Array,
+        values: Array,
+    ) -> Result<(Array, Array), Exception> {
+        let num_new = keys.shape()[2];
+        // Append to the pending tail.
+        self.pk = Some(match self.pk.take() {
+            Some(p) => concatenate_axis(&[p, keys], 2)?,
+            None => keys,
+        });
+        self.pv = Some(match self.pv.take() {
+            Some(p) => concatenate_axis(&[p, values], 2)?,
+            None => values,
+        });
+        self.plen += num_new;
+        self.logical += num_new;
+        self.freeze()?;
+
+        let n = self.ck.len() as i32;
+        if num_new > 1 || n <= self.n_resident_chunks() {
+            // Prefill (or still under budget): attend everything.
+            self.resident = (0..n as usize).collect();
+        } else {
+            // Decode over budget: reselect every `tau` steps (and immediately
+            // on the first over-budget step, using the trailing prefill query).
+            self.steps += 1;
+            if self.resident.len() as i32 > self.n_resident_chunks()
+                || self.steps % self.tau == 0
+            {
+                self.reselect()?;
+            }
+        }
+        self.gather_resident()
+    }
+
+    fn current_kv(&self) -> Option<(Array, Array)> {
+        self.gather_resident().ok()
+    }
+
+    fn reset(&mut self) {
+        *self = KvFlashPagedCache::new(
+            self.pool,
+            self.sink_chunks * self.chunk,
+            self.chunk,
+            self.recent_chunks * self.chunk,
+            self.tau,
+        );
+    }
+
+    fn observe_query(&mut self, q: &Array) -> Result<(), Exception> {
+        // Head + seq mean → [D]; drives the next reselection.
+        self.q_mean = Some(q.mean_axes(&[0, 1, 2], false)?);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -89,6 +89,12 @@ impl TransformerBlock {
                     mask,
                     cache: Some(kf_cache),
                 })?,
+            (AttentionLayer::FullAttention(attn), HybridCache::KvFlashPaged(kf_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(kf_cache),
+                })?,
             (AttentionLayer::LinearAttention(delta), HybridCache::Recurrent(rec_cache)) => {
                 let L = normed.shape()[1];
                 if L > 1 {
@@ -148,6 +154,12 @@ impl TransformerBlock {
                     cache: Some(paged_cache),
                 })?,
             (AttentionLayer::FullAttention(attn), HybridCache::KvFlash(kf_cache)) => attn
+                .forward(GatedAttentionInput {
+                    x: &normed,
+                    mask,
+                    cache: Some(kf_cache),
+                })?,
+            (AttentionLayer::FullAttention(attn), HybridCache::KvFlashPaged(kf_cache)) => attn
                 .forward(GatedAttentionInput {
                     x: &normed,
                     mask,
@@ -318,6 +330,28 @@ impl Model {
                                 .ok()
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(mlx_rs_core::kvflash::DEFAULT_SINK);
+                            // Host paging: keep all chunks, reselect the resident
+                            // set against the query every tau steps so heavy-hitters
+                            // page back in (recall). DFLASH_KVFLASH_PAGING=1.
+                            if std::env::var("DFLASH_KVFLASH_PAGING").as_deref() == Ok("1") {
+                                let recent: i32 = std::env::var("DFLASH_KVFLASH_RECENT")
+                                    .ok()
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(pool / 2);
+                                let tau: i32 = std::env::var("DFLASH_KVFLASH_TAU")
+                                    .ok()
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(8);
+                                return HybridCache::KvFlashPaged(
+                                    mlx_rs_core::kvflash::KvFlashPagedCache::new(
+                                        pool,
+                                        sink,
+                                        mlx_rs_core::kvflash::DEFAULT_CHUNK,
+                                        recent,
+                                        tau,
+                                    ),
+                                );
+                            }
                             // Bound prefill too (memory bound + O(seq·pool)
                             // attention) when DFLASH_KVFLASH_PREFILL=1. Default
                             // off = decode-only bounding (full prefill KV).
