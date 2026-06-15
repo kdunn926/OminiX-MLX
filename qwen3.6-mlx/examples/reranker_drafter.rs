@@ -20,7 +20,7 @@
 use anyhow::{anyhow, Result};
 use mlx_rs::{ops::indexing::IndexOp, transforms::eval, Array, Dtype};
 use mlx_rs_core::Tokenizer;
-use qwen3_mlx::{load_model, load_tokenizer, KVCache, Model, ModelInput};
+use qwen3_mlx::{load_model, load_tokenizer, AttentionMask, KVCache, Model, ModelInput};
 
 const PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
 const SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -55,44 +55,90 @@ impl RerankerDrafter {
         Ok(Self { model, tok, pre, suf, yes_id, no_id })
     }
 
-    /// Relevance of `doc` to `query`: `logit(yes) − logit(no)` at the last
-    /// position (monotone with the model card's softmax score; we only rank).
-    fn score_one(&mut self, query: &str, doc: &str) -> Result<f32> {
+    /// Token ids for one `(query, doc)` reranker prompt.
+    fn encode_pair(&self, query: &str, doc: &str) -> Result<Vec<i32>> {
         let content = format!("<Instruct>: {INSTRUCT}\n<Query>: {query}\n<Document>: {doc}");
-        let cids: Vec<i32> = self
-            .tok
-            .encode(content, false)
-            .map_err(|e| anyhow!("{e}"))?
-            .get_ids()
-            .iter()
-            .map(|&x| x as i32)
-            .collect();
+        let cids = self.tok.encode(content, false).map_err(|e| anyhow!("{e}"))?;
         let mut ids = Vec::with_capacity(self.pre.len() + cids.len() + self.suf.len());
         ids.extend_from_slice(&self.pre);
-        ids.extend_from_slice(&cids);
+        ids.extend(cids.get_ids().iter().map(|&x| x as i32));
         ids.extend_from_slice(&self.suf);
-        let arr = Array::from_slice(&ids, &[1, ids.len() as i32]);
+        Ok(ids)
+    }
+
+    /// Score one **batch** of pre-tokenized prompts in a single forward.
+    ///
+    /// Sequences are **left-padded** to the batch's max length so every row's
+    /// last real token (the suffix end, where the yes/no logit lives) sits at
+    /// index -1 — letting us reuse `forward_last_logits`. A boolean attention
+    /// mask `(j ≤ i) AND (j ≥ pad_count[b])` keeps it causal *and* blocks the
+    /// leading pad keys; partial RoPE is relative so the per-row position shift
+    /// from padding doesn't change a sequence's internal attention.
+    fn score_batch(&mut self, seqs: &[Vec<i32>]) -> Result<Vec<f32>> {
+        let b = seqs.len() as i32;
+        let max_l = seqs.iter().map(|s| s.len()).max().unwrap_or(1) as i32;
+        let pad_id = 0i32;
+        let mut flat = vec![pad_id; (b * max_l) as usize];
+        let mut pad_counts = vec![0i32; b as usize];
+        for (row, s) in seqs.iter().enumerate() {
+            let pad = max_l as usize - s.len();
+            pad_counts[row] = pad as i32;
+            let base = row * max_l as usize + pad;
+            flat[base..base + s.len()].copy_from_slice(s);
+        }
+        let inputs = Array::from_slice(&flat, &[b, max_l]);
+
+        // Bool mask [B,1,L,L]: causal (i≥j) AND key not in this row's pad region.
+        let idx: Vec<i32> = (0..max_l).collect();
+        let cols = Array::from_slice(&idx, &[1, 1, 1, max_l]); // j
+        let rows = Array::from_slice(&idx, &[1, 1, max_l, 1]); // i
+        let causal = rows.ge(&cols).map_err(|e| anyhow!("{e}"))?; // [1,1,L,L] i≥j
+        let pc = Array::from_slice(&pad_counts, &[b, 1, 1, 1]);
+        let not_pad = cols.ge(&pc).map_err(|e| anyhow!("{e}"))?; // [B,1,1,L] j≥pad
+        let mask = causal.logical_and(&not_pad).map_err(|e| anyhow!("{e}"))?;
+        let am = AttentionMask::Array(mask);
+
         let mut cache: Vec<Option<KVCache>> = Vec::new();
         let logits = self
             .model
-            .forward_last_logits(ModelInput { inputs: &arr, mask: None, cache: &mut cache })
-            .map_err(|e| anyhow!("reranker forward: {e}"))?;
-        let yes = logits.index((0, self.yes_id));
-        let no = logits.index((0, self.no_id));
+            .forward_last_logits(ModelInput { inputs: &inputs, mask: Some(&am), cache: &mut cache })
+            .map_err(|e| anyhow!("reranker forward: {e}"))?; // [B, vocab]
+        let yes = logits.index((.., self.yes_id));
+        let no = logits.index((.., self.no_id));
         let diff = yes
             .subtract(&no)
             .and_then(|d| d.as_dtype(Dtype::Float32))
-            .and_then(|d| d.reshape(&[1]))
-            .map_err(|e| anyhow!("reranker score: {e}"))?;
+            .map_err(|e| anyhow!("reranker score: {e}"))?; // [B]
         eval([&diff]).map_err(|e| anyhow!("eval: {e}"))?;
-        Ok(diff.as_slice::<f32>()[0])
+        Ok(diff.as_slice::<f32>().to_vec())
     }
 
     /// Rank `chunks` by relevance to `query`; returns chunk indices best-first.
+    ///
+    /// Chunks are sorted by token length and scored in batches (one forward per
+    /// batch instead of one per chunk) — sorting groups similar lengths so the
+    /// left-padding overhead stays small. `DFLASH_RERANK_BATCH` sets the batch
+    /// size (default 32).
     pub fn rank(&mut self, query: &str, chunks: &[String]) -> Result<Vec<usize>> {
-        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(chunks.len());
+        let batch: usize = std::env::var("DFLASH_RERANK_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(32);
+        // Tokenize all, then sort indices by length to minimize padding waste.
+        let mut tokenized: Vec<(usize, Vec<i32>)> = Vec::with_capacity(chunks.len());
         for (i, c) in chunks.iter().enumerate() {
-            scored.push((i, self.score_one(query, c)?));
+            tokenized.push((i, self.encode_pair(query, c)?));
+        }
+        tokenized.sort_by_key(|(_, s)| s.len());
+
+        let mut scored: Vec<(usize, f32)> = Vec::with_capacity(chunks.len());
+        for group in tokenized.chunks(batch) {
+            let seqs: Vec<Vec<i32>> = group.iter().map(|(_, s)| s.clone()).collect();
+            let scores = self.score_batch(&seqs)?;
+            for ((orig_i, _), score) in group.iter().zip(scores) {
+                scored.push((*orig_i, score));
+            }
         }
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(scored.into_iter().map(|(i, _)| i).collect())
