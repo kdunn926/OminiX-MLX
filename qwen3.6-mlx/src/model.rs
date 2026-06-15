@@ -325,12 +325,24 @@ impl Model {
                                 std::env::var("DFLASH_KVFLASH_PREFILL").ok().as_deref(),
                                 Some("1") | Some("true")
                             );
-                            HybridCache::KvFlash(mlx_rs_core::kvflash::KvFlashCache::new(
+                            let mut kf = mlx_rs_core::kvflash::KvFlashCache::new(
                                 pool,
                                 sink,
                                 mlx_rs_core::kvflash::DEFAULT_CHUNK,
                                 bound_prefill,
-                            ))
+                            );
+                            // H2O-style scored residency: DFLASH_KVFLASH_POLICY=scored
+                            // keeps the most-attended middle chunks (recall) instead
+                            // of pure-recency LRU. DFLASH_KVFLASH_RECENT sets the
+                            // protected recency window (default pool/2).
+                            if std::env::var("DFLASH_KVFLASH_POLICY").as_deref() == Ok("scored") {
+                                let recent: i32 = std::env::var("DFLASH_KVFLASH_RECENT")
+                                    .ok()
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(pool / 2);
+                                kf.enable_scoring(recent);
+                            }
+                            HybridCache::KvFlash(kf)
                         }
                     }
                 } else {

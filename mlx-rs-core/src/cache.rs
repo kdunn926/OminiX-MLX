@@ -106,6 +106,15 @@ pub trait KeyValueCache {
             "KeyValueCache::compact_kv: this cache impl does not support compact",
         ))
     }
+
+    /// Optional hook: observe the queries `q` (`[B, Hq, L, D]`, post-RoPE) that
+    /// just attended this cache's resident keys, so a score-based eviction
+    /// policy can accumulate per-token attention mass and keep the
+    /// heavy-hitters resident (H2O-style). Called for both prefill (`L > 1`)
+    /// and decode (`L == 1`). Default no-op.
+    fn observe_query(&mut self, _q: &Array) -> Result<(), Exception> {
+        Ok(())
+    }
 }
 
 impl<T> KeyValueCache for &'_ mut T
@@ -162,6 +171,10 @@ where
 
     fn compact_kv(&mut self, past_length: i32, keep_indices: &Array) -> Result<(), Exception> {
         T::compact_kv(self, past_length, keep_indices)
+    }
+
+    fn observe_query(&mut self, q: &Array) -> Result<(), Exception> {
+        T::observe_query(self, q)
     }
 }
 

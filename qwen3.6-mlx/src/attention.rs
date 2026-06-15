@@ -119,6 +119,9 @@ impl<C: KeyValueCache> Module<GatedAttentionInput<'_, C>> for GatedAttention {
                 let (k, v) = cache.update_and_fetch(keys, values)?;
                 keys = k;
                 values = v;
+                // KVFlash scored residency: let the cache accumulate which
+                // resident positions these queries attend (no-op otherwise).
+                cache.observe_query(&queries)?;
             }
         } else {
             queries = self.rope.forward(nn::RopeInput::new(&queries))?;

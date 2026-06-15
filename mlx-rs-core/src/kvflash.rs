@@ -48,6 +48,18 @@ pub const DEFAULT_CHUNK: i32 = 64;
 /// Default attention-sink tokens kept at the front.
 pub const DEFAULT_SINK: i32 = 4;
 
+/// Residency policy: which chunk to evict on overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// Drop the oldest non-sink chunk (StreamingLLM): sink + recent window.
+    Lru,
+    /// Drop the lowest accumulated-attention chunk among the unprotected
+    /// middle (H2O-style heavy-hitter retention): keep sink + recent window +
+    /// the most-attended middle chunks. `observe_query` must be wired so the
+    /// model's queries accumulate per-token attention mass.
+    Scored,
+}
+
 /// A bounded-residency KV cache for full-attention layers. See module docs.
 #[derive(Debug, Clone)]
 pub struct KvFlashCache {
@@ -74,6 +86,14 @@ pub struct KvFlashCache {
     /// and that the just-appended block is the suffix of the resident set —
     /// both hold for the qwen3.6 chunked-prefill path (hardware causal mask).
     bound_prefill: bool,
+    /// Eviction policy (LRU or Scored).
+    policy: Policy,
+    /// Recent tokens always protected from scored eviction (recency window).
+    recent: i32,
+    /// Per-resident-position accumulated attention mass `[resident]` (device).
+    /// Maintained in lockstep with `keys`/`values` on append/evict. `None`
+    /// until the first write or under `Policy::Lru`.
+    scores: Option<Array>,
     /// Number of evictions performed (stat).
     pub evictions: usize,
 }
@@ -95,8 +115,24 @@ impl KvFlashCache {
             pool: pool.max(sink + chunk),
             chunk,
             bound_prefill,
+            policy: Policy::Lru,
+            recent: 0,
+            scores: None,
             evictions: 0,
         }
+    }
+
+    /// Switch to H2O-style scored residency: keep sink + a `recent`-token
+    /// recency window + the highest accumulated-attention middle chunks.
+    /// Requires the caller to wire [`KeyValueCache::observe_query`].
+    pub fn enable_scoring(&mut self, recent: i32) {
+        self.policy = Policy::Scored;
+        // Leave room for sink + at least one evictable middle chunk.
+        self.recent = recent.clamp(0, (self.pool - self.sink - self.chunk).max(0));
+    }
+
+    pub fn policy(&self) -> Policy {
+        self.policy
     }
 
     pub fn pool(&self) -> i32 {
@@ -142,49 +178,102 @@ impl KvFlashCache {
         Ok(())
     }
 
-    /// Drop the oldest non-sink chunk(s) so `resident <= pool`. Keeps
-    /// `[0..sink]` ++ `[sink+drop..resident]` (sink + most-recent tokens).
+    /// Drop resident positions `[a, b)` from keys, values, and scores,
+    /// compacting around the gap (keeps `[0..a]` ++ `[b..resident]`).
+    fn drop_range(&mut self, a: i32, b: i32) -> Result<(), Exception> {
+        if b <= a {
+            return Ok(());
+        }
+        let r = self.resident;
+        let keep = |arr: Array| -> Result<Array, Exception> {
+            if a == 0 {
+                Ok(arr.index((Ellipsis, b..r, ..)))
+            } else {
+                concatenate_axis(
+                    &[arr.index((Ellipsis, ..a, ..)), arr.index((Ellipsis, b..r, ..))],
+                    2,
+                )
+            }
+        };
+        let k = self.keys.take().unwrap();
+        let v = self.values.take().unwrap();
+        self.keys = Some(keep(k)?);
+        self.values = Some(keep(v)?);
+        if let Some(s) = self.scores.take() {
+            // scores is 1-D [resident].
+            let kept = if a == 0 {
+                s.index((b..r,))
+            } else {
+                concatenate_axis(&[s.index((..a,)), s.index((b..r,))], 0)?
+            };
+            self.scores = Some(kept);
+        }
+        self.resident -= b - a;
+        self.evictions += 1;
+        Ok(())
+    }
+
     fn evict(&mut self) -> Result<(), Exception> {
+        match self.policy {
+            Policy::Lru => self.evict_lru(),
+            Policy::Scored => self.evict_scored(),
+        }
+    }
+
+    /// LRU: drop the oldest non-sink chunk(s) so `resident <= pool`.
+    fn evict_lru(&mut self) -> Result<(), Exception> {
         if self.resident <= self.pool {
             return Ok(());
         }
         let excess = self.resident - self.pool;
-        // Round the drop up to a whole chunk so eviction happens ~once per
-        // `chunk` decode steps, not every step; never drop the sink or all of
-        // the recent window.
         let mut drop = ((excess + self.chunk - 1) / self.chunk) * self.chunk;
         drop = drop.min(self.resident - self.sink - 1).max(0);
         if drop == 0 {
             return Ok(());
         }
-        let k = self.keys.take().unwrap();
-        let v = self.values.take().unwrap();
-        let keep_k = if self.sink > 0 {
-            concatenate_axis(
-                &[
-                    k.index((Ellipsis, ..self.sink, ..)),
-                    k.index((Ellipsis, self.sink + drop..self.resident, ..)),
-                ],
-                2,
-            )?
-        } else {
-            k.index((Ellipsis, drop..self.resident, ..))
-        };
-        let keep_v = if self.sink > 0 {
-            concatenate_axis(
-                &[
-                    v.index((Ellipsis, ..self.sink, ..)),
-                    v.index((Ellipsis, self.sink + drop..self.resident, ..)),
-                ],
-                2,
-            )?
-        } else {
-            v.index((Ellipsis, drop..self.resident, ..))
-        };
-        self.keys = Some(keep_k);
-        self.values = Some(keep_v);
-        self.resident -= drop;
-        self.evictions += 1;
+        self.drop_range(self.sink, self.sink + drop)
+    }
+
+    /// Scored: while over pool, drop the lowest accumulated-attention chunk in
+    /// the unprotected middle `[sink, resident - recent)` (H2O heavy-hitter
+    /// retention). Falls back to LRU when no scores have accrued yet.
+    fn evict_scored(&mut self) -> Result<(), Exception> {
+        while self.resident > self.pool {
+            let lo = self.sink;
+            let hi = self.resident - self.recent; // exclusive; protected recent tail
+            if hi - lo < self.chunk {
+                // Middle too small to drop a chunk — protect-everything case;
+                // fall back to dropping the oldest evictable chunk.
+                let drop = (self.resident - self.pool)
+                    .min(self.resident - self.sink - 1)
+                    .max(0);
+                if drop == 0 {
+                    return Ok(());
+                }
+                return self.drop_range(self.sink, self.sink + drop);
+            }
+            // Per-chunk accumulated score over the middle; drop the argmin.
+            let scores_host: Vec<f32> = match self.scores.as_ref() {
+                Some(s) => {
+                    let s = s.contiguous()?;
+                    mlx_rs::transforms::eval([&s])?;
+                    s.as_slice::<f32>().to_vec()
+                }
+                None => vec![0.0; self.resident as usize],
+            };
+            let mut best_start = lo;
+            let mut best_sum = f32::INFINITY;
+            let mut c = lo;
+            while c + self.chunk <= hi {
+                let sum: f32 = scores_host[c as usize..(c + self.chunk) as usize].iter().sum();
+                if sum < best_sum {
+                    best_sum = sum;
+                    best_start = c;
+                }
+                c += self.chunk;
+            }
+            self.drop_range(best_start, best_start + self.chunk)?;
+        }
         Ok(())
     }
 }
@@ -237,6 +326,16 @@ impl KeyValueCache for KvFlashCache {
         self.resident = end;
         self.logical += num_new;
 
+        // Grow the per-position score buffer (zeros for the new tokens) so it
+        // stays aligned with the resident set under scored residency.
+        if self.policy == Policy::Scored {
+            let zeros = zeros_dtype(&[num_new], mlx_rs::Dtype::Float32)?;
+            self.scores = Some(match self.scores.take() {
+                Some(s) => concatenate_axis(&[s, zeros], 0)?,
+                None => zeros,
+            });
+        }
+
         // Evict on single-token (decode) appends always; on multi-token
         // (prefill) appends only when `bound_prefill`. Eviction keeps the
         // just-appended block as the resident suffix, so the caller's hardware
@@ -266,9 +365,40 @@ impl KeyValueCache for KvFlashCache {
     fn reset(&mut self) {
         self.keys = None;
         self.values = None;
+        self.scores = None;
         self.resident = 0;
         self.logical = 0;
         self.evictions = 0;
+    }
+
+    /// Accumulate per-resident-position attention mass from the queries `q`
+    /// (`[B, Hq, L, D]`) — a cheap mean-head softmax(q·kᵀ) summed over the
+    /// query block. Heavy-hitter positions accrue mass and survive scored
+    /// eviction. No-op under `Policy::Lru`.
+    fn observe_query(&mut self, q: &Array) -> Result<(), Exception> {
+        if self.policy != Policy::Scored || self.resident == 0 {
+            return Ok(());
+        }
+        let Some(k) = self.keys.as_ref() else {
+            return Ok(());
+        };
+        let kr = k.index((Ellipsis, ..self.resident, ..)); // [B, Hkv, R, D]
+        let d = q.shape()[3];
+        // Collapse heads (cheap proxy for the per-head attention).
+        let q_mean = q.mean_axes(&[1], false)?; // [B, L, D]
+        let k_mean = kr.mean_axes(&[1], false)?; // [B, R, D]
+        let scale = (d as f32).powf(-0.5);
+        // logits [B, L, R] = q_mean @ k_meanᵀ
+        let logits = mlx_rs::ops::matmul(&q_mean, &k_mean.transpose_axes(&[0, 2, 1])?)?
+            .multiply(mlx_rs::array!(scale))?;
+        let attn = mlx_rs::ops::softmax_axes(&logits, &[-1], None)?; // over R
+        // sum over the query block and batch → [R]
+        let mass = attn.sum_axes(&[0, 1], false)?; // [R]
+        self.scores = Some(match self.scores.take() {
+            Some(s) => s.add(&mass)?,
+            None => mass,
+        });
+        Ok(())
     }
 }
 
@@ -336,5 +466,40 @@ mod tests {
         assert_eq!(&ids[..2], &[0, 1], "sink not preserved across prefill: {ids:?}");
         assert_eq!(*ids.last().unwrap(), 19, "most-recent prefill token missing: {ids:?}");
         assert!(c.evictions > 0, "expected prefill evictions");
+    }
+
+    #[test]
+    fn scored_eviction_keeps_the_heavy_hitter() {
+        let _ = arange::<_, f32>(0.0, 1.0, None);
+        // pool 6, sink 1, recent 2, chunk 1, scored. D = 16 one-hot keys so a
+        // query at index 3 attends position 3; V[i] = i so we can read survivors.
+        let mut c = KvFlashCache::new(6, 1, 1, false);
+        c.enable_scoring(2);
+        let d = 16usize;
+        let q3 = {
+            // query == one-hot(3) * 8 (strong), shape [1,1,1,16]
+            let mut v = vec![0.0f32; d]; v[3] = 8.0;
+            Array::from_slice(&v, &[1, 1, 1, d as i32])
+        };
+        for id in 0..12i32 {
+            let mut kv = vec![0.0f32; d];
+            kv[(id as usize) % d] = 1.0; // one-hot(id) key
+            let k = Array::from_slice(&kv, &[1, 1, 1, d as i32]);
+            let v = Array::from_slice(&vec![id as f32; d], &[1, 1, 1, d as i32]); // V[i]=i
+            c.update_and_fetch(k, v).unwrap();
+            c.observe_query(&q3).unwrap(); // position 3 keeps getting attention
+            assert!(c.resident() <= c.pool());
+        }
+        // Read survivor ids from V (first column of each resident row; V[i]=i).
+        let (_, vv) = c.current_kv().unwrap();
+        let col0 = vv.reshape(&[-1, d as i32]).unwrap().index((Ellipsis, ..1)); // [R,1]
+        let col0 = col0.contiguous().unwrap();
+        mlx_rs::transforms::eval([&col0]).unwrap();
+        let ids: Vec<i32> = col0.as_slice::<f32>().iter().map(|&x| x as i32).collect();
+        // Heavy hitter (position 3) must survive despite being old & non-recent.
+        assert!(ids.contains(&3), "scored eviction dropped the heavy hitter: {ids:?}");
+        // Sink (0) and the recent tail (11) are kept too.
+        assert!(ids.contains(&0), "sink dropped: {ids:?}");
+        assert!(ids.contains(&11), "recent tail dropped: {ids:?}");
     }
 }
