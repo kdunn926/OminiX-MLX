@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OminiX-MLX — Model Leaderboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2230; --line: #2a3038;
+    --ink: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --accent2: #79c0ff;
+    --good: #3fb950; --good-bg: rgba(63,185,80,.13);
+    --bad: #f85149; --bad-bg: rgba(248,81,73,.13);
+    --warn: #d29922; --warn-bg: rgba(210,153,34,.10);
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 48px 24px 80px; }
+  header.hero { margin-bottom: 8px; }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing: -.02em; }
+  h1 .chip { font-size: 12px; vertical-align: middle; background: var(--accent);
+    color: #06101f; border-radius: 999px; padding: 3px 10px; margin-left: 10px; font-weight: 700; }
+  .sub { color: var(--muted); margin: 0 0 4px; }
+  .meta { color: var(--muted); font-size: 13px; font-family: var(--mono); }
+  h2 { font-size: 20px; margin: 44px 0 6px; letter-spacing: -.01em; }
+  h2 .tag { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 6px; vertical-align: middle; margin-left: 8px; }
+  .tag.new { background: var(--good-bg); color: var(--good); border: 1px solid rgba(63,185,80,.4); }
+  .lead { color: var(--muted); margin: 0 0 18px; max-width: 70ch; }
+  .callout {
+    background: var(--warn-bg); border: 1px solid rgba(210,153,34,.35);
+    border-left: 4px solid var(--warn); border-radius: 8px; padding: 12px 16px;
+    margin: 18px 0; font-size: 13.5px; color: #e3c97e;
+  }
+  .callout b { color: var(--warn); }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 6px;
+    background: var(--panel); border-radius: 10px; overflow: hidden; box-shadow: 0 1px 0 var(--line); }
+  thead th { background: var(--panel2); color: var(--muted); font-size: 12px; text-transform: uppercase;
+    letter-spacing: .04em; text-align: right; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+  thead th:first-child, tbody td:first-child { text-align: left; }
+  tbody td { padding: 10px 14px; border-bottom: 1px solid var(--line); text-align: right; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(88,166,255,.05); }
+  .model { font-weight: 600; }
+  .model small { display: block; color: var(--muted); font-weight: 400; font-size: 12px; }
+  .num { font-family: var(--mono); }
+  .best { font-family: var(--mono); font-weight: 700; color: var(--accent2); }
+  .note { color: var(--muted); font-size: 12.5px; }
+  .ratio { font-family: var(--mono); font-weight: 700; padding: 2px 8px; border-radius: 6px; font-size: 13px; }
+  .ratio.up { background: var(--good-bg); color: var(--good); }
+  .ratio.down { background: var(--bad-bg); color: var(--bad); }
+  .ratio.flat { background: rgba(139,148,158,.13); color: var(--muted); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 10px; }
+  @media (max-width: 720px){ .grid { grid-template-columns: 1fr; } table{ font-size: 13px; } .wrap{ padding: 28px 14px; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 15px; }
+  .card p { margin: 0; color: var(--muted); font-size: 13.5px; }
+  .card code, .lead code, .callout code { font-family: var(--mono); font-size: 12.5px;
+    background: rgba(110,118,129,.18); padding: 1px 6px; border-radius: 5px; color: var(--accent2); }
+  footer { margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+  footer a { color: var(--accent); text-decoration: none; }
+  footer a:hover { text-decoration: underline; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 12.5px; margin: 6px 0 0; }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: middle; }
+  .legend .l-up::before { background: var(--good); } .legend .l-down::before { background: var(--bad); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>OminiX-MLX Model Leaderboard <span class="chip">decode tok/s</span></h1>
+    <p class="sub">Best config to run each model, by context regime — Apple Silicon (M-series), greedy <span class="num">temp=0</span>.</p>
+    <p class="meta">updated 2026-06-15 · branch perf/inference-optimization</p>
+  </header>
+
+  <p class="lead">The winning configuration <b>flips with context length</b>. At
+  <b>short context</b> the KV read is cheap, so speculative decoding wins (more
+  tokens per target forward). At <b>long context</b> the growing global-attention
+  KV read dominates each step, so <b>kvflash bounded residency</b> wins — and
+  <code>host-paging + reranker drafter</code> adds mid-context recall at the same
+  bounded read.</p>
+
+  <div class="callout">
+    ⚠️ The short-context <b>spec ratios</b> are inherited from the 2026-06-12
+    same-session bench and are <b>cold-biased</b> (AR measured first / cold MoE-gather
+    JIT; spec measured warm) — a warm 35B re-bench flipped DFlash from 1.40× to
+    0.95×. Trust the <b>AR decode</b> numbers; treat spec ratios as <i>needs warm
+    re-bench</i> unless marked ✓warm. The <b>long-context kvflash</b> numbers were
+    each measured warm, in-process.
+  </div>
+
+  <h2>Long context — kvflash is the best config <span class="tag new">NEW</span></h2>
+  <p class="lead">Decode tok/s: default cache (baseline) → <code>kvflash host-paging + drafter</code>,
+  <code>pool=2048</code>. All configs recall an 8.3K/18K mid-context needle — the
+  drafter (Qwen3-Reranker-0.6B) ranks the needle chunk #1 and pins it resident.</p>
+  <table>
+    <thead><tr><th>Model</th><th>Context</th><th>Baseline</th><th>Paging + drafter</th><th>Ratio</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td class="model" rowspan="3">gemma4-26B-A4B<small>UD · MoE 3.8B active</small></td>
+          <td class="num">8.3K</td><td class="num">28.4</td><td class="best">31.4</td><td><span class="ratio up">1.11×</span></td><td class="note">peak (short) 33.5</td></tr>
+      <tr><td class="num">18K</td><td class="num">26.3</td><td class="best">30.2</td><td><span class="ratio up">1.15×</span></td><td class="note">gap widens with ctx</td></tr>
+      <tr><td class="num">15.9K</td><td class="num">26.9</td><td class="best">32.1</td><td><span class="ratio up">1.19×</span></td><td class="note">pool=1024, no drafter</td></tr>
+      <tr><td class="model" rowspan="2">gemma4-12B<small>UD · dense · 8 global layers</small></td>
+          <td class="num">8.3K</td><td class="num">19.8</td><td class="best">21.2</td><td><span class="ratio up">1.07×</span></td><td class="note">peak 22.6</td></tr>
+      <tr><td class="num">18K</td><td class="num">19.5</td><td class="best">21.2</td><td><span class="ratio up">1.09×</span></td><td class="note">drafter dead-flat 21.2→21.2</td></tr>
+      <tr><td class="model" rowspan="2">qwen3.6-27B<small>dense · 64 layers</small></td>
+          <td class="num">7.6K</td><td class="num">18.1</td><td class="best">18.6</td><td><span class="ratio flat">—</span></td><td class="note">baseline sags with ctx</td></tr>
+      <tr><td class="num">21.6K</td><td class="num">15.9</td><td class="best">18.9</td><td><span class="ratio up">1.19×</span></td><td class="note">kvflash holds flat</td></tr>
+    </tbody>
+  </table>
+  <p class="lead" style="margin-top:14px">Paging+drafter tracks the model's <b>peak</b>
+  decode rate (90–94% held at 18K) because the global-KV read is pool-capped, while
+  the baseline keeps paying for the growing cache (78–86% of peak). The gap widens
+  monotonically with context. One-time cost: a batched reranker pass before decode
+  (~15s for 281 chunks @18K), amortized over the generation; prefill is unchanged.</p>
+
+  <h2>Short context — AR baseline &amp; best spec config</h2>
+  <p class="lead">Decode tok/s at ~6–18 token prompt (2026-06-12, same-session).
+  <code>AR</code> = plain autoregressive; <code>best spec</code> = fastest speculative config found.</p>
+  <table>
+    <thead><tr><th>Model</th><th>AR</th><th>Best spec (config)</th><th>Ratio</th></tr></thead>
+    <tbody>
+      <tr><td class="model">gemma4-e4b 4bit<small>non-QAT · PLE + shared-KV</small></td><td class="best">60.8</td><td class="note">—</td><td><span class="ratio flat">—</span></td></tr>
+      <tr><td class="model">Qwen3.6-35B-A3B-4bit<small>MoE · 3B active</small></td><td class="best">69.6 <span class="note">✓warm</span></td><td class="num">DFlash 66.3</td><td><span class="ratio down">0.95×</span></td></tr>
+      <tr><td class="model">gemma4-26B-A4B UD-4bit<small>MoE</small></td><td class="num">32.2</td><td class="best">EAGLE-3 40.0</td><td><span class="ratio up">1.24×</span></td></tr>
+      <tr><td class="model">gemma4-12B QAT-4bit<small>dense</small></td><td class="num">22.4</td><td class="best">MTP-pair 31.0</td><td><span class="ratio up">1.38×</span></td></tr>
+      <tr><td class="model">Qwen3.6-27B-4bit<small>dense · 64 layers</small></td><td class="best">17.4</td><td class="num">DFlash 13.2</td><td><span class="ratio down">0.76×</span></td></tr>
+      <tr><td class="model">Gemma4-27B-MTPLX 4bit<small>dense · 60 layers</small></td><td class="num">8.08</td><td class="best">MTP-pair 16.48</td><td><span class="ratio up">2.04×</span></td></tr>
+    </tbody>
+  </table>
+  <p class="legend"><span class="l-up">ratio ≥ 1 (spec wins)</span><span class="l-down">ratio &lt; 1 (spec loses)</span> · cold-biased except ✓warm — re-bench warm before trusting.</p>
+
+  <h2>Recommendations</h2>
+  <div class="grid">
+    <div class="card"><h3>⚡ Fast daily driver (short prompts)</h3><p>gemma4-e4b (60.8) or the 35B-A3B MoE (~70 warm AR) — run the 35B plain AR; spec doesn't help it warm.</p></div>
+    <div class="card"><h3>📚 Long-document / RAG / large context</h3><p>Add <code>DFLASH_KVFLASH=&lt;pool&gt;</code> (+ <code>DFLASH_KVFLASH_PAGING=1 DFLASH_KVFLASH_DRAFTER=1</code> for mid-context recall) — best throughput past ~8K and the only config that recalls an evicted fact at a bounded KV read.</p></div>
+    <div class="card"><h3>🚀 Biggest spec win (short ctx)</h3><p>Gemma4-27B-MTPLX pair (2.04×) — pending a warm re-bench to confirm the ratio.</p></div>
+    <div class="card"><h3>🛟 Safe default</h3><p>kvflash is byte-identical to the default cache on short prompts (nothing evicted), so it's safe to leave on for long-context workloads.</p></div>
+  </div>
+
+  <footer>
+    Source: <code>docs/model-leaderboard.md</code> · Long-context detail:
+    <a href="kvflash-spike.md">kvflash-spike.md</a> · Rust-vs-Python parity:
+    <a href="performance-comparison.md">performance-comparison.md</a>
+  </footer>
+
+</div>
+</body>
+</html>
