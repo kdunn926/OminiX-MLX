@@ -232,6 +232,35 @@ gemma4's global layers are real attention whose `O(seq²)` prefill cost the pool
 bounds — the qwen3.6 case below doesn't show this because DeltaNet dominates
 its prefill.
 
+#### Host paging + reranker drafter on gemma4
+
+Host paging is wired into gemma4 too: `init_kvflash_paged_cache` gives the global
+slots a `KvFlashPagedCache` (`MixedKvCache::KvFlashPaged`), sliding slots keep
+`SlidingKVCache`, shared-KV slots stay unbounded. `ar_bench` with
+`DFLASH_KVFLASH_PAGING=1 DFLASH_KVFLASH_DRAFTER=1` reranks the prompt's 64-token
+chunks once (Qwen3-Reranker-0.6B) and pins the relevant ones resident.
+
+**gemma4-26B-A4B (UD), 8.3K mid-context needle, pool=2048:**
+
+| backend | decode tok/s | needle |
+|---|---|---|
+| layered (full global KV) | 28.3 | ✓ (has everything) |
+| **host-paging + drafter** | **31.4** | **✓ `CRIMSON-ORCHID-7741`** |
+
+The reranker ranked the needle chunk **#1** (`[62, 126, 10, …]`) in 8.6s and the
+model recalled the code — at a **bounded** global-KV read that decodes *faster*
+than the unbounded baseline (31.4 vs 28.3, 1.11× at only 8K; widens with
+context since only the global layers are bounded). So on gemma4 the drafter buys
+recall *and* speed simultaneously.
+
+**gemma4-12B-it-4bit:** the drafter scoring works identically (ranks the needle
+chunk #1; paging decode 21.1 vs 19.8 tok/s layered, 1.07× at 8K), but this
+checkpoint's plain-AR output degenerates under *both* loaders and the unchanged
+layered baseline (malformed tokens, even on a short prompt) — a pre-existing 12B
+it-4bit / `ar_bench` AR-path issue unrelated to kvflash (the 12B works via the
+`Gemma4PairSession` path, per `docs/mtp-gemma4-12B-plan.md`). So end-to-end
+recall isn't demonstrable on it here, though the wiring and scoring are correct.
+
 ### Hardware caveat
 
 On this **hybrid** arch (48 GatedDeltaNet + 16 full-attention layers) the
