@@ -97,9 +97,46 @@ prefill in this spike.
 
 **The recall trade-off is real.** With pure LRU (sink=4 + recent), the planted
 code sits past the sink and is evicted once context exceeds the pool, so
-kvflash answers wrong while the full cache recalls it. A scored-residency
-policy (next steps) is what the source PR uses to keep recall high at low
-residency; this spike deliberately ships only the LRU/StreamingLLM policy.
+kvflash answers wrong while the full cache recalls it.
+
+## Scored residency (H2O-style) — and why it doesn't recover recall *here*
+
+`DFLASH_KVFLASH_POLICY=scored` adds query-aware eviction: a
+`KeyValueCache::observe_query` hook feeds the model's post-RoPE queries to the
+cache, which accumulates a cheap mean-head `softmax(q·kᵀ)` per resident
+position and evicts the **lowest-attention** middle chunk (keep sink + recency
+window + heavy-hitters) instead of the oldest. `DFLASH_KVFLASH_DECAY<1`
+recency-weights so the trailing query dominates. A unit test confirms the
+**mechanism**: a position that keeps getting attention survives eviction while
+old unattended positions are dropped.
+
+But on a **mid-context needle** (a code at ~50% depth in repetitive filler;
+Qwen3.6-27B, 8.3K tokens, pool=2048), no in-model scoring variant recovers it:
+
+| policy | needle recall |
+|---|---|
+| standard fp16 (full cache) | ✓ |
+| kvflash LRU | ✗ |
+| kvflash scored (plain) | ✗ |
+| kvflash scored decay=0.90 | ✗ |
+| kvflash scored decay=0.97 | ✗ |
+
+**Why — a structural limit of the no-paging spike.** The needle's importance
+only manifests when the model *generates the answer* (decode), but the first
+eviction (8.3K→2048) happens at the start of decode, *before* that retrieval
+attention accumulates — and with no host paging, an evicted chunk is gone for
+good. During prefill the needle is attended only weakly (the question encodes
+causally but doesn't "look up" yet) and is swamped by the local attention every
+filler token gets, so it never ranks as a heavy hitter; recency-weighting only
+extends the recent window, which can't reach 4K tokens back.
+
+This is exactly why the source PR pairs two things this spike doesn't have:
+(1) a **drafter** that scores chunks by *query relevance* proactively (not the
+model's own incidental attention), and (2) **host paging** to *recall* an
+evicted chunk once it becomes relevant. Cheap in-model attention scoring +
+drop-on-evict is enough to keep *naturally heavy-hitter* tokens (the unit-test
+case, and real documents where early facts are referenced throughout) but not
+an adversarial needle whose relevance is deferred to answer time.
 
 ### Gemma4 (the better showcase)
 
@@ -144,6 +181,8 @@ hybrid model.
    (48/64 layers, unaffected by KV bounding) dominates prefill, so the TTFT win
    is bounded by the attention share; the **prefill memory bound** (`O(pool)`)
    is the load-bearing benefit for fitting 64K–256K contexts.
-2. Scored residency (a small drafter ranks chunks) to recover mid-context
-   recall instead of pure LRU.
+2. ~~Scored residency~~ — H2O-style attention scoring is **done**
+   (`DFLASH_KVFLASH_POLICY=scored`), but recovering an *adversarial* mid-context
+   needle needs the source PR's drafter (proactive query-relevance) + **host
+   paging** (recall evicted chunks); see the scored-residency section above.
 3. Wire into gemma4 (full-attention layers only; SWA layers already ring-buffer).
