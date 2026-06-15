@@ -130,13 +130,46 @@ causally but doesn't "look up" yet) and is swamped by the local attention every
 filler token gets, so it never ranks as a heavy hitter; recency-weighting only
 extends the recent window, which can't reach 4K tokens back.
 
-This is exactly why the source PR pairs two things this spike doesn't have:
-(1) a **drafter** that scores chunks by *query relevance* proactively (not the
-model's own incidental attention), and (2) **host paging** to *recall* an
-evicted chunk once it becomes relevant. Cheap in-model attention scoring +
-drop-on-evict is enough to keep *naturally heavy-hitter* tokens (the unit-test
-case, and real documents where early facts are referenced throughout) but not
-an adversarial needle whose relevance is deferred to answer time.
+This is exactly why **drop-on-evict** isn't enough for a needle whose relevance
+is deferred to answer time — you need to **recall** it, not just avoid evicting
+it. That's host paging, below.
+
+## Host paging (`DFLASH_KVFLASH_PAGING=1`) — recall recovered
+
+`KvFlashPagedCache` keeps **all** chunks in (unified) memory and bounds only the
+attention *working set*. Every `tau` decode steps it **reselects** the resident
+set by scoring **all** chunks — including paged-out ones — against the latest
+query, so a chunk pages back in the moment a query attends it:
+
+- Score = **max over positions and KV-heads** of `q·k` over each chunk's real
+  keys (a single retrieval head matching the code token spikes the chunk;
+  mean-pooling averaged it away).
+- Query = the **last position** (the actual "what do I retrieve next" query),
+  not the block mean (which dilutes it with question filler).
+- The first decode reselection uses the trailing prefill query (the question);
+  with `tau=1` every later step re-checks, so the answer query pulls the
+  relevant chunk back into residency.
+
+**Result (Qwen3.6-27B, same 8.3K mid-context needle, pool=2048):**
+
+| policy | needle recall |
+|---|---|
+| standard fp16 | ✓ |
+| kvflash LRU | ✗ |
+| kvflash scored (in-model attention) | ✗ |
+| kvflash paging, mean scoring | ✗ |
+| **kvflash paging, max+last-pos, `tau=1`** | **✓** (`CRIMSON-ORCHID-7741`) |
+
+Host paging **recovers the recall** every drop-based policy loses: the needle is
+evicted from the bounded resident set, then *paged back in* when the answer
+query is scored against the full chunk store. Cost is decode throughput —
+`tau=1` runs a full `q·all_chunks` reselection scan every step (13.8 tok/s vs
+~18 bounded), so `tau` trades recall-latency against decode speed (larger `tau`
+is faster but can miss the page-in window for a short answer). On unified memory
+it also gives up the memory bound (all chunks stay resident) — the trade is
+**recall + bounded attention read, at full memory**, which on a memory-rich Mac
+is often the right one. A trained drafter (vs the cheap in-model `q·k` score)
+would make reselection cheaper and more precise.
 
 ### Gemma4 (the better showcase)
 
