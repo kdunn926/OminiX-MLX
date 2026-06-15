@@ -73,7 +73,21 @@ fn main() -> Result<()> {
     let enc = tokenizer
         .encode(prompt_str.as_str(), false)
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-    let ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+    // Gemma models require a leading <bos>. We encode raw prompts with
+    // add_special_tokens=false (so callers control the template), which omits
+    // it — and the 12B unified checkpoints are acutely BOS-sensitive: without
+    // <bos> their AR output degenerates to a `<start_of_turn>model` loop (the
+    // 26B tolerates its absence on long prompts, which masked this). Prepend it
+    // unless already present; NO_BOS=1 opts out for A/B testing.
+    let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+    if std::env::var("NO_BOS").is_err() {
+        if let Some(bos) = tokenizer.token_to_id("<bos>") {
+            if ids.first() != Some(&(bos as i32)) {
+                ids.insert(0, bos as i32);
+                eprintln!("prepended <bos> (id {bos})");
+            }
+        }
+    }
     eprintln!("prompt_len={}", ids.len());
     let prompt = Array::from_slice(&ids, &[1, ids.len() as i32]);
     let num_slots = *model.model.kv_cache_map.iter().max().unwrap_or(&0) + 1;
